@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional
 import re
 from pathlib import Path
 import os
+from urllib.parse import urljoin
+
+import httpx
 
 import pandas as pd
 import numpy as np
@@ -1189,6 +1192,24 @@ class ProcessRoutingService:
         # Ensure the ``process_details`` blob reflects the new status.
         details = process_details or self.get_process_details(process_id, raw=True) or {}
         details["status"] = status_text
+
+        trigger_workflow_id: Optional[str] = None
+        if status_text == "completed" and isinstance(details, dict):
+            output_payload = details.get("output")
+            if isinstance(output_payload, dict):
+                candidate_workflow_id = details.get("workflow_id") or output_payload.get("workflow_id")
+                sent_flag = self._coerce_truthy(output_payload.get("sent"))
+                if not sent_flag and output_payload.get("success") is not None:
+                    sent_flag = self._coerce_truthy(output_payload.get("success"))
+                message_present = bool(
+                    output_payload.get("message_id")
+                    or output_payload.get("draft")
+                    or output_payload.get("recipients")
+                )
+                workflow_identifier = str(candidate_workflow_id or "").strip()
+                if workflow_identifier and sent_flag and message_present:
+                    trigger_workflow_id = workflow_identifier
+
         try:
             with self.agent_nick.get_db_connection() as conn:
                 with conn.cursor() as cursor:
@@ -1218,6 +1239,172 @@ class ProcessRoutingService:
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "Failed to update status for process %s", process_id
+            )
+            return
+
+        if trigger_workflow_id:
+            self._trigger_email_watcher_via_api(trigger_workflow_id)
+
+    def mark_workflow_failed(
+        self,
+        workflow_id: str,
+        *,
+        reason: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        modified_by: Optional[str] = None,
+    ) -> None:
+        """Mark all processes associated with ``workflow_id`` as failed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT process_id, process_details FROM proc.routing WHERE workflow_id = %s",
+                        (workflow_key,),
+                    )
+                    rows = cursor.fetchall()
+        except Exception:
+            logger.exception("Failed to mark workflow %s as failed", workflow_key)
+            return
+
+        if not rows:
+            return
+
+        for process_id, raw_details in rows:
+            processed_details: Dict[str, Any]
+            if isinstance(raw_details, dict):
+                processed_details = self.normalize_process_details(raw_details)
+            else:
+                try:
+                    payload = json.loads(raw_details) if raw_details else {}
+                except Exception:
+                    payload = {}
+                processed_details = self.normalize_process_details(payload)
+
+            failure_info: Dict[str, Any] = {}
+            if details:
+                failure_info.update(details)
+            if reason:
+                failure_info.setdefault("reason", reason)
+
+            if failure_info:
+                existing_errors = processed_details.setdefault("errors", [])
+                if isinstance(existing_errors, list):
+                    existing_errors.append(failure_info)
+                else:
+                    processed_details["errors"] = [existing_errors, failure_info]
+
+            self.update_process_status(
+                process_id,
+                "failed",
+                modified_by,
+                processed_details,
+            )
+
+    def workflow_has_failed(self, workflow_id: str) -> bool:
+        """Return ``True`` when any recorded process is marked as failed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return False
+
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT process_status FROM proc.routing WHERE workflow_id = %s",
+                        (workflow_key,),
+                    )
+                    rows = cursor.fetchall()
+        except Exception:
+            logger.exception(
+                "Failed to inspect workflow status for %s", workflow_key
+            )
+            return False
+
+        for row in rows:
+            if not row:
+                continue
+            status_value = row[0]
+            try:
+                if int(status_value) < 0:
+                    return True
+            except Exception:
+                token = str(status_value).strip().lower()
+                if token in {"failed", "failure", "error", "timeout"}:
+                    return True
+        return False
+
+    @staticmethod
+    def _coerce_truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in {"true", "1", "yes", "y", "on"}:
+                return True
+            if token in {"false", "0", "no", "n", "off"}:
+                return False
+        return False
+
+    def _resolve_email_watcher_url(self) -> Optional[str]:
+        explicit = getattr(self.settings, "email_watcher_api_url", None)
+        if explicit in (None, ""):
+            explicit = os.environ.get("PROCWISE_EMAIL_WATCHER_URL")
+        if explicit not in (None, ""):
+            return str(explicit).strip().rstrip("/")
+
+        base_url = getattr(self.settings, "api_base_url", None)
+        if base_url in (None, ""):
+            base_url = os.environ.get("PROCWISE_API_BASE_URL")
+        if base_url in (None, ""):
+            return None
+
+        base = str(base_url).strip()
+        if not base:
+            return None
+        if not base.endswith("/"):
+            base = base + "/"
+        return urljoin(base, "email/emailwatcher")
+
+    def _trigger_email_watcher_via_api(self, workflow_id: str) -> None:
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return
+
+        url = self._resolve_email_watcher_url()
+        if not url:
+            logger.debug(
+                "Email watcher API URL not configured; skipping trigger",
+                extra={"workflow_id": workflow_key},
+            )
+            return
+
+        try:
+            response = httpx.post(
+                url,
+                json={"workflow_id": workflow_key},
+                timeout=5.0,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to trigger email watcher API for workflow %s",
+                workflow_key,
+            )
+            return
+
+        if response.status_code >= 400:
+            logger.warning(
+                "Email watcher API returned %s for workflow %s: %s",
+                response.status_code,
+                workflow_key,
+                response.text,
             )
 
 

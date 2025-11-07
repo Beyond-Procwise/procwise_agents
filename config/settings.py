@@ -1,9 +1,11 @@
 # ProcWise/config/settings.py
 
+import json
 import os
+from typing import Dict, List, Optional
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import List, Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ENV_FILE_PATH = os.path.join(PROJECT_ROOT, '.env')
@@ -26,11 +28,26 @@ class Settings(BaseSettings):
     qdrant_collection_name: str = Field(
         default="procwise_document_embeddings", env="QDRANT_COLLECTION_NAME"
     )
+    uploaded_documents_collection_name: str = Field(
+        default="uploaded_documents", env="UPLOADED_DOCUMENTS_COLLECTION_NAME"
+    )
     knowledge_graph_collection_name: str = Field(
         default="procwise_knowledge_graph", env="KNOWLEDGE_GRAPH_COLLECTION_NAME"
     )
     learning_collection_name: str = Field(
         default="learning", env="LEARNING_COLLECTION_NAME"
+    )
+    static_policy_collection_name: str = Field(
+        default="static_policy", env="STATIC_POLICY_COLLECTION_NAME"
+    )
+    static_policy_s3_prefix: str = Field(
+        default="Static Policy/", env="STATIC_POLICY_S3_PREFIX"
+    )
+    static_policy_s3_bucket: Optional[str] = Field(
+        default=None, env="STATIC_POLICY_S3_BUCKET"
+    )
+    static_policy_auto_ingest: bool = Field(
+        default=True, env="STATIC_POLICY_AUTO_INGEST"
     )
     context_training_data_dir: str = Field(
         default=os.path.join(PROJECT_ROOT, "resources", "training", "conversations"),
@@ -62,6 +79,30 @@ class Settings(BaseSettings):
     )
 
     redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
+    workflow_redis_url: Optional[str] = Field(
+        default=None, env="WORKFLOW_REDIS_URL"
+    )
+    langcache_api_key: Optional[str] = Field(
+        default=None, env="LANGCACHE_API_KEY"
+    )
+    langcache_server_url: Optional[str] = Field(
+        default=None, env="LANGCACHE_SERVER_URL"
+    )
+    langcache_cache_id: Optional[str] = Field(
+        default=None, env="LANGCACHE_CACHE_ID"
+    )
+    langcache_embedding_ttl_seconds: int = Field(
+        default=604800, env="LANGCACHE_EMBEDDING_TTL_SECONDS"
+    )
+    langcache_query_ttl_seconds: int = Field(
+        default=86400, env="LANGCACHE_QUERY_TTL_SECONDS"
+    )
+    langcache_embedding_similarity_threshold: float = Field(
+        default=0.985, env="LANGCACHE_EMBEDDING_SIMILARITY_THRESHOLD"
+    )
+    langcache_query_similarity_threshold: float = Field(
+        default=0.93, env="LANGCACHE_QUERY_SIMILARITY_THRESHOLD"
+    )
     redis_response_ttl_seconds: int = Field(
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
@@ -130,6 +171,9 @@ class Settings(BaseSettings):
         default=120, env="LANGCHAIN_REQUEST_TIMEOUT"
     )
     hitl_enabled: bool = Field(default=True, env="HITL_ENABLED")
+    data_extraction_staging_schema: str = Field(
+        default="proc_stage", env="DATA_EXTRACTION_STAGING_SCHEMA"
+    )
     memory_store_uri: Optional[str] = Field(
         default=None, env="MEMORY_STORE_URI"
     )
@@ -137,9 +181,9 @@ class Settings(BaseSettings):
         default=False, env="LANGGRAPH_TRACING_ENABLED"
     )
     document_extraction_model: str = Field(
-        default="gemma3:1b-it-qat", env="DOCUMENT_EXTRACTION_MODEL"
+        default="llama3.2", env="DOCUMENT_EXTRACTION_MODEL"
     )
-    rag_model: str = Field(default="gemma3:1b-it-qat", env="RAG_LLM_MODEL")
+    rag_model: str = Field(default="phi4:latest", env="RAG_LLM_MODEL")
     # ``BAAI/bge-large-en-v1.5`` provides state-of-the-art dense retrieval
     # performance for procurement terminology while remaining compatible with
     # Qdrant's HNSW indexes. The model outputs 1024 dimensional vectors which
@@ -154,6 +198,14 @@ class Settings(BaseSettings):
     )
     rag_chunk_chars: int = Field(default=1800, env="RAG_CHUNK_CHARS")
     rag_chunk_overlap: int = Field(default=350, env="RAG_CHUNK_OVERLAP")
+    rag_chunk_min_tokens: int = Field(default=320, env="RAG_CHUNK_MIN_TOKENS")
+    rag_chunk_max_tokens: int = Field(default=880, env="RAG_CHUNK_MAX_TOKENS")
+    rag_chunk_overlap_ratio: float = Field(
+        default=0.12, env="RAG_CHUNK_OVERLAP_RATIO"
+    )
+    agent_model_overrides: Dict[str, str] = Field(
+        default_factory=dict, env="AGENT_MODEL_OVERRIDES"
+    )
     ollama_quantized_model: Optional[str] = Field(
         default=None, env="OLLAMA_QUANTIZED_MODEL"
     )
@@ -202,6 +254,39 @@ class Settings(BaseSettings):
         env_file = ENV_FILE_PATH
         env_file_encoding = 'utf-8'
         extra = "ignore"
+
+    @field_validator("agent_model_overrides", mode="before")
+    @classmethod
+    def _coerce_agent_model_overrides(cls, value):
+        """Normalise overrides supplied via environment variables."""
+
+        if value in (None, "", {}):
+            return {}
+        if isinstance(value, dict):
+            return {
+                str(key).strip(): str(val).strip()
+                for key, val in value.items()
+                if str(key).strip() and str(val).strip()
+            }
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    "AGENT_MODEL_OVERRIDES must be valid JSON mapping"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "AGENT_MODEL_OVERRIDES must decode to a JSON object"
+                )
+            return {
+                str(key).strip(): str(val).strip()
+                for key, val in parsed.items()
+                if str(key).strip() and str(val).strip()
+            }
+        raise TypeError(
+            "Unsupported type for AGENT_MODEL_OVERRIDES; expected dict or JSON string"
+        )
 
 try:
     settings = Settings()

@@ -2,15 +2,37 @@ import importlib
 import importlib.util
 import json
 import logging
+import re
 import uuid
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set
 from types import SimpleNamespace
 
 import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
 from qdrant_client import models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
+from services.semantic_cache import SemanticCacheManager
+from services.document_extractor import LayoutAwareParser
+from services.semantic_chunker import SemanticChunker, SemanticChunk
+
+DISALLOWED_METADATA_KEYS: Set[str] = {
+    "effective_date",
+    "supplier",
+    "doc_version",
+    "round_id",
+}
+
+_TRAINING_ROOT = (
+    Path(__file__).resolve().parent.parent
+    / "resources"
+    / "training"
+    / "rag"
+)
+_TRAINING_ROOT.mkdir(parents=True, exist_ok=True)
+_PREFERENCE_WEIGHTS_PATH = _TRAINING_ROOT / "preference_weights.json"
 
 configure_gpu()
 
@@ -26,6 +48,26 @@ class RAGService:
         self.settings = agent_nick.settings
         self.client = agent_nick.qdrant_client
         self.embedder = agent_nick.embedding_model
+        self.primary_collection = getattr(
+            self.settings,
+            "qdrant_collection_name",
+            "procwise_document_embeddings",
+        )
+        self.uploaded_collection = getattr(
+            self.settings,
+            "uploaded_documents_collection_name",
+            "uploaded_documents",
+        )
+        self.static_policy_collection = getattr(
+            self.settings,
+            "static_policy_collection_name",
+            "static_policy",
+        )
+        self.learning_collection = getattr(
+            self.settings,
+            "learning_collection_name",
+            "learning",
+        )
         # Local FAISS and BM25 indexes to complement Qdrant
         self._faiss_index = None
         self._doc_vectors: List[np.ndarray] = []
@@ -43,32 +85,490 @@ class RAGService:
         self._reranker = load_cross_encoder(
             model_name, cross_encoder_cls, getattr(self.agent_nick, "device", None)
         )
+        self._semantic_cache = SemanticCacheManager(
+            self.settings, namespace="rag_service"
+        )
+        self._preference_weights_path = _PREFERENCE_WEIGHTS_PATH
+        self._preference_weights = self._load_preference_weights()
+        self._rrf_k = 60
+        self._layout_parser = LayoutAwareParser()
+        self._chunker = SemanticChunker(settings=self.settings)
+        self._payload_index_cache: Dict[str, Set[str]] = {}
 
     # ------------------------------------------------------------------
     # Embedding helpers
     # ------------------------------------------------------------------
-    def _chunk_text(self, text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
-        """Split text into whitespace-aware chunks with overlap."""
-        cleaned = " ".join(text.split())
+    def reload_preference_weights(self) -> None:
+        """Reload retrieval preference weights from disk."""
+
+        self._preference_weights = self._load_preference_weights()
+
+    def _load_preference_weights(self) -> Dict[str, Dict[str, float]]:
+        defaults: Dict[str, Dict[str, float]] = {
+            "collection": {},
+            "document_type": {},
+        }
+        defaults["collection"][self.primary_collection] = 0.12
+        defaults["collection"][self.uploaded_collection] = 0.08
+        if self.static_policy_collection:
+            defaults["collection"].setdefault(self.static_policy_collection, 0.14)
+        defaults["document_type"].setdefault("policy", 0.1)
+
+        path_obj = Path(self._preference_weights_path)
+        if not path_obj.exists():
+            return defaults
+
+        try:
+            loaded = json.loads(path_obj.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug(
+                "Falling back to default preference weights due to parse failure",
+                exc_info=True,
+            )
+            return defaults
+
+        if not isinstance(loaded, dict):
+            return defaults
+
+        result = {
+            "collection": dict(defaults["collection"]),
+            "document_type": dict(defaults["document_type"]),
+        }
+
+        for section_key in ("collection", "document_type"):
+            section = loaded.get(section_key)
+            if not isinstance(section, dict):
+                continue
+            for key, value in section.items():
+                if not isinstance(key, str) or not isinstance(value, (int, float)):
+                    continue
+                result[section_key][key] = float(value)
+
+        return result
+
+    def _chunk_text(
+        self, text: str, max_chars: int = 1000, overlap: int = 200
+    ) -> List[SemanticChunk]:
+        """Chunk text using the structure-aware chunker for previews.
+
+        The ``max_chars`` and ``overlap`` parameters are retained for backward
+        compatibility with older call sites. They now map to the runtime
+        configuration derived from :class:`SemanticChunker`.
+        """
+
+        del max_chars, overlap  # legacy parameters retained for compatibility
+        cleaned = (text or "").strip()
         if not cleaned:
             return []
-        configured_max = getattr(self.settings, "rag_chunk_chars", max_chars)
-        configured_overlap = getattr(self.settings, "rag_chunk_overlap", overlap)
-        max_chars = max(configured_max, 200)
-        overlap = max(0, min(configured_overlap, max_chars - 1))
-        step = max_chars - overlap if max_chars > overlap else max_chars
-        return [cleaned[i : i + max_chars] for i in range(0, len(cleaned), step)]
+
+        try:
+            structured = self._layout_parser.from_text(cleaned, scanned=False)
+        except Exception:
+            logger.debug("Layout parsing failed; using fallback chunking", exc_info=True)
+            structured = None
+
+        chunks: List[SemanticChunk] = []
+        title_hint = None
+        if structured and structured.elements:
+            first = structured.elements[0]
+            candidate = getattr(first, "text", None)
+            if candidate:
+                title_hint = candidate.strip()
+        chunk_seed = {
+            "document_type": "General",
+            "source_type": "Upload",
+            "title": title_hint or "Preview",
+        }
+
+        if structured:
+            try:
+                chunks = self._chunker.build_from_structured(
+                    structured,
+                    document_type="General",
+                    base_metadata=chunk_seed,
+                    title_hint=chunk_seed["title"],
+                    default_section="document_overview",
+                )
+            except Exception:
+                logger.debug(
+                    "Semantic chunking failed; falling back to heuristic chunker",
+                    exc_info=True,
+                )
+                chunks = []
+
+        if not chunks or self._requires_fallback(chunks):
+            return self._fallback_chunk_text(cleaned, seed_metadata=chunk_seed)
+
+        return chunks
+
+    def _requires_fallback(self, chunks: List[SemanticChunk]) -> bool:
+        """Determine whether the semantic chunker output needs refinement."""
+
+        if not chunks:
+            return True
+
+        if len(chunks) > 1:
+            return False
+
+        char_limit = self._chunk_char_limit()
+        return len(chunks[0].content or "") > int(char_limit * 1.2)
+
+    def _chunk_char_limit(self) -> int:
+        """Return the configured character limit for fallback chunking."""
+
+        approx_chars = getattr(self.settings, "rag_chunk_chars", None)
+        try:
+            approx_value = int(approx_chars) if approx_chars else 0
+        except (TypeError, ValueError):
+            approx_value = 0
+        if approx_value <= 0:
+            approx_value = 1800
+        return max(900, min(approx_value, 2400))
+
+    def _chunk_overlap_chars(self) -> int:
+        """Return the configured overlap (in characters) for fallback chunks."""
+
+        overlap_value = getattr(self.settings, "rag_chunk_overlap", None)
+        try:
+            overlap = int(overlap_value) if overlap_value else 0
+        except (TypeError, ValueError):
+            overlap = 0
+        if overlap <= 0:
+            overlap = int(self._chunk_char_limit() * 0.1)
+        return max(120, min(overlap, int(self._chunk_char_limit() * 0.4)))
+
+    def _fallback_chunk_text(
+        self, text: str, *, seed_metadata: Optional[Dict[str, Any]] = None
+    ) -> List[SemanticChunk]:
+        """Fallback heuristic chunker when structural parsing fails.
+
+        This splitter groups paragraphs and long sentences into overlapping
+        windows so that downstream retrieval receives semantically coherent
+        spans rather than single large blocks of text.
+        """
+
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
+            return []
+
+        char_limit = self._chunk_char_limit()
+        overlap_chars = self._chunk_overlap_chars()
+
+        paragraphs = [
+            part.strip()
+            for part in re.split(r"\n{2,}", text)
+            if part and part.strip()
+        ]
+        if not paragraphs:
+            paragraphs = [cleaned]
+
+        expanded_parts: List[str] = []
+        for paragraph in paragraphs:
+            expanded_parts.extend(self._split_paragraph(paragraph, char_limit))
+
+        chunks: List[SemanticChunk] = []
+        buffer: List[str] = []
+        buffer_len = 0
+        idx = 0
+        while idx < len(expanded_parts):
+            part = expanded_parts[idx]
+            part_len = len(part)
+            if buffer and buffer_len + part_len + 2 > char_limit:
+                chunk_text = self._normalise_chunk("\n\n".join(buffer))
+                if chunk_text:
+                    chunks.append(
+                        SemanticChunk(
+                            content=chunk_text,
+                            metadata=self._fallback_metadata(
+                                seed_metadata, len(chunks)
+                            ),
+                        )
+                    )
+                buffer, buffer_len = self._build_overlap_buffer(
+                    buffer, overlap_chars
+                )
+                continue
+
+            buffer.append(part)
+            buffer_len += part_len + 2
+            idx += 1
+
+        if buffer:
+            chunk_text = self._normalise_chunk("\n\n".join(buffer))
+            if chunk_text:
+                chunks.append(
+                    SemanticChunk(
+                        content=chunk_text,
+                        metadata=self._fallback_metadata(seed_metadata, len(chunks)),
+                    )
+                )
+
+        return chunks
+
+    def _split_paragraph(self, paragraph: str, limit: int) -> List[str]:
+        """Split long paragraphs into sentence-based windows."""
+
+        paragraph = paragraph.strip()
+        if len(paragraph) <= limit:
+            return [paragraph]
+
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+        if not sentences:
+            return [paragraph[i : i + limit] for i in range(0, len(paragraph), limit)]
+
+        parts: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for sentence in sentences:
+            sentence_len = len(sentence)
+            if current and current_len + sentence_len + 1 > limit:
+                parts.append(" ".join(current))
+                current = []
+                current_len = 0
+            current.append(sentence)
+            current_len += sentence_len + 1
+        if current:
+            parts.append(" ".join(current))
+        return parts
+
+    def _build_overlap_buffer(
+        self, buffer: List[str], overlap_chars: int
+    ) -> Tuple[List[str], int]:
+        if not buffer or overlap_chars <= 0:
+            return [], 0
+
+        tail = buffer[-1]
+        overlap_text = self._tail_sentences(tail, overlap_chars)
+        if not overlap_text:
+            return [], 0
+        return [overlap_text], len(overlap_text)
+
+    def _tail_sentences(self, text: str, limit: int) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+        if not sentences:
+            return text[-limit:].strip()
+
+        collected: List[str] = []
+        total = 0
+        for sentence in reversed(sentences):
+            collected.insert(0, sentence)
+            total += len(sentence) + 1
+            if total >= limit:
+                break
+        return " ".join(collected).strip()
+
+    def _normalise_chunk(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def _fallback_metadata(
+        self, seed_metadata: Optional[Dict[str, Any]], index: int
+    ) -> Dict[str, Any]:
+        metadata = dict(seed_metadata or {})
+        metadata.setdefault("section", "document_overview")
+        metadata.setdefault("section_path", "document_overview")
+        metadata.setdefault("content_type", "paragraph")
+        metadata.setdefault("chunk_strategy", "fallback")
+        metadata.setdefault("fallback_index", index)
+        return metadata
+
+    def _embedding_dimension(self) -> int:
+        """Determine the embedding dimensionality of the active encoder."""
+
+        getter = getattr(self.embedder, "get_sentence_embedding_dimension", None)
+        if callable(getter):
+            try:
+                dimension = int(getter())
+                if dimension > 0:
+                    return dimension
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug("Failed to query embedding dimension from model", exc_info=True)
+
+        probe = self.embedder.encode("dimension probe", normalize_embeddings=True)
+        if isinstance(probe, np.ndarray):
+            if probe.ndim == 1:
+                return int(probe.shape[0])
+            if probe.ndim == 2:
+                return int(probe.shape[1])
+        if isinstance(probe, list):
+            if probe and isinstance(probe[0], (float, int)):
+                return len(probe)
+            if probe and isinstance(probe[0], (list, tuple, np.ndarray)):
+                first = probe[0]
+                return len(first)
+        raise RuntimeError("Unable to determine embedding dimension for Qdrant collection initialisation")
+
+    def ensure_collection(self, collection_name: Optional[str] = None) -> None:
+        """Ensure the specified Qdrant collection exists with the right vector size."""
+
+        if self.client is None:
+            raise RuntimeError("Qdrant client is not configured on AgentNick")
+
+        target = collection_name or self.primary_collection
+
+        try:
+            self.client.get_collection(collection_name=target)
+            self._refresh_payload_index_cache(target)
+            return
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) != 404:
+                return
+        except Exception:
+            try:
+                collections = self.client.get_collections().collections
+            except Exception:
+                collections = []
+            if any(getattr(col, "name", None) == target for col in collections):
+                return
+
+        dimension = self._embedding_dimension()
+        try:
+            self.client.create_collection(
+                collection_name=target,
+                vectors_config=models.VectorParams(
+                    size=int(dimension),
+                    distance=models.Distance.COSINE,
+                ),
+            )
+            self._payload_index_cache.pop(target, None)
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) != 409:
+                raise
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.warning("Failed to ensure Qdrant collection %s", target, exc_info=True)
+
+        self._refresh_payload_index_cache(target)
+
+    def _refresh_payload_index_cache(self, collection_name: str) -> None:
+        if not self.client or not collection_name:
+            return
+        get_collection = getattr(self.client, "get_collection", None)
+        if get_collection is None:
+            return
+        try:
+            info = get_collection(collection_name=collection_name)
+        except Exception:
+            return
+
+        schema = getattr(info, "payload_schema", {}) or {}
+        if isinstance(schema, dict):
+            self._payload_index_cache[collection_name] = set(schema.keys())
+
+    def _ensure_payload_index(
+        self,
+        collection_name: Optional[str],
+        field_name: Optional[str],
+        schema: models.PayloadSchemaType = models.PayloadSchemaType.KEYWORD,
+    ) -> None:
+        if not collection_name or not field_name or not self.client:
+            return
+
+        create_index = getattr(self.client, "create_payload_index", None)
+        if create_index is None:
+            return
+
+        cached = self._payload_index_cache.setdefault(collection_name, set())
+        if field_name in cached:
+            return
+
+        if not cached:
+            self._refresh_payload_index_cache(collection_name)
+            cached = self._payload_index_cache.setdefault(collection_name, set())
+            if field_name in cached:
+                return
+
+        try:
+            create_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=schema,
+                wait=True,
+            )
+            cached.add(field_name)
+        except UnexpectedResponse as exc:
+            status = getattr(exc, "status_code", None)
+            if status in (400, 409):
+                cached.add(field_name)
+            else:  # pragma: no cover - diagnostic logging only
+                logger.debug(
+                    "Failed to create payload index for %s.%s", collection_name, field_name, exc_info=True
+                )
+        except Exception:  # pragma: no cover - diagnostic logging only
+            logger.debug(
+                "Failed to ensure payload index for %s.%s", collection_name, field_name, exc_info=True
+            )
+
+    def _collect_filter_fields(self, query_filter: Optional[models.Filter]) -> Set[str]:
+        if query_filter is None:
+            return set()
+
+        fields: Set[str] = set()
+        stack: List[Any] = [query_filter]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, models.FieldCondition):
+                key = getattr(current, "key", None)
+                if isinstance(key, str) and key.strip():
+                    fields.add(key.strip())
+                continue
+
+            if isinstance(current, models.Filter):
+                for attr in ("must", "must_not", "should"):
+                    items = getattr(current, attr, None) or []
+                    for item in items:
+                        if item is not None:
+                            stack.append(item)
+
+        return fields
+
+    def _ensure_filter_indexes(
+        self, collection_name: Optional[str], query_filter: Optional[models.Filter]
+    ) -> None:
+        if not collection_name or query_filter is None:
+            return
+
+        try:
+            fields = self._collect_filter_fields(query_filter)
+        except Exception:  # pragma: no cover - diagnostic logging only
+            logger.debug(
+                "Failed to inspect filter for collection %s", collection_name, exc_info=True
+            )
+            return
+
+        for field in fields:
+            self._ensure_payload_index(collection_name, field)
+
+    def _purge_disallowed_metadata(self, collection_name: str) -> None:
+        if not DISALLOWED_METADATA_KEYS:
+            return
+        try:
+            selector = models.FilterSelector(filter=models.Filter(must=[]))
+            self.client.delete_payload(
+                collection_name=collection_name,
+                keys=list(DISALLOWED_METADATA_KEYS),
+                points=selector,
+                wait=False,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to purge disallowed metadata for collection %s",
+                collection_name,
+                exc_info=True,
+            )
 
     def upsert_payloads(
         self,
         payloads: List[Dict[str, Any]],
         text_representation_key: str = "content",
+        collection_name: Optional[str] = None,
     ):
         """Encode and upsert structured payloads into Qdrant, FAISS and BM25."""
 
         if not payloads:
             return
 
+        resolved_collection = collection_name or self.primary_collection
         points: List[models.PointStruct] = []
         texts_for_embedding: List[str] = []
         payloads_for_storage: List[Dict[str, Any]] = []
@@ -83,6 +583,8 @@ class RAGService:
             else:
                 base_payload = dict(payload)
             base_payload.pop("payload", None)
+            for key in DISALLOWED_METADATA_KEYS:
+                base_payload.pop(key, None)
 
             record_id = (
                 base_payload.get("record_id")
@@ -90,6 +592,10 @@ class RAGService:
                 or str(uuid.uuid4())
             )
             base_payload["record_id"] = record_id
+
+            override_collection = self._extract_source_collection(base_payload)
+            if override_collection:
+                resolved_collection = override_collection
 
             if text_representation_key in base_payload:
                 base_payload.pop(text_representation_key, None)
@@ -114,24 +620,43 @@ class RAGService:
             for idx, chunk in enumerate(chunks):
                 chunk_payload = dict(base_payload)
                 chunk_payload["chunk_id"] = idx
+                chunk_payload["chunk_index"] = idx
+
+                if isinstance(chunk, SemanticChunk):
+                    chunk_text = chunk.content
+                    chunk_metadata = chunk.metadata or {}
+                else:
+                    chunk_text = str(chunk)
+                    chunk_metadata = {}
+
+                chunk_text = (chunk_text or "").strip()
+                if not chunk_text:
+                    continue
+
+                for key, value in (chunk_metadata or {}).items():
+                    if value in (None, "", [], {}):
+                        continue
+                    chunk_payload.setdefault(key, value)
+
                 if (
                     "content" in chunk_payload
-                    and chunk_payload.get("content") != chunk
+                    and chunk_payload.get("content") != chunk_text
                 ):
                     chunk_payload.setdefault(
                         "_rag_source_content", chunk_payload.get("content")
                     )
-                chunk_payload["content"] = chunk
+                chunk_payload["content"] = chunk_text
                 if (
                     "text_summary" in chunk_payload
-                    and chunk_payload.get("text_summary") != chunk
+                    and chunk_payload.get("text_summary") != chunk_text
                 ):
                     chunk_payload.setdefault(
                         "_rag_source_text_summary",
                         chunk_payload.get("text_summary"),
                     )
-                chunk_payload["text_summary"] = chunk
-                texts_for_embedding.append(chunk)
+                chunk_payload["text_summary"] = chunk_text
+                chunk_payload.setdefault("collection_name", resolved_collection)
+                texts_for_embedding.append(chunk_text)
                 payloads_for_storage.append(chunk_payload)
 
         if not texts_for_embedding:
@@ -172,9 +697,15 @@ class RAGService:
             if self._bm25_corpus:
                 self._bm25 = BM25Okapi(self._bm25_corpus)
 
-        if points:
+        collection_name = (
+            resolved_collection
+            or getattr(self.settings, "qdrant_collection_name", None)
+        )
+
+        if points and collection_name:
+            self._purge_disallowed_metadata(collection_name)
             self.client.upsert(
-                collection_name=self.settings.qdrant_collection_name,
+                collection_name=collection_name,
                 points=points,
                 wait=True,
             )
@@ -188,6 +719,20 @@ class RAGService:
             payloads.append({**metadata, "content": text})
 
         self.upsert_payloads(payloads, text_representation_key="content")
+
+    @staticmethod
+    def _extract_source_collection(payload: Dict[str, Any]) -> Optional[str]:
+        """Return a collection override specified by the payload, if any."""
+
+        candidate = payload.get("source_collection")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        nested = payload.get("payload")
+        if isinstance(nested, dict):
+            nested_candidate = nested.get("source_collection")
+            if isinstance(nested_candidate, str) and nested_candidate.strip():
+                return nested_candidate.strip()
+        return None
 
     def _build_point_id(self, record_id: str, chunk_idx: int) -> str:
         """Create a Qdrant-compatible point ID for the given record chunk."""
@@ -213,76 +758,390 @@ class RAGService:
         query: str,
         top_k: int = 5,
         filters: Optional[models.Filter] = None,
+        *,
+        session_hint: Optional[str] = None,
+        memory_fragments: Optional[List[str]] = None,
+        policy_mode: bool = False,
+        nltk_features: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        collections: Optional[Sequence[str]] = None,
     ):
         """Retrieve and rerank documents for the given query."""
+        if not query or not query.strip():
+            return []
+
+        base_query = re.sub(r"\s+", " ", query or "").strip()
+        if not base_query:
+            return []
+
+        hint_text = self._compose_hint_text(session_hint, memory_fragments)
+        feature_keywords: List[str] = []
+        feature_phrases: List[str] = []
+        nltk_features: Optional[Dict[str, Any]] = None
+        if isinstance(nltk_features, dict):
+            raw_keywords = nltk_features.get("keywords", [])
+            raw_phrases = nltk_features.get("key_phrases", [])
+            feature_keywords = [
+                str(item).strip()
+                for item in raw_keywords
+                if isinstance(item, str) and str(item).strip()
+            ]
+            feature_phrases = [
+                str(item).strip()
+                for item in raw_phrases
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if feature_keywords or feature_phrases:
+                logger.debug(
+                    "Applying NLTK feature hints: keywords=%s phrases=%s",
+                    feature_keywords[:8],
+                    feature_phrases[:5],
+                )
+
+        rewritten_query, auto_conditions = self._rewrite_query(base_query)
+        combined_filter = self._merge_filters(filters, auto_conditions)
+        combined_filter, session_key = self._separate_session_scope(
+            combined_filter, session_id
+        )
+        policy_mode = bool(policy_mode or self._looks_like_policy_query(base_query, hint_text))
+        search_text = rewritten_query or base_query
+        feature_hint_parts = feature_keywords[:6] + feature_phrases[:4]
+        if feature_hint_parts:
+            features_line = ", ".join(dict.fromkeys(feature_hint_parts))
+            search_text = f"{search_text}\n\nFocus terms: {features_line}".strip()
+            if hint_text:
+                hint_text = f"{hint_text} | focus terms: {features_line}"
+        if hint_text:
+            search_text = f"{search_text}\n\nConversation context: {hint_text}".strip()
         candidates: Dict[str, SimpleNamespace] = {}
 
-        # --- FAISS semantic search ---
+        query_matrix: Optional[np.ndarray] = None
+        query_vector: Optional[List[float]] = None
+
+        def _ensure_query_vectors() -> Tuple[np.ndarray, List[float]]:
+            nonlocal query_matrix, query_vector
+            if query_matrix is not None and query_vector is not None:
+                return query_matrix, query_vector
+
+            encoded = self.embedder.encode(search_text, normalize_embeddings=True)
+            arr = (
+                encoded
+                if isinstance(encoded, np.ndarray)
+                else np.array(encoded, dtype="float32")
+            )
+            if arr.ndim == 1:
+                matrix = arr.reshape(1, -1).astype("float32")
+            else:
+                matrix = np.array(arr, dtype="float32")
+            vector = matrix[0].astype("float32").tolist()
+            query_matrix, query_vector = matrix, vector
+            return query_matrix, query_vector
+
+        use_cache = combined_filter is None and not auto_conditions and not hint_text
+        cached_entries: List[Dict[str, Any]] = []
+        if use_cache:
+            cached_entries = self._semantic_cache.get_cached_queries(search_text)
+            direct_cache = self._rebuild_cached_hits(
+                cached_entries, search_text, top_k
+            )
+            if direct_cache is not None:
+                return direct_cache
+
+        prefetch = max(50, top_k * 8)
+        weights = {"dense": 1.0, "sparse": 0.75, "qdrant": 1.0, "cache": 0.6}
+
+        def _register_candidate(
+            source: str,
+            payload: Dict[str, Any],
+            doc_id: Any,
+            raw_score: float,
+            rank: int,
+            weight: float,
+        ) -> None:
+            if not isinstance(payload, dict) or doc_id is None:
+                return
+            normalised_payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in DISALLOWED_METADATA_KEYS
+            }
+            doc_id_str = str(doc_id)
+            collection = normalised_payload.get(
+                "collection_name", self.primary_collection
+            )
+            chunk_marker = normalised_payload.get("chunk_id")
+            if chunk_marker is None:
+                chunk_marker = normalised_payload.get("chunk_index")
+            if chunk_marker is None:
+                chunk_marker = normalised_payload.get("chunk_hash")
+            key = (
+                f"{collection}:{doc_id_str}:{chunk_marker}"
+                if chunk_marker is not None
+                else f"{collection}:{doc_id_str}"
+            )
+            entry = candidates.get(key)
+            if entry is None:
+                entry = SimpleNamespace(
+                    id=(
+                        f"{doc_id_str}:{chunk_marker}"
+                        if chunk_marker is not None
+                        else doc_id_str
+                    ),
+                    payload=dict(normalised_payload),
+                    score_components={},
+                    aggregated=0.0,
+                    chunk_id=chunk_marker,
+                )
+                candidates[key] = entry
+            rrf = weight * (1.0 / (self._rrf_k + rank))
+            entry.score_components[source] = {
+                "raw": float(raw_score),
+                "rank": int(rank),
+                "rrf": float(rrf),
+            }
+            entry.aggregated += float(rrf)
+            entry.payload.setdefault("_query_rewrite", rewritten_query or base_query)
+            if hint_text:
+                entry.payload.setdefault("_query_context", hint_text)
+
+        if cached_entries:
+            self._augment_candidates_from_cache(
+                cached_entries, _register_candidate, weights["cache"]
+            )
+
         if self._faiss_index is not None and self._doc_vectors:
-            q_vec = self.embedder.encode(query, normalize_embeddings=True)
-            q_vec = np.array([q_vec], dtype="float32")
-            scores, ids = self._faiss_index.search(q_vec, top_k * 5)
-            for score, idx in zip(scores[0], ids[0]):
+            matrix, _ = _ensure_query_vectors()
+            scores, ids = self._faiss_index.search(matrix, prefetch)
+            for rank, (score, idx) in enumerate(zip(scores[0], ids[0]), 1):
                 if idx < 0 or idx >= len(self._documents):
                     continue
                 doc = self._documents[idx]
-                candidates[doc["id"]] = SimpleNamespace(
-                    id=doc["id"], payload=doc, score=float(score)
+                payload = dict(doc)
+                payload.setdefault(
+                    "collection_name", doc.get("collection_name", self.primary_collection)
+                )
+                _register_candidate(
+                    "dense", payload, doc.get("id"), float(score), rank, weights["dense"]
                 )
 
-        # --- BM25 lexical search ---
-        if self._bm25 is not None:
-            tokens = query.lower().split()
+        if self._bm25 is not None and self._documents:
+            tokens = rewritten_query.lower().split()
+            if feature_keywords:
+                tokens.extend(
+                    keyword.lower()
+                    for keyword in feature_keywords
+                    if keyword.lower() not in tokens
+                )
+            if feature_phrases:
+                for phrase in feature_phrases:
+                    for part in phrase.lower().split():
+                        if part not in tokens:
+                            tokens.append(part)
             bm25_scores = self._bm25.get_scores(tokens)
-            for idx, score in sorted(
-                enumerate(bm25_scores), key=lambda x: x[1], reverse=True
-            )[: top_k * 5]:
+            ranked = sorted(
+                enumerate(bm25_scores), key=lambda item: item[1], reverse=True
+            )[:prefetch]
+            for rank, (idx, score) in enumerate(ranked, 1):
+                if idx < 0 or idx >= len(self._documents):
+                    continue
                 doc = self._documents[idx]
-                existing = candidates.get(doc["id"])
-                if existing is None or score > existing.score:
-                    candidates[doc["id"]] = SimpleNamespace(
-                        id=doc["id"], payload=doc, score=float(score)
-                    )
-
-        hits = list(candidates.values())
-
-        # --- Fallback to Qdrant if local indexes empty ---
-        if not hits:
-            q_vec = self.embedder.encode(query, normalize_embeddings=True).tolist()
-            search_params = models.SearchParams(hnsw_ef=256, exact=False)
-            hits = self.client.search(
-                collection_name=self.settings.qdrant_collection_name,
-                query_vector=q_vec,
-                query_filter=filters,
-                limit=top_k * 5,
-                with_payload=True,
-                with_vectors=False,
-                search_params=search_params,
-            )
-            if not hits:
-                exact_params = models.SearchParams(hnsw_ef=256, exact=True)
-                hits = self.client.search(
-                    collection_name=self.settings.qdrant_collection_name,
-                    query_vector=q_vec,
-                    query_filter=filters,
-                    limit=top_k * 5,
-                    with_payload=True,
-                    with_vectors=False,
-                    search_params=exact_params,
+                payload = dict(doc)
+                payload.setdefault(
+                    "collection_name", doc.get("collection_name", self.primary_collection)
                 )
-            if not hits:
-                return []
+                _register_candidate(
+                    "sparse", payload, doc.get("id"), float(score), rank, weights["sparse"]
+                )
 
-        # --- Re-rank with cross-encoder ---
+        collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = tuple()
+        if self.client is not None:
+            _, vector = _ensure_query_vectors()
+            search_params = models.SearchParams(hnsw_ef=256, exact=False)
+
+            def _search_collection(
+                name: str,
+                *,
+                query_filter: Optional[models.Filter],
+            ) -> List[SimpleNamespace]:
+                if not name:
+                    return []
+
+                self._ensure_filter_indexes(name, query_filter)
+                try:
+                    raw_hits = self.client.search(
+                        collection_name=name,
+                        query_vector=vector,
+                        query_filter=query_filter,
+                        limit=prefetch,
+                        with_payload=True,
+                        with_vectors=False,
+                        search_params=search_params,
+                    )
+                except UnexpectedResponse as exc:
+                    if getattr(exc, "status_code", None) == 404:
+                        return []
+                    logger.warning(
+                        "Qdrant search failed for collection %s", name, exc_info=True
+                    )
+                    return []
+                except Exception:
+                    logger.warning(
+                        "Qdrant search failed for collection %s", name, exc_info=True
+                    )
+                    return []
+
+                if not raw_hits:
+                    try:
+                        raw_hits = self.client.search(
+                            collection_name=name,
+                            query_vector=vector,
+                            query_filter=query_filter,
+                            limit=prefetch,
+                            with_payload=True,
+                            with_vectors=False,
+                            search_params=models.SearchParams(
+                                hnsw_ef=256, exact=True
+                            ),
+                        )
+                    except UnexpectedResponse as exc:
+                        if getattr(exc, "status_code", None) == 404:
+                            return []
+                        logger.warning(
+                            "Exact Qdrant search failed for collection %s", name, exc_info=True
+                        )
+                        return []
+                    except Exception:
+                        logger.warning(
+                            "Exact Qdrant search failed for collection %s", name, exc_info=True
+                        )
+                        return []
+
+                wrapped: List[SimpleNamespace] = []
+                for hit in raw_hits or []:
+                    payload = dict(getattr(hit, "payload", {}) or {})
+                    payload.setdefault("collection_name", name)
+                    wrapped.append(
+                        SimpleNamespace(
+                            id=str(getattr(hit, "id", payload.get("record_id"))),
+                            payload=payload,
+                            score=float(getattr(hit, "score", 0.0)),
+                        )
+                    )
+                return wrapped
+
+        base_collections: List[Tuple[str, Optional[models.Filter]]] = []
+
+        def _filter_signature(value: Optional[models.Filter]) -> str:
+            if value is None:
+                return "∅"
+            try:
+                return value.model_dump_json(sort_keys=True)
+            except Exception:
+                try:
+                    return json.dumps(value.model_dump(), sort_keys=True)
+                except Exception:
+                    return repr(value)
+
+        seen_pairs: Set[Tuple[str, str]] = set()
+
+        def _append_collection(
+            name: Optional[str], filt: Optional[models.Filter]
+        ) -> None:
+            if not name:
+                return
+            signature = _filter_signature(filt)
+            key = (name, signature)
+            if key in seen_pairs:
+                return
+            seen_pairs.add(key)
+            base_collections.append((name, filt))
+
+        forced_names: List[str] = []
+        for candidate in collections or []:
+            try:
+                cleaned_name = str(candidate).strip()
+            except Exception:
+                cleaned_name = ""
+            if cleaned_name:
+                forced_names.append(cleaned_name)
+        forced_collections: Tuple[str, ...] = tuple(forced_names)
+
+        session_specific_filter: Optional[models.Filter] = None
+        if session_key:
+            session_specific_filter = self._merge_filters(
+                combined_filter,
+                [
+                    models.FieldCondition(
+                        key="session_id",
+                        match=models.MatchValue(value=session_key),
+                    )
+                ],
+            )
+        if forced_collections:
+            for name in forced_collections:
+                if (
+                    session_specific_filter is not None
+                    and name == self.uploaded_collection
+                ):
+                    _append_collection(name, session_specific_filter)
+                else:
+                    _append_collection(name, combined_filter)
+        else:
+            if session_specific_filter is not None:
+                _append_collection(self.uploaded_collection, session_specific_filter)
+
+            if policy_mode:
+                ordered_candidates: List[Tuple[Optional[str], Optional[models.Filter]]] = [
+                    (self.static_policy_collection, combined_filter),
+                    (self.uploaded_collection, combined_filter),
+                    (self.primary_collection, combined_filter),
+                    (self.learning_collection, combined_filter),
+                ]
+            else:
+                ordered_candidates = [
+                    (self.uploaded_collection, combined_filter),
+                    (self.primary_collection, combined_filter),
+                    (self.static_policy_collection, combined_filter),
+                    (self.learning_collection, combined_filter),
+                ]
+
+            for name, filt in ordered_candidates:
+                if session_specific_filter is not None and name == self.uploaded_collection:
+                    continue
+                _append_collection(name, filt)
+
+        collections_to_query = tuple(base_collections)
+
+        for name, collection_filter in collections_to_query:
+            hits = _search_collection(name, query_filter=collection_filter)
+            for rank, hit in enumerate(hits[:prefetch], 1):
+                payload = dict(hit.payload or {})
+                payload.setdefault("collection_name", name)
+                _register_candidate(
+                    "qdrant",
+                    payload,
+                    hit.id,
+                    float(getattr(hit, "score", 0.0)),
+                    rank,
+                    weights["qdrant"],
+                )
+
+        if not candidates:
+            return []
+
+        ranked_candidates = sorted(
+            candidates.values(), key=lambda item: item.aggregated, reverse=True
+        )
+        hits = ranked_candidates[:prefetch]
+        if not hits:
+            return []
+
         pairs = [
             (
-                query,
+                rewritten_query,
                 h.payload.get(
                     "text_summary",
-                    h.payload.get(
-                        "content",
-                        h.payload.get("summary", ""),
-                    ),
+                    h.payload.get("content", h.payload.get("summary", "")),
                 ),
             )
             for h in hits
@@ -290,8 +1149,337 @@ class RAGService:
         scores = self._reranker.predict(pairs)
         if hasattr(scores, "tolist"):
             scores = scores.tolist()
-        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
-        return [h for h, _ in ranked[:top_k]]
+
+        def _priority_bonus(hit: SimpleNamespace) -> float:
+            payload = getattr(hit, "payload", {}) or {}
+            collection = payload.get("collection_name", self.primary_collection)
+            document_type = str(payload.get("document_type", "")).lower()
+            weights_map = getattr(self, "_preference_weights", {}) or {}
+            collection_weights = weights_map.get("collection", {}) or {}
+            document_weights = weights_map.get("document_type", {}) or {}
+
+            bonus = float(collection_weights.get(collection, 0.0))
+            if collection == self.static_policy_collection:
+                bonus = max(bonus, 0.12)
+                if policy_mode:
+                    bonus += 0.22
+            doc_bonus = float(document_weights.get(document_type, 0.0))
+            if document_type == "policy":
+                doc_bonus = max(doc_bonus, 0.08)
+                if policy_mode:
+                    doc_bonus += 0.15
+
+            return float(bonus + doc_bonus)
+
+        scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
+        rerank_weight = 1.35
+        context_weight = 0.65
+        for hit, score in zip(hits, scores):
+            base_score = float(score)
+            aggregated_score = float(getattr(hit, "aggregated", 0.0))
+            combined = (
+                base_score * rerank_weight
+                + aggregated_score * context_weight
+                + _priority_bonus(hit)
+            )
+            hit.rerank_score = base_score
+            hit.combined_score = combined
+            hit.context_score = aggregated_score
+            scored_hits.append((hit, combined, base_score))
+
+        if not scored_hits:
+            return []
+
+        scored_hits.sort(key=lambda item: item[1], reverse=True)
+
+        if top_k <= 0:
+            return []
+
+        selected = scored_hits[:top_k]
+
+        def _collection_name(hit_obj: SimpleNamespace) -> str:
+            payload = getattr(hit_obj, "payload", {}) or {}
+            return payload.get("collection_name", self.primary_collection)
+
+        required_collections: Tuple[str, ...] = tuple(
+            name for name, _ in collections_to_query if name
+        )
+
+        available_by_collection: Dict[str, List[Tuple[SimpleNamespace, float, float]]] = {}
+        for record in scored_hits:
+            collection = _collection_name(record[0])
+            available_by_collection.setdefault(collection, []).append(record)
+
+        def _has_collection(collection: str) -> bool:
+            return any(_collection_name(hit) == collection for hit, _, _ in selected)
+
+        for collection in required_collections:
+            candidates_for_collection = available_by_collection.get(collection)
+            if not candidates_for_collection or _has_collection(collection):
+                continue
+            replacement_candidate = candidates_for_collection[0]
+            if len(selected) < top_k:
+                selected.append(replacement_candidate)
+            else:
+                lowest_idx = min(range(len(selected)), key=lambda idx: selected[idx][1])
+                selected[lowest_idx] = replacement_candidate
+
+        if policy_mode and self.static_policy_collection:
+            static_hits = [
+                record
+                for record in scored_hits
+                if _collection_name(record[0]) == self.static_policy_collection
+            ]
+            if static_hits:
+                max_static = min(len(static_hits), max(1, top_k // 2))
+                for idx in range(max_static):
+                    candidate = static_hits[idx]
+                    if candidate not in selected:
+                        if len(selected) < top_k:
+                            selected.append(candidate)
+                        else:
+                            lowest_idx = min(
+                                range(len(selected)), key=lambda i: selected[i][1]
+                            )
+                            selected[lowest_idx] = candidate
+
+        deduped: List[Tuple[SimpleNamespace, float, float]] = []
+        seen_keys: Set[Tuple[str, str, Any]] = set()
+        for hit, combined, base in sorted(selected, key=lambda item: item[1], reverse=True):
+            payload = getattr(hit, "payload", {}) or {}
+            chunk_marker = payload.get("chunk_id")
+            if chunk_marker is None:
+                chunk_marker = payload.get("chunk_index")
+            if chunk_marker is None:
+                chunk_marker = payload.get("chunk_hash")
+            key = (
+                str(getattr(hit, "id", payload.get("record_id"))),
+                _collection_name(hit),
+                chunk_marker,
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append((hit, combined, base))
+
+        results = [hit for hit, _, _ in deduped[:top_k]]
+
+        if use_cache:
+            cache_payload: List[Dict[str, Any]] = []
+            for hit, combined, base in deduped[:top_k]:
+                payload = self._normalise_payload_for_cache(
+                    getattr(hit, "payload", {}) or {}
+                )
+                cache_payload.append(
+                    {
+                        "id": getattr(hit, "id", payload.get("record_id")),
+                        "collection_name": payload.get(
+                            "collection_name", self.primary_collection
+                        ),
+                        "payload": payload,
+                        "score": base,
+                        "combined_score": combined,
+                        "aggregated_score": getattr(hit, "aggregated", 0.0),
+                    }
+                )
+            self._semantic_cache.set_query_results(search_text, cache_payload)
+
+        return results
+
+    def _rewrite_query(
+        self, query: str
+    ) -> Tuple[str, List[models.FieldCondition]]:
+        normalised = re.sub(r"\s+", " ", query or "").strip()
+        if not normalised:
+            return "", []
+
+        normalised = re.sub(
+            r"(?i)\bpo[-\s]?(\d{3,})\b",
+            lambda match: f"purchase order {match.group(1)}",
+            normalised,
+        )
+
+        conditions: List[models.FieldCondition] = []
+
+        def _ensure_condition(field: str, value: str) -> None:
+            for condition in conditions:
+                if getattr(condition, "key", None) == field:
+                    match_obj = getattr(condition, "match", None)
+                    if isinstance(match_obj, models.MatchValue) and match_obj.value == value:
+                        return
+            conditions.append(
+                models.FieldCondition(key=field, match=models.MatchValue(value=value))
+            )
+
+        lowered = normalised.lower()
+        if "policy" in lowered:
+            _ensure_condition("source_type", "Policy")
+        if "invoice" in lowered:
+            _ensure_condition("source_type", "Invoice")
+        if "purchase order" in lowered:
+            _ensure_condition("source_type", "PO")
+        if "quote" in lowered:
+            _ensure_condition("source_type", "Quote")
+
+        synonyms: Dict[str, List[str]] = {
+            "payment terms": ["net terms", "discount period"],
+            "lead time": ["delivery time", "turnaround"],
+            "escalation": ["escalation clause"],
+        }
+        expansions: List[str] = []
+        for phrase, alternatives in synonyms.items():
+            if phrase in lowered:
+                expansions.extend(alternatives)
+
+        if expansions:
+            unique = " ".join(sorted(set(expansions)))
+            normalised = f"{normalised} {unique}".strip()
+
+        return normalised, conditions
+
+    def _compose_hint_text(
+        self,
+        session_hint: Optional[str],
+        memory_fragments: Optional[List[str]],
+    ) -> str:
+        hints: List[str] = []
+        if session_hint:
+            snippet = re.sub(r"\s+", " ", session_hint).strip()
+            if snippet:
+                hints.append(snippet)
+        if memory_fragments:
+            for fragment in memory_fragments:
+                cleaned = re.sub(r"\s+", " ", str(fragment or "")).strip()
+                if cleaned:
+                    hints.append(cleaned)
+        return " ".join(hints)
+
+    def _looks_like_policy_query(
+        self, query: str, hint_text: Optional[str]
+    ) -> bool:
+        combined = " ".join(
+            part.strip().lower()
+            for part in (query or "", hint_text or "")
+            if part and part.strip()
+        )
+        if not combined:
+            return False
+
+        policy_tokens = (
+            "policy",
+            "policies",
+            "approved supplier",
+            "supplier approval",
+            "compliance",
+            "procurement rule",
+            "sourcing rule",
+            "maverick",
+            "non-approved",
+            "delegation of authority",
+        )
+        return any(token in combined for token in policy_tokens)
+
+    def _merge_filters(
+        self,
+        base_filter: Optional[models.Filter],
+        extra_conditions: List[models.FieldCondition],
+    ) -> Optional[models.Filter]:
+        if not extra_conditions:
+            return base_filter
+        if base_filter is None:
+            return models.Filter(must=list(extra_conditions))
+
+        merged_must = list(getattr(base_filter, "must", []) or [])
+        merged_must.extend(extra_conditions)
+        merged_must_not = list(getattr(base_filter, "must_not", []) or [])
+        merged_should = list(getattr(base_filter, "should", []) or [])
+        return models.Filter(
+            must=merged_must,
+            must_not=merged_must_not if merged_must_not else None,
+            should=merged_should if merged_should else None,
+        )
+
+    def _separate_session_scope(
+        self,
+        active_filter: Optional[models.Filter],
+        session_id: Optional[str],
+    ) -> Tuple[Optional[models.Filter], Optional[str]]:
+        """Detach session-specific constraints from the shared filter space."""
+
+        session_token = self._normalise_session_token(session_id)
+        if active_filter is None:
+            return None, session_token
+
+        def _extract_from_condition(condition: Any) -> Tuple[bool, Optional[str]]:
+            if isinstance(condition, models.FieldCondition):
+                key = getattr(condition, "key", None)
+                if key and str(key).strip().lower() == "session_id":
+                    match_obj = getattr(condition, "match", None)
+                    candidate: Optional[str] = None
+                    if isinstance(match_obj, models.MatchValue):
+                        candidate = self._normalise_session_token(match_obj.value)
+                    elif isinstance(match_obj, models.MatchAny):
+                        for item in getattr(match_obj, "any", []) or []:
+                            candidate = self._normalise_session_token(item)
+                            if candidate:
+                                break
+                    return True, candidate
+            if isinstance(condition, dict):
+                key = str(condition.get("key") or condition.get("field") or "").strip().lower()
+                if key == "session_id":
+                    value = condition.get("value")
+                    if value is None:
+                        match_payload = condition.get("match")
+                        if isinstance(match_payload, dict):
+                            value = match_payload.get("value") or match_payload.get("any")
+                    candidate = None
+                    if isinstance(value, list):
+                        for item in value:
+                            candidate = self._normalise_session_token(item)
+                            if candidate:
+                                break
+                    else:
+                        candidate = self._normalise_session_token(value)
+                    return True, candidate
+            return False, None
+
+        def _process_conditions(items: Optional[Sequence[Any]]) -> List[Any]:
+            nonlocal session_token
+            processed: List[Any] = []
+            for condition in list(items or []):
+                should_remove, found = _extract_from_condition(condition)
+                if should_remove:
+                    if not session_token and found:
+                        session_token = found
+                    elif found:
+                        session_token = session_token or found
+                    continue
+                processed.append(condition)
+            return processed
+
+        must_conditions = _process_conditions(getattr(active_filter, "must", None))
+        must_not_conditions = _process_conditions(getattr(active_filter, "must_not", None))
+        should_conditions = _process_conditions(getattr(active_filter, "should", None))
+
+        if not (must_conditions or must_not_conditions or should_conditions):
+            return None, session_token
+
+        cleaned_filter = models.Filter(
+            must=must_conditions or None,
+            must_not=must_not_conditions or None,
+            should=should_conditions or None,
+        )
+        return cleaned_filter, session_token
+
+    @staticmethod
+    def _normalise_session_token(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
 
     def create_langchain_retriever_tool(
         self,
@@ -386,6 +1574,121 @@ class RAGService:
                 "falling back to CPU index."
             )
             return index
+
+    # ------------------------------------------------------------------
+    # LangCache integration helpers
+    # ------------------------------------------------------------------
+    def _rebuild_cached_hits(
+        self,
+        cached_entries: List[Dict[str, Any]],
+        query: str,
+        top_k: int,
+    ) -> Optional[List[SimpleNamespace]]:
+        rebuilt: List[SimpleNamespace] = []
+        for entry in cached_entries:
+            response = entry.get("response")
+            if not isinstance(response, str):
+                continue
+            try:
+                payload = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            hits = payload.get("hits")
+            if not isinstance(hits, list):
+                continue
+            similarity = float(entry.get("similarity") or 0.0)
+            if entry.get("prompt") == query and similarity >= 0.995:
+                for hit in hits[:top_k]:
+                    rebuilt_hit = self._convert_cache_hit(hit)
+                    if rebuilt_hit is not None:
+                        collection_name = (
+                            getattr(rebuilt_hit, "payload", {}) or {}
+                        ).get("collection_name")
+                        if (
+                            collection_name
+                            and collection_name == self.learning_collection
+                        ):
+                            continue
+                        rebuilt.append(rebuilt_hit)
+                if rebuilt:
+                    return rebuilt[:top_k]
+        return None
+
+    def _augment_candidates_from_cache(
+        self,
+        cached_entries: List[Dict[str, Any]],
+        register: Callable[[str, Dict[str, Any], Any, float, int, float], None],
+        weight: float,
+    ) -> None:
+        for entry in cached_entries:
+            response = entry.get("response")
+            if not isinstance(response, str):
+                continue
+            try:
+                payload = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            hits = payload.get("hits")
+            if not isinstance(hits, list):
+                continue
+            similarity = float(entry.get("similarity") or 0.0)
+            similarity_weight = max(0.45, min(1.0, similarity))
+            effective_weight = weight * similarity_weight
+            for rank, cached_hit in enumerate(hits, 1):
+                rebuilt = self._convert_cache_hit(cached_hit)
+                if rebuilt is None:
+                    continue
+                score = float(
+                    cached_hit.get("combined_score", cached_hit.get("score", 0.0))
+                )
+                register(
+                    "cache",
+                    rebuilt.payload,
+                    rebuilt.id,
+                    score,
+                    rank,
+                    effective_weight,
+                )
+
+    def _convert_cache_hit(self, cached_hit: Dict[str, Any]) -> Optional[SimpleNamespace]:
+        if not isinstance(cached_hit, dict):
+            return None
+        payload = cached_hit.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        payload = dict(payload)
+        collection = cached_hit.get(
+            "collection_name", payload.get("collection_name", self.primary_collection)
+        )
+        payload.setdefault("collection_name", collection)
+        hit_id = cached_hit.get("id") or payload.get("record_id")
+        if hit_id is None:
+            return None
+        score = float(cached_hit.get("combined_score", cached_hit.get("score", 0.0)))
+        return SimpleNamespace(id=str(hit_id), payload=payload, score=score)
+
+    def _normalise_payload_for_cache(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        def _normalise(value: Any):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, list):
+                return [_normalise(item) for item in value]
+            if isinstance(value, tuple):
+                return [_normalise(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): _normalise(val) for key, val in value.items()}
+            return str(value)
+
+        filtered = {
+            key: value
+            for key, value in (payload or {}).items()
+            if key not in DISALLOWED_METADATA_KEYS
+        }
+        try:
+            json.dumps(filtered)
+            return filtered
+        except (TypeError, ValueError):
+            return _normalise(filtered)
 
         try:  # pragma: no cover - depends on GPU libraries
             resources = faiss.StandardGpuResources()

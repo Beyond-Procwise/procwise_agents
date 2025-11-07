@@ -7,7 +7,7 @@ import os
 import time
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -17,6 +17,7 @@ from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.opportunity_service import record_opportunity_feedback
 from services.email_dispatch_service import EmailDispatchService
+from services.backend_scheduler import BackendScheduler
 from repositories import draft_rfq_emails_repo
 
 # Ensure GPU-related environment variables are set
@@ -51,12 +52,13 @@ def get_agent_nick(request: Request):
 class AskRequest(BaseModel):
     query: str
     user_id: str
+    session_id: Optional[str] = None
     model_name: Optional[str] = None
     doc_type: Optional[str] = None
     product_type: Optional[str] = None
     file_path: Optional[str] = Field(default=None, description="Optional local file path", json_schema_extra={"example": None})
 
-    @field_validator("doc_type", "product_type", "file_path", mode="before")
+    @field_validator("doc_type", "product_type", "file_path", "session_id", mode="before")
     @classmethod
     def _empty_to_none(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -659,6 +661,35 @@ def _extract_workflow_token(payload: Any) -> Optional[str]:
     return None
 
 
+def _resolve_workflow_from_dispatch_result(result: Any) -> Optional[str]:
+    if not isinstance(result, dict):
+        return None
+
+    workflow_identifier = _coerce_identifier(result.get("workflow_id"))
+    if workflow_identifier:
+        return workflow_identifier
+
+    draft_payload = result.get("draft")
+    if isinstance(draft_payload, dict):
+        candidate = _extract_workflow_token(draft_payload)
+        if candidate:
+            return candidate
+
+    context_payload = result.get("workflow_context")
+    if isinstance(context_payload, dict):
+        candidate = _coerce_identifier(context_payload.get("workflow_id"))
+        if candidate:
+            return candidate
+
+    dispatch_metadata = result.get("dispatch_metadata")
+    if isinstance(dispatch_metadata, dict):
+        candidate = _coerce_identifier(dispatch_metadata.get("workflow_id"))
+        if candidate:
+            return candidate
+
+    return None
+
+
 def _resolve_dispatch_workflow_id(
     request_model: "EmailDispatchRequest", identifier: Optional[str]
 ) -> Optional[str]:
@@ -758,8 +789,17 @@ async def build_email_dispatch_request(request: Request) -> EmailDispatchRequest
 @router.post("/ask")
 async def ask_question(
     req: AskRequest,
+    request: Request,
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
 ):
+    def _clean(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        return value or None
+
     file_data: List[tuple[bytes, str]] = []
     if req.file_path:
         if not os.path.isfile(req.file_path):
@@ -770,10 +810,14 @@ async def ask_question(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
 
+    header_session = _clean(request.headers.get("x-session-id"))
+    resolved_session = _clean(req.session_id) or header_session or _clean(req.user_id)
+
     result = await run_in_threadpool(
         pipeline.answer_question,
         query=req.query,
         user_id=req.user_id,
+        session_id=resolved_session,
         model_name=req.model_name,
         files=file_data or None,
         doc_type=req.doc_type,
@@ -1057,11 +1101,7 @@ async def send_email(
         else:
             response_recipients = dispatch_request.resolve_recipients() or []
 
-        result_workflow_id = _coerce_identifier(result.get("workflow_id"))
-        if not result_workflow_id:
-            draft_payload = result.get("draft") if isinstance(result, dict) else None
-            if isinstance(draft_payload, dict):
-                result_workflow_id = _extract_workflow_token(draft_payload)
+        result_workflow_id = _resolve_workflow_from_dispatch_result(result)
 
         if workflow_id_hint and result_workflow_id and workflow_id_hint != result_workflow_id:
             logger.error(
@@ -1181,6 +1221,7 @@ async def dispatch_batch_emails(
     dispatch_service = EmailDispatchService(agent_nick)
 
     results: List[Dict[str, Any]] = []
+    workflows_to_notify: Set[str] = set()
     for draft in request.drafts:
         identifier = draft.resolved_identifier()
         if not identifier:
@@ -1206,6 +1247,7 @@ async def dispatch_batch_emails(
                 sender=draft.resolved_sender(),
                 subject_override=draft.resolved_subject(),
                 body_override=draft.resolved_body(),
+                notify_watcher=False,
             )
             results.append(
                 {
@@ -1216,6 +1258,10 @@ async def dispatch_batch_emails(
                     "subject": result.get("subject") or draft.resolved_subject(),
                 }
             )
+            if result.get("sent"):
+                workflow_identifier = _resolve_workflow_from_dispatch_result(result)
+                if workflow_identifier:
+                    workflows_to_notify.add(workflow_identifier)
         except Exception as exc:  # pragma: no cover - runtime dependent
             logger.error("Failed to dispatch %s: %s", identifier, str(exc))
             results.append(
@@ -1229,6 +1275,20 @@ async def dispatch_batch_emails(
             )
 
     success_count = sum(1 for r in results if r.get("sent"))
+
+    if workflows_to_notify:
+        try:
+            scheduler = BackendScheduler.ensure(agent_nick)
+            for workflow_identifier in workflows_to_notify:
+                try:
+                    scheduler.notify_email_dispatch(workflow_identifier)
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception(
+                        "Failed to trigger email watcher for workflow %s",
+                        workflow_identifier,
+                    )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to initialise backend scheduler for batch dispatch")
 
     return {
         "success": success_count == len(results) if results else False,
@@ -1272,12 +1332,14 @@ async def dispatch_workflow_drafts(
         dispatch_service = EmailDispatchService(agent_nick)
 
         results: List[Dict[str, Any]] = []
+        workflows_to_notify: Set[str] = set()
         for unique_id, supplier_id, subject, sent in draft_rows:
             try:
                 result = await run_in_threadpool(
                     dispatch_service.send_draft,
                     identifier=unique_id,
                     subject_override=subject,
+                    notify_watcher=False,
                 )
                 results.append(
                     {
@@ -1288,6 +1350,10 @@ async def dispatch_workflow_drafts(
                         "subject": subject,
                     }
                 )
+                if result.get("sent"):
+                    workflow_identifier = _resolve_workflow_from_dispatch_result(result)
+                    if workflow_identifier:
+                        workflows_to_notify.add(workflow_identifier)
             except Exception as exc:  # pragma: no cover - runtime dependent
                 logger.error("Failed to dispatch %s: %s", unique_id, str(exc))
                 results.append(
@@ -1301,6 +1367,22 @@ async def dispatch_workflow_drafts(
                 )
 
         success_count = sum(1 for r in results if r.get("sent"))
+
+        if workflows_to_notify:
+            try:
+                scheduler = BackendScheduler.ensure(agent_nick)
+                for workflow_identifier in workflows_to_notify:
+                    try:
+                        scheduler.notify_email_dispatch(workflow_identifier)
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to trigger email watcher for workflow %s",
+                            workflow_identifier,
+                        )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Failed to initialise backend scheduler for workflow dispatch"
+                )
 
         return {
             "success": success_count == len(results),

@@ -39,6 +39,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from utils.email_markers import attach_hidden_marker
 from utils.email_tracking import generate_unique_email_id
+from services.negotiation_email_templates import NegotiationEmailTemplateRenderer
 
 logger = logging.getLogger(__name__)
 
@@ -451,9 +452,16 @@ class WorkflowContextManager:
 class EmailDraftingAgent:
     """Generate procurement RFQ drafts while anchoring unique identifiers."""
 
-    def __init__(self, db: MockDatabaseConnection, context: WorkflowContextManager) -> None:
+    def __init__(
+        self,
+        db: MockDatabaseConnection,
+        context: WorkflowContextManager,
+        *,
+        template_renderer: Optional[NegotiationEmailTemplateRenderer] = None,
+    ) -> None:
         self.db = db
         self.context = context
+        self.template_renderer = template_renderer or NegotiationEmailTemplateRenderer.from_default()
 
     async def generate_initial_email(
         self, workflow_id: str, supplier: Dict[str, Any]
@@ -462,12 +470,9 @@ class EmailDraftingAgent:
         supplier_email = supplier.get("email")
         unique_id = generate_unique_email_id(workflow_id, supplier_id)
 
-        subject = f"Request for Quotation – {supplier.get('name', supplier_id)}"
-        base_body = (
-            f"Hello {supplier.get('contact', 'team')},\n\n"
-            f"We are initiating a procurement workflow (workflow_id={workflow_id}).\n"
-            "Please review the attached requirements and provide your quotation."
-        )
+        supplier_payload = dict(supplier)
+        supplier_payload.setdefault("supplier_id", supplier_id)
+        subject, base_body = self.template_renderer.initial_quote_request(supplier_payload)
         marked_body, marker_token = attach_hidden_marker(
             base_body,
             supplier_id=supplier_id,
@@ -565,9 +570,16 @@ class SupplierInteractionAgent:
 class NegotiationAgent:
     """Generate counter proposals for each supplier response."""
 
-    def __init__(self, db: MockDatabaseConnection, context: WorkflowContextManager) -> None:
+    def __init__(
+        self,
+        db: MockDatabaseConnection,
+        context: WorkflowContextManager,
+        *,
+        template_renderer: Optional[NegotiationEmailTemplateRenderer] = None,
+    ) -> None:
         self.db = db
         self.context = context
+        self.template_renderer = template_renderer or NegotiationEmailTemplateRenderer.from_default()
 
     async def run(
         self,
@@ -604,15 +616,21 @@ class NegotiationAgent:
         thread: EmailThread,
         response: SupplierResponse,
     ) -> DraftEmail:
-        subject = (
-            "Re: Pricing Discussion - "
-            f"{response.payload.get('subject_hint', thread.supplier_id)}"
-        )
-        content = (
-            f"Thank you for the update. After reviewing your message we would "
-            f"like to align on {response.payload.get('proposal_summary', 'the terms discussed')}"
-            " while remaining within our budget expectations."
-        )
+        supplier_payload: Dict[str, Any] = {
+            "supplier_id": thread.supplier_id,
+            "name": response.payload.get("supplier_name") or thread.supplier_id,
+            "contact_name": response.payload.get("contact_name"),
+            "commodity": response.payload.get("commodity")
+            or response.payload.get("item_name"),
+        }
+        if round_number <= 1:
+            subject, content = self.template_renderer.renegotiation_request(
+                supplier_payload
+            )
+        else:
+            subject, content = self.template_renderer.final_review_request(
+                supplier_payload
+            )
         annotated_body, marker_token = attach_hidden_marker(
             content,
             supplier_id=thread.supplier_id,
@@ -688,10 +706,19 @@ class WorkflowOrchestrator:
             start_time=datetime.now(timezone.utc).isoformat(),
         )
         self.context_manager = WorkflowContextManager()
+        self.template_renderer = NegotiationEmailTemplateRenderer.from_default()
         self.threads: Dict[str, EmailThread] = {}
-        self.drafting_agent = EmailDraftingAgent(db, self.context_manager)
+        self.drafting_agent = EmailDraftingAgent(
+            db,
+            self.context_manager,
+            template_renderer=self.template_renderer,
+        )
         self.interaction_agent = SupplierInteractionAgent(db)
-        self.negotiation_agent = NegotiationAgent(db, self.context_manager)
+        self.negotiation_agent = NegotiationAgent(
+            db,
+            self.context_manager,
+            template_renderer=self.template_renderer,
+        )
         self.comparison_agent = QuoteComparisonAgent(db)
 
     async def _initialize_response_tracking(
@@ -751,6 +778,12 @@ class WorkflowOrchestrator:
         }
         return thread
 
+    def build_approval_email(self) -> Dict[str, str]:
+        """Return the approval email payload derived from the workflow template."""
+
+        subject, body = self.template_renderer.approval_request_email()
+        return {"subject": subject, "body": body}
+
 
 async def handle_supplier_response(
     db: MockDatabaseConnection,
@@ -800,6 +833,10 @@ async def validate_implementation() -> None:
 
     responses = await orchestrator.wait_for_responses(1, "validation", round_num=0)
     assert thread.supplier_id in responses
+
+    approval_preview = orchestrator.build_approval_email()
+    assert approval_preview.get("subject")
+    assert approval_preview.get("body")
 
 
 __all__ = [

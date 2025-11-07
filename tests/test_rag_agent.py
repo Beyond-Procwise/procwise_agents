@@ -1,128 +1,83 @@
 from types import SimpleNamespace
-from typing import Dict
+import pathlib
+import sys
+
+import numpy as np
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from agents import rag_agent as rag_module
+from agents.base_agent import AgentStatus
 
 
-class DummyCrossEncoder:
-    def __init__(self, *args, **kwargs):
-        pass
+class DummyEmbedder:
+    def encode(self, texts):
+        import hashlib
 
-    def predict(self, pairs):
-        return [0.0 for _ in pairs]
+        vectors = []
+        size = 64
+        for text in texts:
+            vec = np.zeros(size, dtype=float)
+            for token in text.lower().split():
+                digest = hashlib.sha1(token.encode("utf-8")).digest()
+                index = digest[0] % size
+                vec[index] += 1.0
+            vectors.append(vec)
+        return vectors if len(vectors) > 1 else vectors[0]
 
 
-def test_rag_agent_applies_filters(monkeypatch):
-    monkeypatch.setattr(rag_module, "CrossEncoder", DummyCrossEncoder)
-
-    captured = {}
-
-    class DummyRAGService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def search(self, query, top_k=5, filters=None):
-            captured["filters"] = filters
-            return []
-
-    monkeypatch.setattr(rag_module, "RAGService", DummyRAGService)
-
+@pytest.fixture
+def agent(monkeypatch):
     nick = SimpleNamespace(
         device="cpu",
-        settings=SimpleNamespace(reranker_model="dummy"),
-        qdrant_client=SimpleNamespace(),
-        embedding_model=SimpleNamespace(),
+        settings=SimpleNamespace(),
+        embedding_model=DummyEmbedder(),
     )
-    agent = rag_module.RAGAgent(nick)
-    agent._expand_query = lambda q: []
-    agent._load_chat_history = lambda u, s=None: []
-    agent._save_chat_history = lambda u, h, s=None: None
-    agent.call_ollama = lambda prompt, model: {"response": "ans"}
-    agent._generate_followups = lambda q, c: []
-
-    agent.run("q", "u", doc_type="Invoice")
-
-    flt = captured.get("filters")
-    assert flt is not None
-    assert flt.must[0].key == "document_type"
-    assert flt.must[0].match.value == "invoice"
+    # Avoid GPU initialisation noise in tests
+    monkeypatch.setattr(rag_module, "logger", rag_module.logging.getLogger("rag_agent_test"))
+    return rag_module.RAGAgent(nick)
 
 
-def test_rag_agent_generates_agentic_plan(monkeypatch):
-    monkeypatch.setattr(rag_module, "CrossEncoder", DummyCrossEncoder)
+def test_rag_agent_returns_static_answer(agent):
+    result = agent.run("What is our current total savings year to date?", "user-1")
+    assert result.status == AgentStatus.SUCCESS
+    answer = result.data["answer"]
+    assert answer.startswith("## Summary")
+    assert "Looking at the spend position" in answer
+    assert "Key figures that anchor the conversation" in answer
+    assert result.data["structure_type"] == "financial_analysis"
+    assert result.data["structured"] is True
+    assert any("£" in point for point in result.data["main_points"])
+    assert "£2.8 million" in result.data["original_answer"]
+    assert result.data["topic"] == "Current Total Savings Year-to-Date"
+    assert len(result.data["related_prompts"]) == 3
 
-    class DummyRAGService:
-        def __init__(self, *args, **kwargs):
-            pass
 
-        def search(self, query, top_k=5, filters=None):
-            return [
-                SimpleNamespace(
-                    id="doc-1",
-                    payload={
-                        "record_id": "DOC1",
-                        "document_type": "invoice",
-                        "content": "Invoice total 1,200 GBP with extended warranty",
-                        "supplier_name": "Supplier One",
-                    },
-                    score=0.7,
-                ),
-                SimpleNamespace(
-                    id="kg-1",
-                    payload={
-                        "document_type": "supplier_flow",
-                        "supplier_id": "S1",
-                        "supplier_name": "Supplier One",
-                        "coverage_ratio": 0.75,
-                        "purchase_orders": {"count": 3},
-                    },
-                    score=0.9,
-                ),
-            ]
-
-    monkeypatch.setattr(rag_module, "RAGService", DummyRAGService)
-
-    captured_plan: Dict[str, str] = {}
-
-    def fake_plan(self, query, outline, knowledge_summary):
-        captured_plan["query"] = query
-        captured_plan["outline"] = outline
-        captured_plan["knowledge_summary"] = knowledge_summary
-        return "1. Investigate supplier coverage\n2. Confirm invoice specifics"
-
-    monkeypatch.setattr(
-        rag_module.RAGAgent, "_generate_agentic_plan", fake_plan, raising=False
+def test_rag_agent_maintains_topic_context(agent):
+    first = agent.run(
+        "Who are my approved suppliers I can use for events?",
+        "user-1",
+        session_id="session-A",
     )
-
-    nick = SimpleNamespace(
-        device="cpu",
-        settings=SimpleNamespace(reranker_model="dummy", extraction_model="test-model"),
-        qdrant_client=SimpleNamespace(),
-        embedding_model=SimpleNamespace(),
+    follow_up = agent.run(
+        "How do I request event supplier engagement?",
+        "user-1",
+        session_id="session-A",
     )
+    assert follow_up.data["topic"] == first.data["topic"]
+    assert follow_up.data["answer"].startswith("## Overview")
+    assert "Thanks for checking in about" in follow_up.data["answer"]
 
-    agent = rag_module.RAGAgent(nick)
-    agent._expand_query = lambda q: []
-    agent._load_chat_history = lambda u, s=None: []
-    agent._save_chat_history = lambda u, h, s=None: None
-    agent.call_ollama = lambda prompt, model, format=None: {"response": "Final answer"}
-    agent._generate_followups = lambda q, c: ["Next step"]
 
-    result = agent.run("How is Supplier One performing?", "user-1")
-
-    assert isinstance(result, rag_module.AgentOutput)
-    assert result.data["answer"] == "Final answer"
-    assert result.data["follow_up_questions"] == ["Next step"]
-
-    retrieved = result.data["retrieved_documents"]
-    knowledge_entry = next(
-        item
-        for item in retrieved
-        if item.get("document_type") == "knowledge_summary"
+def test_rag_agent_switches_topic_on_new_question(agent):
+    agent.run("What is our current total savings year to date?", "user-2", session_id="session-B")
+    next_answer = agent.run(
+        "What business expenses can I not claim?",
+        "user-2",
+        session_id="session-B",
     )
-    assert "Supplier One" in knowledge_entry["summary"]
-    assert "coverage" in knowledge_entry["summary"].lower()
-    assert captured_plan["knowledge_summary"]
-    assert "Supplier One" in captured_plan["knowledge_summary"]
-    assert "Invoice" in captured_plan["outline"]
-    assert result.agentic_plan == "1. Investigate supplier coverage\n2. Confirm invoice specifics"
+    assert next_answer.data["topic"] == "Business Expenses That Cannot Be Claimed"
+    assert next_answer.data["answer"].startswith("## What Business Expenses Can I Not Claim Policy")

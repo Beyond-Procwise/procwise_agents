@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
 
+import pdfplumber
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, Request
+from docx import Document as DocxDocument
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from pptx import Presentation
 from pydantic import BaseModel, Field, field_validator
 
+from services.document_embedding_service import DocumentEmbeddingService
 from services.document_extractor import DocumentExtractor
+from services.model_selector import RAGPipeline
 
 # Ensure GPU-related environment variables align with the rest of the API.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -23,10 +29,11 @@ os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/documents", tags=["Documents"])
+router = APIRouter(prefix="/document", tags=["Documents"])
 
 
 DEFAULT_S3_BUCKET_NAME = "procwisemvp"
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".pptx", ".txt"}
 
 
 def get_agent_nick(request: Request):
@@ -34,6 +41,72 @@ def get_agent_nick(request: Request):
     if not agent_nick:
         raise HTTPException(status_code=503, detail="AgentNick not available")
     return agent_nick
+
+
+def get_rag_pipeline(request: Request) -> RAGPipeline:
+    pipeline = getattr(request.app.state, "rag_pipeline", None)
+    if not pipeline:
+        raise HTTPException(
+            status_code=503, detail="RAG Pipeline service is not available."
+        )
+    return pipeline
+
+
+def _extract_text_from_bytes(filename: str, data: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{suffix or 'unknown'}'. "
+                "Allowed types: PDF, DOCX, PPTX, TXT."
+            ),
+        )
+
+    if suffix == ".pdf":
+        try:
+            with pdfplumber.open(BytesIO(data)) as pdf:
+                pages = [page.extract_text() for page in pdf.pages]
+        except Exception as exc:  # pragma: no cover - depends on document layout
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read PDF document '{filename}': {exc}",
+            ) from exc
+        return "\n".join(page for page in pages if page)
+
+    if suffix == ".docx":
+        try:
+            document = DocxDocument(BytesIO(data))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read DOCX document '{filename}': {exc}",
+            ) from exc
+        return "\n".join(
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text and paragraph.text.strip()
+        )
+
+    if suffix == ".pptx":
+        try:
+            presentation = Presentation(BytesIO(data))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read PPTX document '{filename}': {exc}",
+            ) from exc
+        slide_text: List[str] = []
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    slide_text.append(shape.text)
+        return "\n".join(slide_text)
+
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="ignore")
 
 
 class S3DocumentExtractionRequest(BaseModel):
@@ -59,6 +132,32 @@ class S3DocumentExtractionRequest(BaseModel):
         if not path:
             raise ValueError("s3_path must not be empty")
         return path
+
+
+class DocumentEmbeddingResponse(BaseModel):
+    """Response payload for embedded document uploads."""
+
+    document_id: str
+    collection: str
+    chunk_count: int
+    metadata: Dict[str, Any]
+
+
+class DocumentEmbeddingError(BaseModel):
+    """Details about documents that failed to embed."""
+
+    filename: str
+    reason: str
+
+
+class DocumentEmbeddingBatchResponse(BaseModel):
+    """Aggregate response for multi-document embedding uploads."""
+
+    status: str
+    total_documents: int
+    total_chunks: int
+    processed: List[DocumentEmbeddingResponse]
+    failed: List[DocumentEmbeddingError] = Field(default_factory=list)
 
 
 def _resolve_s3_path(s3_path: str, default_bucket: str) -> Tuple[str, str]:
@@ -242,5 +341,163 @@ def extract_document_from_s3(
     return response_payload
 
 
-__all__ = ["router"]
+@router.post("/embed-document", response_model=DocumentEmbeddingBatchResponse)
+async def embed_documents(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    user_id: Optional[str] = Form(None),
+    pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    agent_nick=Depends(get_agent_nick),
+):
+    """Upload, extract, embed, and register user-provided documents for the RAG pipeline."""
 
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one document must be provided")
+
+    def _clean(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        return value or None
+
+    header_user = _clean(request.headers.get("x-user-id"))
+    header_session = _clean(request.headers.get("x-session-id"))
+    query_user = _clean(request.query_params.get("user_id"))
+
+    resolved_user: Optional[str] = None
+    for candidate in (_clean(user_id), header_user, query_user):
+        if candidate:
+            resolved_user = candidate
+            break
+
+    rag_service = pipeline.rag
+    collection_name = getattr(rag_service, "uploaded_collection", "uploaded_documents")
+
+    try:
+        rag_service.ensure_collection(collection_name)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to initialise Qdrant collection for uploads")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to initialise vector collection for uploaded documents.",
+        ) from exc
+
+    embedding_service = DocumentEmbeddingService(agent_nick, collection_name=collection_name)
+
+    processed: List[DocumentEmbeddingResponse] = []
+    failures: List[DocumentEmbeddingError] = []
+    total_chunks = 0
+
+    for upload in files:
+        filename = Path(upload.filename or "uploaded_document").name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES:
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason=(
+                        f"Unsupported file type '{suffix or 'unknown'}'. "
+                        "Allowed types: PDF, DOCX, PPTX, TXT."
+                    ),
+                )
+            )
+            continue
+
+        try:
+            data = await upload.read()
+        except Exception as exc:
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason=f"Unable to read file: {exc}",
+                )
+            )
+            continue
+
+        if not data:
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason="Uploaded file contained no data.",
+                )
+            )
+            continue
+
+        metadata: Dict[str, Any] = {
+            "mime_type": upload.content_type or "",
+            "ingestion_source": "document_embed_endpoint",
+        }
+        if resolved_user:
+            metadata["uploaded_by"] = resolved_user
+
+        try:
+            embedded = embedding_service.embed_document(
+                filename=filename,
+                file_bytes=data,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            failures.append(DocumentEmbeddingError(filename=filename, reason=str(exc)))
+            continue
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Embedding pipeline failed for %s", filename)
+            failures.append(
+                DocumentEmbeddingError(
+                    filename=filename,
+                    reason="Unexpected error while embedding document.",
+                )
+            )
+            continue
+
+        processed.append(
+            DocumentEmbeddingResponse(
+                document_id=embedded.document_id,
+                collection=embedded.collection,
+                chunk_count=embedded.chunk_count,
+                metadata=embedded.metadata,
+            )
+        )
+        total_chunks += embedded.chunk_count
+
+    if not processed:
+        detail = failures[0].reason if failures else "No documents were processed."
+        raise HTTPException(status_code=400, detail=detail)
+
+    uploaded_document_ids = [doc.document_id for doc in processed]
+    upload_metadata = {
+        "filenames": [
+            doc.metadata.get("filename") or doc.metadata.get("doc_name") for doc in processed
+        ],
+        "total_chunks": total_chunks,
+    }
+    if resolved_user:
+        upload_metadata["uploaded_by"] = resolved_user
+
+    try:
+        pipeline.activate_uploaded_context(
+            uploaded_document_ids,
+            metadata=upload_metadata,
+            session_id=header_session or resolved_user,
+        )
+    except AttributeError:
+        logger.debug(
+            "RAG pipeline does not expose uploaded context activation",
+            exc_info=True,
+        )
+
+    return DocumentEmbeddingBatchResponse(
+        status="success",
+        total_documents=len(processed),
+        total_chunks=total_chunks,
+        processed=processed,
+        failed=failures,
+    )
+
+
+__all__ = ["router"]

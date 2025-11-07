@@ -1,0 +1,422 @@
+[
+  {
+    "topic": "Current Total Savings Year-to-Date",
+    "context_prompts": [
+      "How does this compare with the same period last year?",
+      "Show me the savings trend over the past 6 months.",
+      "How much is still in the savings pipeline?"
+    ],
+    "qas": [
+      {
+        "question": "What is our current total savings year to date?",
+        "answer": "Year-to-date realised savings are around £2.8 million, mainly from IT and facilities contract renewals."
+      },
+      {
+        "question": "How does this compare with the same period last year?",
+        "answer": "Savings are about 14% higher than last year due to improved contract controls and supplier terms."
+      },
+      {
+        "question": "Which areas contributed most to the savings?",
+        "answer": "IT services, facilities, and marketing contributed the majority of savings through rate reviews and consolidation."
+      },
+      {
+        "question": "Show me the savings trend over the past 6 months.",
+        "answer": "Monthly realised savings moved from £350k in April to £570k in September, steadily increasing as renewals were renegotiated."
+      },
+      {
+        "question": "How much is still in the savings pipeline?",
+        "answer": "Approximately £1.1 million remains in the savings pipeline, tied to Q4 software renewals and marketing consolidations."
+      }
+    ]
+  },
+  {
+    "topic": "Business Expenses That Cannot Be Claimed",
+    "context_prompts": [
+      "Are there exceptions for entertainment?",
+      "Where is the full list of non-reimbursables?",
+      "What happens if a non-claimable expense is submitted?"
+    ],
+    "qas": [
+      {
+        "question": "What business expenses can I not claim?",
+        "answer": "Non-claimable expenses include alcohol (unless pre-approved), personal travel upgrades, and hotel incidentals."
+      },
+      {
+        "question": "Are there exceptions for entertainment?",
+        "answer": "Yes, if pre-approved and under the £100 per person threshold for client meetings."
+      },
+      {
+        "question": "Where is the full list of non-reimbursables?",
+        "answer": "The complete non-reimbursable list is published in the Travel & Expense Policy on the intranet under Finance → Policies → Expenses."
+      },
+      {
+        "question": "What happens if a non-claimable expense is submitted?",
+        "answer": "It will be declined, logged, and repeated breaches may lead to disciplinary action."
+      }
+    ]
+  },
+  {
+    "topic": "Approved Suppliers for Events",
+    "context_prompts": [
+      "Can a new supplier be used for a specific event?",
+      "How do I request event supplier engagement?",
+      "What approvals are required for new event suppliers?"
+    ],
+    "qas": [
+      {
+        "question": "Who are my approved suppliers I can use for events?",
+        "answer": "BrightStage Events, Creative Catering Co., City AV Solutions, and VenueLink Global are approved."
+      },
+      {
+        "question": "Can a new supplier be used for a specific event?",
+        "answer": "Only after full onboarding, compliance review, and Procurement approval."
+      },
+      {
+        "question": "How do I request event supplier engagement?",
+        "answer": "Submit an event brief through the Procurement Intake Tool with scope, dates, and budget."
+      },
+      {
+        "question": "What approvals are required for new event suppliers?",
+        "answer": "Procurement must complete due diligence, risk review, and secure director sign-off before the supplier can be contracted."
+      }
+    ]
+  },
+  {
+    "topic": "Top 10 Suppliers",
+    "context_prompts": [
+      "Have there been changes recently?",
+      "What share of total spend do these suppliers represent?",
+      "Are any new suppliers approaching the top 10 threshold?"
+    ],
+    "qas": [
+      {
+        "question": "Who are my top 10 suppliers?",
+        "answer": "TechCore, Global Facilities, BrightStage, and others based on spend."
+      },
+      {
+        "question": "Have there been changes recently?",
+        "answer": "Yes, DataEdge entered top 10; CleanBuild dropped off."
+      },
+      {
+        "question": "What share of total spend do these suppliers represent?",
+        "answer": "Top 10 represent 56% of total spend YTD."
+      },
+      {
+        "question": "Are any new suppliers approaching the top 10 threshold?",
+        "answer": "Yes, EcoLogix and PrintSphere are trending upward and are within 5% of entering the top 10 list."
+      }
+    ]
+  },
+  {
+    "topic": "Spend Concentration – Top 20 vs Rest",
+    "context_prompts": [
+      "Is that concentration level acceptable?",
+      "Which category is most concentrated?",
+      "What actions are planned to address supplier concentration risk?"
+    ],
+    "qas": [
+      {
+        "question": "How much do I spend with my top 20 suppliers compared with the rest?",
+        "answer": "Top 20 = 68% of spend; rest = 32%."
+      },
+      {
+        "question": "Is that concentration level acceptable?",
+        "answer": "It provides leverage but also increases supplier risk."
+      },
+      {
+        "question": "Which category is most concentrated?",
+        "answer": "Facilities, where 3 vendors control 84% of spend."
+      },
+      {
+        "question": "What actions are planned to address supplier concentration risk?",
+        "answer": "Procurement is exploring secondary suppliers for facilities and running risk assessments on the top five vendors."
+      }
+    ]
+  },
+  {
+    "topic": "Suppliers Invoicing Above PO Value",
+    "context_prompts": [
+      "Which suppliers consistently invoice above PO value?",
+      "What drives these variances?",
+      "How is this managed?"
+    ],
+    "qas": [
+      {
+        "question": "Which suppliers consistently invoice above PO value?",
+        "answer": "Global Facilities and BrightStage are top outliers."
+      },
+      {
+        "question": "What drives these variances?",
+        "answer": "Scope changes and late PO amendments are common causes."
+      },
+      {
+        "question": "How is this managed?",
+        "answer": "Exceptions are reviewed pre-payment and logged for compliance."
+      },
+      {
+        "question": "How quickly are above-PO exceptions resolved?",
+        "answer": "Most exceptions are cleared within five business days after Procurement confirms the amended scope."
+      }
+    ]
+  },
+  {
+    "topic": "Contracts Expiring in 1 Month Above £100k",
+    "context_prompts": [
+      "How many contracts do I have expiring in the next month above £100k?",
+      "Have renewal discussions started?",
+      "What happens if they lapse?"
+    ],
+    "qas": [
+      {
+        "question": "How many contracts do I have expiring in the next month above £100k?",
+        "answer": "Five — three IT and two Facilities."
+      },
+      {
+        "question": "Have renewal discussions started?",
+        "answer": "Yes, two active, three pending scoping."
+      },
+      {
+        "question": "What happens if they lapse?",
+        "answer": "Interim approvals may be required, increasing non-compliance risk."
+      },
+      {
+        "question": "Which teams own the expiring contracts?",
+        "answer": "Digital owns the three IT renewals while Workplace Services manages the two facilities agreements."
+      }
+    ]
+  },
+  {
+    "topic": "Total Spend by Category, Region, Supplier",
+    "context_prompts": [
+      "Summarise my total spend by category, region, and supplier.",
+      "Which region grew fastest?",
+      "Which category offers most saving potential?"
+    ],
+    "qas": [
+      {
+        "question": "Summarise my total spend by category, region, and supplier.",
+        "answer": "£42.2M total: IT 32%, Facilities 25%, UK 62%, TechCore top supplier."
+      },
+      {
+        "question": "Which region grew fastest?",
+        "answer": "APAC rose 22% due to infrastructure spend."
+      },
+      {
+        "question": "Which category offers most saving potential?",
+        "answer": "Marketing has 9% price variance — ~£400k savings potential."
+      },
+      {
+        "question": "What is the supplier mix by region?",
+        "answer": "TechCore and DataEdge dominate UK and EU, while BrightStage and VenueLink drive APAC event spend."
+      }
+    ]
+  },
+  {
+    "topic": "Maverick Spend",
+    "context_prompts": [
+      "How much maverick spend did we have this month?",
+      "Which areas caused it?",
+      "How will this be reduced?"
+    ],
+    "qas": [
+      {
+        "question": "How much maverick spend did we have this month?",
+        "answer": "£290k, mainly low-value engagements outside approved routes."
+      },
+      {
+        "question": "Which areas caused it?",
+        "answer": "Marketing and consulting led with 73% of maverick spend."
+      },
+      {
+        "question": "How will this be reduced?",
+        "answer": "Guided buying and pre-engagement with Procurement are being reinforced."
+      },
+      {
+        "question": "Are any teams improving maverick compliance?",
+        "answer": "Yes, Technology reduced off-contract spend by 18% after adopting the intake checklist."
+      }
+    ]
+  },
+  {
+    "topic": "Year-on-Year Spend",
+    "context_prompts": [
+      "What is my year-on-year spend?",
+      "What drove the increase?",
+      "Is the increase acceptable?"
+    ],
+    "qas": [
+      {
+        "question": "What is my year-on-year spend?",
+        "answer": "Spend increased from £39.8M to £42.2M — a 6% rise."
+      },
+      {
+        "question": "What drove the increase?",
+        "answer": "Growth in facilities and IT spending were key drivers."
+      },
+      {
+        "question": "Is the increase acceptable?",
+        "answer": "Yes — increased service coverage supported the higher spend."
+      },
+      {
+        "question": "Which areas offset spend growth?",
+        "answer": "Marketing offsets came from campaign consolidation that freed £220k versus last year."
+      }
+    ]
+  },
+  {
+    "topic": "Contracts Non-Compliant",
+    "context_prompts": [
+      "How many contracts are currently non-compliant?",
+      "Which departments are affected?",
+      "What remediation actions are underway?"
+    ],
+    "qas": [
+      {
+        "question": "How many contracts are currently non-compliant?",
+        "answer": "Seven contracts are flagged for non-compliance due to missing approvals or outdated terms."
+      },
+      {
+        "question": "Which departments are affected?",
+        "answer": "Marketing owns four of the contracts and Operations owns three, all awaiting updated governance artefacts."
+      },
+      {
+        "question": "What are the main compliance issues?",
+        "answer": "Expired insurance certificates, unsigned amendments, and absent GDPR schedules are the primary gaps."
+      },
+      {
+        "question": "What remediation actions are underway?",
+        "answer": "Procurement and Legal have scheduled owner reviews this week with a goal to regularise all seven contracts before month-end."
+      }
+    ]
+  },
+  {
+    "topic": "Invoices Exceeding PO Terms",
+    "context_prompts": [
+      "How many invoices exceeded PO terms this month?",
+      "Which suppliers are impacted?",
+      "What controls are being added?"
+    ],
+    "qas": [
+      {
+        "question": "How many invoices exceeded PO terms this month?",
+        "answer": "Twelve invoices exceeded PO terms, totalling £180k above authorised amounts."
+      },
+      {
+        "question": "Which suppliers are impacted?",
+        "answer": "Global Facilities, BrightStage, and City AV Solutions account for nine of the twelve exceptions."
+      },
+      {
+        "question": "How quickly are exceptions resolved?",
+        "answer": "Finance clears most exceptions within five business days once scope confirmations are received."
+      },
+      {
+        "question": "What controls are being added?",
+        "answer": "Mandatory change-order approvals and weekly PO variance dashboards go live next month."
+      }
+    ]
+  },
+  {
+    "topic": "No PO Contracts",
+    "context_prompts": [
+      "How many contracts were raised without a PO?",
+      "Which categories are affected?",
+      "What is being done to close the gaps?"
+    ],
+    "qas": [
+      {
+        "question": "How many contracts were raised without a PO?",
+        "answer": "Nine contracts were executed without a supporting PO this quarter."
+      },
+      {
+        "question": "Which categories are affected?",
+        "answer": "Marketing services and contingent labour account for seven of the nine no-PO agreements."
+      },
+      {
+        "question": "What issues arise from no-PO contracts?",
+        "answer": "They bypass spend controls, delay invoice matching, and increase audit findings."
+      },
+      {
+        "question": "What is being done to close the gaps?",
+        "answer": "Procurement is enforcing the intake checklist and requiring PO references before contract signature."
+      }
+    ]
+  },
+  {
+    "topic": "Procurement Engagement",
+    "context_prompts": [
+      "When should Procurement be engaged?",
+      "What happens if engagement is late?",
+      "How do teams request Procurement support?"
+    ],
+    "qas": [
+      {
+        "question": "When should Procurement be engaged?",
+        "answer": "Engage Procurement at least eight weeks before contract expiry or four weeks before new sourcing needs."
+      },
+      {
+        "question": "What happens if engagement is late?",
+        "answer": "Late engagement compresses negotiation time, limits supplier options, and raises non-compliance risk."
+      },
+      {
+        "question": "How do teams request Procurement support?",
+        "answer": "Submit a request via the Procurement Intake Tool with scope, budget, and timeline details."
+      },
+      {
+        "question": "Who approves expedited Procurement requests?",
+        "answer": "The Head of Procurement reviews and approves expedited paths based on business criticality."
+      }
+    ]
+  },
+  {
+    "topic": "Procurement Process",
+    "context_prompts": [
+      "What are the key steps in the procurement process?",
+      "Where can I find process documentation?",
+      "How long does the standard sourcing cycle take?"
+    ],
+    "qas": [
+      {
+        "question": "What are the key steps in the procurement process?",
+        "answer": "Initiation, sourcing strategy, supplier selection, contract negotiation, and onboarding are the core stages."
+      },
+      {
+        "question": "Where can I find process documentation?",
+        "answer": "Detailed process maps are on the Procurement Hub under \"How We Buy\"."
+      },
+      {
+        "question": "How long does the standard sourcing cycle take?",
+        "answer": "Standard sourcing runs six to eight weeks depending on complexity and risk reviews."
+      },
+      {
+        "question": "Who signs off each stage of the process?",
+        "answer": "Category managers own strategy and selection, while Legal and Finance approve contract and onboarding gates."
+      }
+    ]
+  },
+  {
+    "topic": "Who to Support",
+    "context_prompts": [
+      "Who can support me with procurement questions?",
+      "How do I escalate urgent supplier issues?",
+      "Is there a community for procurement updates?"
+    ],
+    "qas": [
+      {
+        "question": "Who can support me with procurement questions?",
+        "answer": "Your category manager is the first point of contact, with the Procurement Helpdesk covering transactional issues."
+      },
+      {
+        "question": "How do I escalate urgent supplier issues?",
+        "answer": "Escalate through the Procurement Helpdesk who will engage the Head of Supplier Management within two hours."
+      },
+      {
+        "question": "Is there a community for procurement updates?",
+        "answer": "Yes, join the #procwise-procurement Slack channel for updates, Q&A sessions, and policy reminders."
+      },
+      {
+        "question": "Who handles supplier performance reviews?",
+        "answer": "Supplier performance reviews are coordinated by Supplier Relationship Managers with input from contract owners."
+      }
+    ]
+  }
+]

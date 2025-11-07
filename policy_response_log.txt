@@ -1,0 +1,25 @@
+PROMPT: Summarize the procurement policies for approved suppliers.
+ANSWER: Thanks for the context. Here's a quick policy summary. The policy states approved suppliers must complete onboarding, keep current insurance, and wait for a purchase order before work begins. Let me know if you'd like me to draft the escalation note.
+FOLLOW UPS: ['Should I gather further detail on "Summarize the procurement policies for approved suppliers."?', 'Would you like me to brief stakeholders responsible for Procurement policy?', 'Should I capture these actions for audit?']
+HINTS: {'session_hint': 'Earlier question: policy refresh', 'policy_mode': True}
+---
+PROMPT: How do we request an exception to onboard a new supplier?
+ANSWER: Thanks for the context. Here's a quick policy summary. The policy states exception onboarding needs procurement to document the case, route it to the CFO for approval, and log the decision for audit. Let me know if you'd like me to draft the escalation note.
+FOLLOW UPS: ['Should I gather further detail on "How do we request an exception to onboard a new supplier?"?', 'Would you like me to brief stakeholders responsible for Procurement policy?', 'Should I capture these actions for audit?']
+HINTS: {'session_hint': 'Earlier question: policy refresh', 'policy_mode': True}
+---
+PROMPT: What happens if a non-approved supplier is used?
+ANSWER: Thanks for the context. Here's a quick policy summary. The policy states any non-approved supplier triggers CFO approval, a compliance review, and retroactive onboarding before payment. Let me know if you'd like me to draft the escalation note.
+FOLLOW UPS: ['Should I gather further detail on "What happens if a non-approved supplier is used?"?', 'Would you like me to brief stakeholders responsible for Procurement policy?', 'Should I capture these actions for audit?']
+HINTS: {'session_hint': 'Earlier question: policy refresh', 'policy_mode': True}
+---
+PROMPT: Outline the escalation path for urgent purchases outside policy.
+ANSWER: Thanks for the context. Here's a quick policy summary. The policy states urgent out-of-policy spend escalates from procurement to the CFO and then to legal, with each stage logging an approval note. Let me know if you'd like me to draft the escalation note.
+FOLLOW UPS: ['Should I gather further detail on "Outline the escalation path for urgent purchases outside policy."?', 'Would you like me to brief stakeholders responsible for Procurement policy?', 'Should I capture these actions for audit?']
+HINTS: {'session_hint': 'Earlier question: policy refresh', 'policy_mode': True}
+---
+PROMPT: Remind me of the insurance requirements we discussed earlier.
+ANSWER: Thanks for the context. Here's a quick policy summary. The policy states every approved supplier maintains insurance that matches category risk levels and submits certificates annually. Let me know if you'd like me to draft the escalation note.
+FOLLOW UPS: ['Should I gather further detail on "Remind me of the insurance requirements we discussed earlier."?', 'Would you like me to brief stakeholders responsible for Procurement policy?', 'Should I capture these actions for audit?']
+HINTS: {'session_hint': 'Earlier question: policy refresh', 'policy_mode': True}
+---

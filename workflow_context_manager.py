@@ -1,9 +1,8 @@
-import json
 """Simple context holder used by the illustrative workflow orchestrator."""
 
 from __future__ import annotations
 
-import json
+import json  # Required for serialising the workflow context via json.dumps
 from datetime import datetime, timezone
 from typing import Any, Dict
 

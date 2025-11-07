@@ -158,6 +158,9 @@ def test_ensure_updates_training_endpoint_reference(monkeypatch):
 def test_notify_email_dispatch_wakes_watcher(monkeypatch):
     scheduler = _prepare_scheduler(monkeypatch, SimpleNamespace())
 
+    assert isinstance(scheduler._email_watcher_service, DummyEmailWatcher)
+    assert scheduler._email_watcher_service.started is True
+
     scheduler.notify_email_dispatch("wf-demo")
 
     assert scheduler._email_watcher_service.notifications == ["wf-demo"]

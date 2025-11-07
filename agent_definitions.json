@@ -32,6 +32,12 @@
     "dependencies": ["prompt_engine"]
   },
   {
+    "agentId": 10,
+    "agentType": "EmailDispatchAgent",
+    "description": "Sends approved drafts to suppliers and records dispatch metadata.",
+    "dependencies": ["db_client"]
+  },
+  {
     "agentId": 6,
     "agentType": "NegotiationAgent",
     "description": "Generates supplier negotiation messages using an LLM.",

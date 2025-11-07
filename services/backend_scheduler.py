@@ -1,7 +1,7 @@
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from services.email_watcher_service import EmailWatcherService
 
@@ -49,6 +49,7 @@ class BackendScheduler:
         agent_nick,
         *,
         training_endpoint: Optional[ModelTrainingEndpoint] = None,
+        orchestrator: Optional[Any] = None,
     ) -> None:
         self.agent_nick = agent_nick
         self._jobs: Dict[str, _ScheduledJob] = {}
@@ -59,9 +60,15 @@ class BackendScheduler:
         self._training_endpoint = training_endpoint
         self._email_watcher_service: Optional[EmailWatcherService] = None
         self._email_watcher_lock = threading.Lock()
+        self._orchestrator = orchestrator
         self._register_default_jobs()
         self.start()
-        self._ensure_email_watcher_service()
+        # Ensure the email watcher service is running as soon as the scheduler
+        # is initialised so replies can be processed even after restarts.
+        try:
+            self._ensure_email_watcher_service()
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to start email watcher service during initialisation")
 
     @classmethod
     def ensure(
@@ -69,15 +76,20 @@ class BackendScheduler:
         agent_nick,
         *,
         training_endpoint: Optional[ModelTrainingEndpoint] = None,
+        orchestrator: Optional[Any] = None,
     ) -> "BackendScheduler":
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = cls(
-                    agent_nick, training_endpoint=training_endpoint
+                    agent_nick,
+                    training_endpoint=training_endpoint,
+                    orchestrator=orchestrator,
                 )
             else:
                 cls._instance._update_agent(
-                    agent_nick, training_endpoint=training_endpoint
+                    agent_nick,
+                    training_endpoint=training_endpoint,
+                    orchestrator=orchestrator,
                 )
         return cls._instance
 
@@ -86,17 +98,40 @@ class BackendScheduler:
         agent_nick,
         *,
         training_endpoint: Optional[ModelTrainingEndpoint] = None,
+        orchestrator: Optional[Any] = None,
     ) -> None:
         if self.agent_nick is agent_nick:
             if training_endpoint is not None:
                 self._training_endpoint = training_endpoint
             self._sync_training_job()
+            if orchestrator is not None and orchestrator is not getattr(self, "_orchestrator", None):
+                self._orchestrator = orchestrator
+                try:
+                    self._ensure_email_watcher_service()
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception("Failed to refresh email watcher service after orchestrator update")
             return
         self.agent_nick = agent_nick
         self._relationship_scheduler = self._init_relationship_scheduler()
         if training_endpoint is not None:
             self._training_endpoint = training_endpoint
+        if orchestrator is not None:
+            self._orchestrator = orchestrator
+        # Reinitialise the email watcher service so it reflects the new agent
+        # registry/orchestrator context.
+        with self._email_watcher_lock:
+            watcher = self._email_watcher_service
+            self._email_watcher_service = None
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("Failed to stop previous email watcher service")
         self._sync_training_job()
+        try:
+            self._ensure_email_watcher_service()
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to restart email watcher service after agent update")
 
     def start(self) -> None:
         with self._lock:
@@ -186,16 +221,61 @@ class BackendScheduler:
             self._deregister_job(self.TRAINING_JOB_NAME)
 
     def _ensure_email_watcher_service(self) -> EmailWatcherService:
+        registry = getattr(self.agent_nick, "agents", None)
+        orchestrator = getattr(self, "_orchestrator", None)
+        supplier_agent = None
+        negotiation_agent = None
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            try:
+                supplier_agent = getter("supplier_interaction")
+            except Exception:  # pragma: no cover - defensive
+                supplier_agent = None
+            try:
+                negotiation_agent = getter("negotiation")
+            except Exception:  # pragma: no cover - defensive
+                negotiation_agent = None
+        if supplier_agent is None and isinstance(registry, dict):
+            supplier_agent = registry.get("supplier_interaction")
+        if negotiation_agent is None and isinstance(registry, dict):
+            negotiation_agent = registry.get("negotiation")
         with self._email_watcher_lock:
             if self._email_watcher_service is None:
                 registry = getattr(self.agent_nick, "agents", None)
                 self._email_watcher_service = EmailWatcherService(
                     agent_registry=registry,
-                    orchestrator=None,
+                    orchestrator=orchestrator,
+                    supplier_agent=supplier_agent,
+                    negotiation_agent=negotiation_agent,
+                    process_routing_service=getattr(
+                        supplier_agent, "process_routing_service", None
+                    ),
                 )
             service = self._email_watcher_service
+            updater = getattr(service, "update_dependencies", None)
+            if callable(updater):
+                try:
+                    updater(
+                        agent_registry=registry,
+                        orchestrator=orchestrator,
+                        supplier_agent=supplier_agent,
+                        negotiation_agent=negotiation_agent,
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception("Failed to update email watcher dependencies")
+            else:
+                # Fallback for watcher stubs in tests
+                if registry is not None:
+                    setattr(service, "_agent_registry", registry)
+                if orchestrator is not None:
+                    setattr(service, "_orchestrator", orchestrator)
         service.start()
         return service
+
+    def get_email_watcher_service(self) -> EmailWatcherService:
+        """Expose the active email watcher service instance."""
+
+        return self._ensure_email_watcher_service()
 
     def notify_email_dispatch(self, workflow_id: str) -> None:
         workflow_key = (workflow_id or "").strip()

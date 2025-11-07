@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from services.process_routing_service import ProcessRoutingService
+import services.process_routing_service as process_routing_service
 
 
 class DummyCursor:
@@ -616,6 +617,48 @@ def test_update_agent_status_enforces_sequence():
     prs.get_process_details = lambda pid, **kwargs: initial
     with pytest.raises(ValueError):
         prs.update_agent_status(1, "A2", "validated")
+
+
+def test_update_process_status_triggers_email_watcher_api(monkeypatch):
+    conn = DummyConn()
+    agent = SimpleNamespace(
+        get_db_connection=lambda: conn,
+        settings=SimpleNamespace(
+            script_user="tester",
+            email_watcher_api_url="http://localhost:9000/email/emailwatcher",
+        ),
+    )
+    prs = ProcessRoutingService(agent)
+
+    payload = {
+        "status": "completed",
+        "workflow_id": "wf-trigger",
+        "output": {
+            "sent": True,
+            "message_id": "msg-1",
+        },
+    }
+
+    captured = {}
+
+    def fake_post(url, *, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+
+        class _Response:
+            status_code = 200
+            text = "ok"
+
+        return _Response()
+
+    monkeypatch.setattr(process_routing_service.httpx, "post", fake_post)
+
+    prs.update_process_status(101, 1, process_details=payload)
+
+    assert captured["url"] == "http://localhost:9000/email/emailwatcher"
+    assert captured["json"] == {"workflow_id": "wf-trigger"}
+    assert captured["timeout"] == 5.0
 
 
 def test_update_agent_status_allows_when_previous_started():

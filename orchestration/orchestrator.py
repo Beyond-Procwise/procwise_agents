@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Mapping
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,7 +22,7 @@ try:  # Optional dependency for JSONPath mapping
 except Exception:  # pragma: no cover - library may be absent in tests
     jsonpath_parse = None
 
-from agents.base_agent import AgentContext, AgentStatus
+from agents.base_agent import AgentContext, AgentStatus, AgentOutput
 from engines.policy_engine import PolicyEngine
 from engines.query_engine import QueryEngine
 from services.process_routing_service import ProcessRoutingService
@@ -31,6 +31,7 @@ from services.event_bus import get_event_bus, workflow_scope
 from services.agent_manifest import AgentManifestService
 from services.supplier_response_workflow import SupplierResponseWorkflow
 from utils.gpu import configure_gpu
+from services.redis_client import get_workflow_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +93,15 @@ class Orchestrator:
         self.executor = ThreadPoolExecutor(max_workers=self.settings.max_workers)
         self.model_training_endpoint = training_endpoint
         self.backend_scheduler = BackendScheduler.ensure(
-            agent_nick, training_endpoint=training_endpoint
+            agent_nick,
+            training_endpoint=training_endpoint,
+            orchestrator=self,
         )
         self.event_bus = get_event_bus()
         self.manifest_service = AgentManifestService(agent_nick)
         self._prompt_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self._policy_cache: Optional[Dict[int, Dict[str, Any]]] = None
+        self._workflow_redis = get_workflow_redis_client()
 
     def execute_ranking_flow(self, query: str) -> Dict:
         """Public wrapper for the supplier ranking workflow.
@@ -155,6 +159,15 @@ class Orchestrator:
         workflow_id = str(uuid.uuid4())
         logger.info(f"Starting workflow {workflow_name} with ID {workflow_id}")
 
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if memory and getattr(memory, "enabled", False):
+            try:
+                memory.start(workflow_id, workflow_name)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Workflow memory initialisation failed for %s", workflow_id, exc_info=True
+                )
+
         context: Optional[AgentContext] = None
         enriched_input: Dict[str, Any] = {}
 
@@ -190,8 +203,10 @@ class Orchestrator:
                     "workflow_id": workflow_id,
                 }
 
-            # Execute workflow based on type
-            if workflow_name == "document_extraction":
+            workflow_config = enriched_input.get("workflow_configuration")
+            if workflow_config:
+                result = self._run_state_machine(context, workflow_config)
+            elif workflow_name == "document_extraction":
                 result = self._execute_extraction_workflow(context)
             elif workflow_name == "supplier_ranking":
                 result = self._execute_ranking_workflow(context)
@@ -210,6 +225,14 @@ class Orchestrator:
                 context=context,
                 result=result,
                 status="completed",
+            )
+
+            self._finalise_workflow_memory(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                context=context,
+                result=result,
+                success=True,
             )
 
             return {
@@ -239,6 +262,13 @@ class Orchestrator:
                 context=context,
                 result={"error": str(e)},
                 status="failed",
+            )
+            self._finalise_workflow_memory(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                context=context,
+                result={"error": str(e)},
+                success=False,
             )
             return {"status": "failed", "workflow_id": workflow_id, "error": str(e)}
 
@@ -1699,15 +1729,96 @@ class Orchestrator:
         email_drafts = self._filter_drafts_for_workflow(email_drafts, workflow_hint)
         unique_ids = [draft.get("unique_id") for draft in email_drafts]
 
-        coordinator = SupplierResponseWorkflow()
-        readiness = coordinator.ensure_ready(
-            workflow_id=workflow_hint,
-            unique_ids=unique_ids,
-            dispatch_timeout=dispatch_timeout,
-            dispatch_poll_interval=dispatch_poll,
-            response_timeout=response_timeout,
-            response_poll_interval=response_poll,
+        dispatch_input: Dict[str, Any] = {}
+        if email_result and email_result.pass_fields:
+            dispatch_input.update(dict(email_result.pass_fields))
+        dispatch_input.setdefault("drafts", email_drafts)
+        dispatch_input.setdefault("workflow_id", workflow_hint)
+        round_hint = (
+            payload.get("round_number")
+            or payload.get("round")
+            or (supplier_payload.get("round") if isinstance(supplier_payload, dict) else None)
         )
+        if round_hint is not None:
+            dispatch_input.setdefault("round", round_hint)
+
+        dispatch_ctx = self._create_child_context(context, "email_dispatch", dispatch_input)
+        dispatch_result = self._execute_agent("email_dispatch", dispatch_ctx)
+        dispatch_data = dispatch_result.data if dispatch_result else {}
+
+        if isinstance(dispatch_data.get("drafts"), list):
+            email_drafts = [draft for draft in dispatch_data["drafts"] if isinstance(draft, dict)]
+            unique_ids = [draft.get("unique_id") for draft in email_drafts]
+
+        dispatch_records = (
+            dispatch_data.get("dispatch_records")
+            if isinstance(dispatch_data.get("dispatch_records"), list)
+            else []
+        )
+        if dispatch_records:
+            tracked_unique_ids = [
+                str(record.get("unique_id")).strip()
+                for record in dispatch_records
+                if record.get("unique_id")
+            ]
+            tracked_unique_ids = [uid for uid in tracked_unique_ids if uid]
+            unique_ids = [record.get("unique_id") for record in dispatch_records]
+
+        coordinator = SupplierResponseWorkflow()
+        readiness: Dict[str, Dict[str, object]] = {}
+
+        if isinstance(dispatch_data.get("expected_dispatches"), int):
+            expected_email_count = int(dispatch_data["expected_dispatches"])
+        else:
+            expected_email_count = len(tracked_unique_ids) or drafted_email_count
+
+        try:
+            readiness = coordinator.ensure_ready(
+                workflow_id=workflow_hint,
+                unique_ids=unique_ids,
+                dispatch_timeout=dispatch_timeout,
+                dispatch_poll_interval=dispatch_poll,
+                response_timeout=response_timeout,
+                response_poll_interval=response_poll,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Supplier response readiness timed out for workflow=%s",
+                workflow_hint,
+            )
+            normalised_ids = list(tracked_unique_ids) or [
+                uid for uid in unique_ids if uid
+            ]
+            readiness = {
+                "activation": {
+                    "activated": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "unique_ids": normalised_ids,
+                },
+                "dispatch": {
+                    "complete": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "expected_dispatches": expected_email_count,
+                    "completed_dispatches": 0,
+                    "unique_ids": normalised_ids,
+                },
+                "responses": {
+                    "complete": False,
+                    "timed_out": True,
+                    "workflow_id": workflow_hint,
+                    "expected_responses": expected_email_count,
+                    "completed_responses": 0,
+                    "unique_ids": normalised_ids,
+                },
+            }
+        except Exception:
+            logger.exception(
+                "Failed to coordinate supplier response readiness for workflow=%s",
+                workflow_hint,
+            )
+            readiness = {}
 
         supplier_input: Dict[str, Any] = {}
         if email_result and email_result.pass_fields:
@@ -1715,10 +1826,15 @@ class Orchestrator:
         if isinstance(supplier_payload, dict):
             supplier_input.update(supplier_payload)
         supplier_input["drafts"] = email_drafts
-        expected_email_count = len(tracked_unique_ids) or drafted_email_count
         supplier_input.setdefault("expected_dispatch_count", expected_email_count)
         # Retain legacy key for agents that still inspect the historical field.
         supplier_input.setdefault("expected_email_count", expected_email_count)
+        if dispatch_records:
+            supplier_input.setdefault("dispatch_records", dispatch_records)
+        if dispatch_data.get("failures"):
+            supplier_input.setdefault("dispatch_failures", dispatch_data.get("failures"))
+        if dispatch_data:
+            supplier_input.setdefault("dispatch_metadata", dispatch_data)
         if tracked_unique_ids:
             supplier_input.setdefault("expected_unique_ids", tracked_unique_ids)
         supplier_input.setdefault("await_response", True)
@@ -1754,6 +1870,20 @@ class Orchestrator:
             workflow_hint,
             getattr(supplier_result, "status", None),
         )
+
+        scheduler = getattr(self, "backend_scheduler", None)
+        if (
+            workflow_hint
+            and scheduler
+            and hasattr(scheduler, "notify_email_dispatch")
+        ):
+            try:
+                scheduler.notify_email_dispatch(workflow_hint)
+            except Exception:
+                logger.exception(
+                    "Failed to notify email watcher for workflow=%s from orchestrator",
+                    workflow_hint,
+                )
 
         negotiation_result = None
         if (
@@ -1803,8 +1933,8 @@ class Orchestrator:
 
         results: Dict[str, Any] = {
             "email_drafting": email_data,
-            "dispatch_monitor": readiness.get("dispatch"),
-            "response_monitor": readiness.get("responses"),
+            "dispatch_monitor": readiness.get("dispatch") if readiness else None,
+            "response_monitor": readiness.get("responses") if readiness else None,
             "activation_monitor": activation_summary,
             "supplier_interaction": supplier_result.data if supplier_result else {},
             "expected_email_count": expected_email_count,
@@ -2061,6 +2191,147 @@ class Orchestrator:
 
         return results
 
+    def _checkpoint_workflow_state(
+        self, workflow_id: str, state: str, payload: Mapping[str, Any]
+    ) -> None:
+        if not self._workflow_redis:
+            return
+        try:
+            checkpoint = {
+                "state": state,
+                "timestamp": datetime.utcnow().isoformat(),
+                "payload": dict(payload),
+            }
+            self._workflow_redis.set(
+                f"workflow_state:{workflow_id}", json.dumps(checkpoint)
+            )
+        except Exception:
+            logger.debug(
+                "Failed to checkpoint workflow state for %s", workflow_id, exc_info=True
+            )
+
+    def _clear_workflow_checkpoint(self, workflow_id: str) -> None:
+        if not self._workflow_redis:
+            return
+        try:
+            self._workflow_redis.delete(f"workflow_state:{workflow_id}")
+        except Exception:
+            logger.debug(
+                "Failed to clear workflow checkpoint for %s", workflow_id, exc_info=True
+            )
+
+    def _run_state_machine(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        state = "INIT"
+        results: Dict[str, Any] = {}
+        state_history: List[str] = []
+        while True:
+            state_history.append(state)
+            self._checkpoint_workflow_state(
+                context.workflow_id, state, context.input_data
+            )
+
+            if state == "INIT":
+                state = "DRAFT_EMAILS"
+                continue
+
+            if state == "DRAFT_EMAILS":
+                if self._should_trigger_drafting(context, workflow_config):
+                    result = self._invoke_state_agent("EmailDraftingAgent", context)
+                    results["EmailDraftingAgent"] = getattr(result, "data", None)
+                state = "SEND_EMAILS"
+                continue
+
+            if state == "SEND_EMAILS":
+                if self._should_trigger_dispatch(context, workflow_config):
+                    result = self._invoke_state_agent("EmailDispatchAgent", context)
+                    results["EmailDispatchAgent"] = getattr(result, "data", None)
+                state = "WATCH_RESPONSES"
+                continue
+
+            if state == "WATCH_RESPONSES":
+                if self._should_trigger_watcher(context, workflow_config):
+                    result = self._invoke_state_agent("EmailWatcherAgent", context)
+                    results["EmailWatcherAgent"] = getattr(result, "data", None)
+                state = "NEGOTIATE"
+                continue
+
+            if state == "NEGOTIATE":
+                if self._should_trigger_negotiation(context, workflow_config, results):
+                    result = self._invoke_state_agent("NegotiationAgent", context)
+                    results["NegotiationAgent"] = getattr(result, "data", None)
+                state = "FINALIZE"
+                continue
+
+            if state == "FINALIZE":
+                results["state_history"] = state_history
+                self._clear_workflow_checkpoint(context.workflow_id)
+                break
+
+        return results
+
+    def _invoke_state_agent(
+        self, agent_name: str, context: AgentContext
+    ) -> Optional[AgentOutput]:
+        if agent_name not in self.agents:
+            logger.debug("State machine skipped missing agent %s", agent_name)
+            return None
+        child_context = self._create_child_context(context, agent_name, {})
+        result = self._execute_agent(agent_name, child_context)
+        if result and getattr(result, "pass_fields", None):
+            context.input_data.update(result.pass_fields)
+        return result
+
+    def _should_trigger_drafting(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        if data.get("negotiation_context") or data.get("negotiation"):
+            return True
+        if data.get("supplier_information") or data.get("ranking"):
+            return True
+        trigger = workflow_config.get("states", {}).get("DRAFT_EMAILS", {})
+        return bool(trigger.get("enabled", True))
+
+    def _should_trigger_dispatch(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        has_drafts = bool(data.get("drafts"))
+        trigger = workflow_config.get("states", {}).get("SEND_EMAILS", {})
+        return has_drafts and trigger.get("enabled", True)
+
+    def _should_trigger_watcher(
+        self, context: AgentContext, workflow_config: Dict[str, Any]
+    ) -> bool:
+        data = context.input_data or {}
+        supplier_agent_active = "SupplierInteractionAgent" in self.agents
+        if not supplier_agent_active:
+            return False
+        dispatched = bool(
+            data.get("dispatch_summary")
+            or data.get("sent_messages")
+            or data.get("email_dispatch")
+        )
+        trigger = workflow_config.get("states", {}).get("WATCH_RESPONSES", {})
+        return dispatched and trigger.get("enabled", True)
+
+    def _should_trigger_negotiation(
+        self,
+        context: AgentContext,
+        workflow_config: Dict[str, Any],
+        results: Dict[str, Any],
+    ) -> bool:
+        data = context.input_data or {}
+        watcher_result = results.get("EmailWatcherAgent") or {}
+        responses_received = 0
+        if isinstance(watcher_result, dict):
+            responses_received = watcher_result.get("responses_received") or 0
+        pending_negotiation = data.get("negotiation_context") or data.get("supplier_responses")
+        trigger = workflow_config.get("states", {}).get("NEGOTIATE", {})
+        return trigger.get("enabled", True) and (responses_received > 0 or bool(pending_negotiation))
+
     def _execute_agent(self, agent_name: str, context: AgentContext) -> Any:
         """Execute single agent"""
         agent = self.agents.get(agent_name)
@@ -2102,6 +2373,80 @@ class Orchestrator:
             self.event_bus.publish("workflow.complete", payload)
         except Exception:  # pragma: no cover - defensive publication
             logger.exception("Failed to publish workflow.complete event for %s", workflow_id)
+
+    def _finalise_workflow_memory(
+        self,
+        *,
+        workflow_id: str,
+        workflow_name: str,
+        context: Optional[AgentContext],
+        result: Any,
+        success: bool,
+    ) -> None:
+        memory = getattr(self.agent_nick, "workflow_memory", None)
+        if not memory or not getattr(memory, "enabled", False) or not workflow_id:
+            return
+
+        repository = getattr(self.agent_nick, "learning_repository", None)
+        events: List[Dict[str, Any]] = []
+        if success:
+            try:
+                events = memory.drain_learning_events(workflow_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to drain workflow learning events for %s", workflow_id, exc_info=True
+                )
+                events = []
+
+            if repository:
+                for record in events:
+                    if not isinstance(record, dict) or record.get("type") != "learning_event":
+                        continue
+                    event_payload = record.get("event") if isinstance(record.get("event"), dict) else {}
+                    category = event_payload.get("category")
+                    try:
+                        if category == "email_draft":
+                            repository.record_email_learning(
+                                workflow_id=workflow_id,
+                                draft=event_payload.get("draft") or {},
+                                context=event_payload.get("context") or {},
+                            )
+                        elif category == "negotiation_snapshot":
+                            repository.record_negotiation_learning(
+                                workflow_id=workflow_id,
+                                rfq_id=event_payload.get("rfq_id"),
+                                supplier_id=event_payload.get("supplier_id"),
+                                decision=event_payload.get("decision") or {},
+                                state=event_payload.get("state") or {},
+                                awaiting_response=bool(event_payload.get("awaiting_response")),
+                                supplier_reply_registered=bool(
+                                    event_payload.get("supplier_reply_registered")
+                                ),
+                            )
+                    except Exception:  # pragma: no cover - learning capture failures are non fatal
+                        logger.debug(
+                            "Failed to record learning event for workflow=%s category=%s",
+                            workflow_id,
+                            category,
+                            exc_info=True,
+                        )
+
+                if hasattr(repository, "record_workflow_learning"):
+                    try:
+                        repository.record_workflow_learning(
+                            workflow_id=workflow_id,
+                            workflow_name=workflow_name,
+                            result=result if isinstance(result, dict) else {"result": result},
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.debug(
+                            "Failed to record workflow learning for %s", workflow_id, exc_info=True
+                        )
+
+        try:
+            memory.complete(workflow_id, success=success)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to clear workflow memory for %s", workflow_id, exc_info=True)
 
     def _execute_parallel_agents(
         self, agents: List[str], context: AgentContext, pass_fields: Dict
@@ -2407,8 +2752,8 @@ class WorkflowOrchestrator(_BaseWorkflowOrchestrator):
                 draft.action_id,
                 round_number=0,
                 headers={
-                    "X-Procwise-Unique-Id": draft.unique_id,
-                    "X-Procwise-Workflow-Id": self.workflow_id,
+                    "X-ProcWise-Unique-ID": draft.unique_id,
+                    "X-ProcWise-Workflow-ID": self.workflow_id,
                 },
             )
 

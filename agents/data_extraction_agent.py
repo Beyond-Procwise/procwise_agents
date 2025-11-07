@@ -6,6 +6,8 @@ import os
 import tempfile
 import textwrap
 import threading
+import time
+from collections import OrderedDict
 from io import BytesIO
 from functools import lru_cache
 from pathlib import Path
@@ -46,7 +48,7 @@ _easyocr_reader = None
 from qdrant_client import models
 from sentence_transformers import util
 import torch
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dateutil import parser
 
 from utils.nlp import extract_entities
@@ -61,15 +63,18 @@ from utils.procurement_schema import (
 )
 from services.document_extractor import (
     DocumentExtractor,
+    LayoutAwareParser,
     RAW_TABLE_MAPPING as DOC_EXTRACTOR_RAW_TABLES,
 )
+from services.semantic_chunker import SemanticChunker
 
 
 logger = logging.getLogger(__name__)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 configure_gpu()
 
-HITL_CONFIDENCE_THRESHOLD = 0.85
+DEFAULT_STAGING_SCHEMA = "proc_stage"
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 REFERENCE_PATH = Path(__file__).resolve().parents[1] / "docs" / "procurement_table_reference.md"
 LEARNING_LOG_PATH = (
@@ -714,6 +719,50 @@ class DataExtractionAgent(BaseAgent):
         self.extraction_model = self._select_fast_extraction_model()
         self._document_extractor: Optional[DocumentExtractor] = None
         self._document_extractor_lock = threading.Lock()
+        self._layout_parser = LayoutAwareParser()
+        self._semantic_chunker = SemanticChunker(settings=self.settings)
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.isoformat() + ("Z" if value.tzinfo is None else "")
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, set):
+            return sorted(value)
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except Exception:
+                return value.hex()
+        return str(value)
+
+    def _log_workflow_event(
+        self,
+        *,
+        event: str,
+        workflow_id: Optional[str],
+        agent_name: Optional[str],
+        level: str = "info",
+        **fields: Any,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event": event,
+            "workflow_id": workflow_id,
+            "agent": agent_name or self.__class__.__name__,
+            "timestamp": datetime.utcnow(),
+        }
+        for key, value in fields.items():
+            if value is None:
+                continue
+            payload[key] = value
+        try:
+            message = json.dumps(payload, default=self._json_default, ensure_ascii=False)
+        except TypeError:
+            safe_payload = {k: self._json_default(v) for k, v in payload.items()}
+            message = json.dumps(safe_payload, ensure_ascii=False)
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(message)
 
     # --------------------------------------------------------------------
     # Regex-based header extraction
@@ -721,13 +770,27 @@ class DataExtractionAgent(BaseAgent):
     def _select_fast_extraction_model(self) -> str:
         preferred_models: Tuple[str, ...] = ("llama3.2:latest", "phi4:latest")
 
+        override_model: Optional[str] = None
+        resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                candidate = resolver(self.__class__.__name__, fallback=None)
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.debug(
+                    "DataExtractionAgent model override lookup failed", exc_info=True
+                )
+            else:
+                if isinstance(candidate, str) and candidate.strip():
+                    override_model = candidate.strip()
+
         configured_models: Tuple[str, ...] = tuple(
             model
             for model in (
+                override_model,
                 getattr(self.settings, "document_extraction_model", None),
                 getattr(self.settings, "extraction_model", None),
             )
-            if model
+            if isinstance(model, str) and model.strip()
         )
 
         candidates: Tuple[str, ...] = tuple(
@@ -777,6 +840,27 @@ class DataExtractionAgent(BaseAgent):
                 self._document_extractor = extractor
         return extractor
 
+    def _document_parser_version(self) -> str:
+        return getattr(
+            self.settings,
+            "document_parser_version",
+            getattr(self.settings, "document_extraction_model", "document_extractor_v1"),
+        )
+
+    def _staging_schema(self) -> str:
+        candidate = getattr(self.settings, "data_extraction_staging_schema", DEFAULT_STAGING_SCHEMA)
+        if isinstance(candidate, str) and IDENTIFIER_RE.match(candidate):
+            return candidate
+        return DEFAULT_STAGING_SCHEMA
+
+    def _safe_identifier(self, name: str) -> Optional[str]:
+        if not name:
+            return None
+        name = str(name).strip()
+        if IDENTIFIER_RE.match(name):
+            return name
+        return None
+
     def _build_extractor_metadata(
         self,
         object_key: str,
@@ -807,7 +891,35 @@ class DataExtractionAgent(BaseAgent):
             "routing_log": routing_log,
             "page_count": total_pages,
             "ocr_page_count": ocr_pages,
+            "parser_version": self._document_parser_version(),
         }
+
+    def _build_traceability(
+        self,
+        *,
+        object_key: str,
+        text_bundle: DocumentTextBundle,
+        validation: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        page_results = text_bundle.page_results or []
+        ocr_page_count = metadata.get("ocr_page_count")
+        if ocr_page_count is None:
+            ocr_page_count = sum(
+                1 for page in page_results if getattr(page, "route", "") == "ocr"
+            )
+        page_count = metadata.get("page_count") or len(page_results)
+        parser_version = metadata.get("parser_version") or self._document_parser_version()
+        traceability = {
+            "s3_key": object_key,
+            "parser_version": parser_version,
+            "confidence_score": float(validation.get("confidence_score") or 0.0),
+            "ingestion_mode": metadata.get("ingestion_mode"),
+            "page_count": page_count,
+            "ocr_page_count": ocr_page_count,
+            "page_routes": list(text_bundle.routing_log or []),
+        }
+        return traceability
 
     def _run_document_extraction(
         self,
@@ -1171,7 +1283,19 @@ class DataExtractionAgent(BaseAgent):
         try:
             s3_prefix = context.input_data.get("s3_prefix")
             s3_object_key = context.input_data.get("s3_object_key")
-            data = self._process_documents(s3_prefix, s3_object_key)
+            workflow_id = getattr(context, "workflow_id", None)
+            agent_name = getattr(context, "agent_id", None) or self.__class__.__name__
+            batch_start = time.perf_counter()
+            self._log_workflow_event(
+                event="batch_start",
+                workflow_id=workflow_id,
+                agent_name=agent_name,
+                s3_prefix=s3_prefix,
+                s3_object_key=s3_object_key,
+            )
+            batch_status = "success"
+            mismatches: List[Dict[str, Any]] = []
+            data = self._process_documents(s3_prefix, s3_object_key, context=context)
             docs = data.get("details", [])
             processing_issues = [
                 {
@@ -1194,11 +1318,25 @@ class DataExtractionAgent(BaseAgent):
 
             if discrepancy_result.status != AgentStatus.SUCCESS:
                 err = discrepancy_result.error or "discrepancy detection failed"
+                batch_status = "failed"
                 data["summary"] = {
                     "documents_provided": len(docs),
                     "documents_valid": 0,
                     "documents_with_discrepancies": len(docs),
                 }
+                duration = time.perf_counter() - batch_start
+                self._log_workflow_event(
+                    event="batch_complete",
+                    workflow_id=workflow_id,
+                    agent_name=agent_name,
+                    duration_seconds=duration,
+                    documents_total=len(docs),
+                    documents_success=0,
+                    documents_failed=len(docs),
+                    mismatches=0,
+                    status=batch_status,
+                    error=err,
+                )
                 return self._with_plan(
                     context,
                     AgentOutput(status=AgentStatus.FAILED, data=data, error=err),
@@ -1213,12 +1351,42 @@ class DataExtractionAgent(BaseAgent):
             }
             if mismatches:
                 data["mismatches"] = mismatches
+            duration = time.perf_counter() - batch_start
+            failures = [doc for doc in docs if doc.get("status") != "success"]
+            self._log_workflow_event(
+                event="batch_complete",
+                workflow_id=workflow_id,
+                agent_name=agent_name,
+                duration_seconds=duration,
+                documents_total=len(docs),
+                documents_success=len(docs) - len(failures),
+                documents_failed=len(failures),
+                mismatches=len(mismatches) if mismatches else 0,
+                status=batch_status,
+            )
             return self._with_plan(
                 context, AgentOutput(status=AgentStatus.SUCCESS, data=data)
             )
 
         except Exception as exc:
             logger.error("DataExtractionAgent failed: %s", exc)
+            self._log_workflow_event(
+                event="batch_error",
+                workflow_id=getattr(context, "workflow_id", None),
+                agent_name=getattr(context, "agent_id", None) or self.__class__.__name__,
+                level="error",
+                error=str(exc),
+            )
+            self._log_workflow_event(
+                event="batch_complete",
+                workflow_id=getattr(context, "workflow_id", None),
+                agent_name=getattr(context, "agent_id", None) or self.__class__.__name__,
+                status="failed",
+                duration_seconds=time.perf_counter() - batch_start if 'batch_start' in locals() else None,
+                documents_total=0,
+                documents_success=0,
+                documents_failed=0,
+            )
             return self._with_plan(
                 context,
                 AgentOutput(status=AgentStatus.FAILED, data={}, error=str(exc)),
@@ -1246,22 +1414,81 @@ class DataExtractionAgent(BaseAgent):
         )
         return disc_agent.execute(disc_context)
 
-    def _process_documents(self, s3_prefix: str | None = None, s3_object_key: str | None = None) -> Dict:
+    def _iter_s3_keys(self, client, prefix: str) -> List[str]:
+        keys: List[str] = []
+        token: Optional[str] = None
+        bucket = self.settings.s3_bucket_name
+        while True:
+            params = {"Bucket": bucket, "Prefix": prefix}
+            if token:
+                params["ContinuationToken"] = token
+            response = client.list_objects_v2(**params)
+            contents = response.get("Contents") or []
+            for obj in contents:
+                key = obj.get("Key")
+                if key:
+                    keys.append(key)
+            if not response.get("IsTruncated"):
+                break
+            token = response.get("NextContinuationToken")
+            if not token:
+                break
+        return keys
+
+    def _process_documents(
+        self,
+        s3_prefix: str | None = None,
+        s3_object_key: str | None = None,
+        *,
+        context: AgentContext | None = None,
+    ) -> Dict:
         results: List[Dict[str, str]] = []
         prefixes = [s3_prefix] if s3_prefix else self.settings.s3_prefixes
-        keys: List[str] = []
+        key_map: OrderedDict[str, None] = OrderedDict()
+        workflow_id = getattr(context, "workflow_id", None) if context else None
+        agent_name = getattr(context, "agent_id", None) if context else None
+
         for prefix in prefixes:
             if s3_object_key and s3_object_key.startswith(prefix):
-                keys.append(s3_object_key)
-            else:
-                with self._borrow_s3_client() as s3_client:
-                    resp = s3_client.list_objects_v2(
-                        Bucket=self.settings.s3_bucket_name, Prefix=prefix
+                key_map.setdefault(s3_object_key, None)
+                continue
+            prefix_keys: List[str] = []
+            with self._borrow_s3_client() as s3_client:
+                try:
+                    prefix_keys = self._iter_s3_keys(s3_client, prefix)
+                except Exception as exc:
+                    self._log_workflow_event(
+                        event="s3_scan_error",
+                        workflow_id=workflow_id,
+                        agent_name=agent_name,
+                        level="warning",
+                        prefix=prefix,
+                        error=str(exc),
                     )
-                keys.extend(obj["Key"] for obj in resp.get("Contents", []))
+                    continue
+            for key in prefix_keys:
+                key_map.setdefault(key, None)
+            self._log_workflow_event(
+                event="s3_scan",
+                workflow_id=workflow_id,
+                agent_name=agent_name,
+                prefix=prefix,
+                discovered=len(prefix_keys),
+            )
 
         supported_exts = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
-        keys = [k for k in keys if os.path.splitext(k)[1].lower() in supported_exts]
+        keys = [
+            key
+            for key in key_map.keys()
+            if os.path.splitext(key)[1].lower() in supported_exts
+        ]
+
+        self._log_workflow_event(
+            event="document_queue_built",
+            workflow_id=workflow_id,
+            agent_name=agent_name,
+            documents_discovered=len(keys),
+        )
 
         max_workers_setting = int(getattr(self.settings, "data_extraction_max_workers", os.cpu_count() or 4))
         pool_cap = getattr(self.agent_nick, "s3_pool_size", max_workers_setting)
@@ -1274,7 +1501,10 @@ class DataExtractionAgent(BaseAgent):
             pool_cap,
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self._process_single_document, k) for k in keys]
+            futures = [
+                executor.submit(self._process_single_document, k, context=context)
+                for k in keys
+            ]
             for fut in concurrent.futures.as_completed(futures):
                 res = fut.result()
                 if res:
@@ -1282,10 +1512,21 @@ class DataExtractionAgent(BaseAgent):
 
         return {"status": "completed", "details": results}
 
-    def _process_single_document(self, object_key: str) -> Optional[Dict[str, str]]:
+    def _process_single_document(
+        self, object_key: str, *, context: AgentContext | None = None
+    ) -> Optional[Dict[str, str]]:
         if not object_key:
             return None
         logger.info("Processing %s", object_key)
+        workflow_id = getattr(context, "workflow_id", None) if context else None
+        agent_name = getattr(context, "agent_id", None) if context else None
+        start_time = time.perf_counter()
+        self._log_workflow_event(
+            event="document_start",
+            workflow_id=workflow_id,
+            agent_name=agent_name,
+            object_key=object_key,
+        )
         try:
             with self._borrow_s3_client() as s3_client:
                 obj = s3_client.get_object(
@@ -1294,6 +1535,14 @@ class DataExtractionAgent(BaseAgent):
             body = obj.get("Body")
             if body is None:
                 logger.error("No body returned for %s", object_key)
+                self._log_workflow_event(
+                    event="document_error",
+                    workflow_id=workflow_id,
+                    agent_name=agent_name,
+                    level="error",
+                    object_key=object_key,
+                    error="empty_body",
+                )
                 return None
             try:
                 file_bytes = body.read()
@@ -1304,6 +1553,14 @@ class DataExtractionAgent(BaseAgent):
                     logger.debug("Failed to close streaming body for %s", object_key, exc_info=True)
         except Exception as exc:
             logger.error("Failed downloading %s: %s", object_key, exc)
+            self._log_workflow_event(
+                event="document_error",
+                workflow_id=workflow_id,
+                agent_name=agent_name,
+                level="error",
+                object_key=object_key,
+                error=str(exc),
+            )
             return None
 
         force_ocr_vendors = set(
@@ -1352,6 +1609,11 @@ class DataExtractionAgent(BaseAgent):
                     or raw_header.get("vendor_name")
                     or vendor_name
                 )
+
+        metadata_payload = (
+            dict(raw_payload.get("metadata") or {}) if raw_payload else {}
+        )
+        metadata_payload.setdefault("parser_version", self._document_parser_version())
 
         # Vectorize raw document content for search regardless of type
         self._vectorize_document(text, unique_id, doc_type, product_type, object_key)
@@ -1409,20 +1671,34 @@ class DataExtractionAgent(BaseAgent):
             if not header.get("supplier_id") and header.get("vendor_name"):
                 header["supplier_id"] = header.get("vendor_name")
 
-            ok = header.get("_validation", {}).get("ok", True)
-            conf = header.get("_validation", {}).get("confidence", 0.8)
-            notes = header.get("_validation", {}).get("notes", [])
+            header_validation = header.get("_validation", {}) or {}
+            report_validation = (
+                structured.report.get("validation", {}) if structured.report else {}
+            )
+            conf = float(
+                report_validation.get("confidence_score")
+                or header_validation.get("confidence")
+                or 0.0
+            )
+            ok = bool(report_validation.get("is_valid", header_validation.get("ok", True)))
+            warnings_list = list(report_validation.get("warnings") or [])
+            errors_list = list(report_validation.get("errors") or [])
+            notes_list = header_validation.get("notes") or []
+            notes_text = "; ".join(notes_list) if notes_list else ("; ".join(warnings_list) if warnings_list else "ok")
+            validation_payload = {
+                "is_valid": ok,
+                "confidence_score": conf,
+                "warnings": warnings_list,
+                "errors": errors_list,
+                "notes": notes_text,
+            }
 
             data = {
                 "header_data": header,
                 "line_items": line_items,
                 "header_df": structured.header_df.replace({pd.NA: None}).to_dict("records"),
                 "lines_df": structured.line_df.replace({pd.NA: None}).to_dict("records"),
-                "validation": {
-                    "is_valid": bool(ok),
-                    "confidence_score": float(conf),
-                    "notes": "; ".join(notes) if notes else "ok",
-                },
+                "validation": validation_payload,
                 "report": table_report,
             }
             if raw_payload:
@@ -1435,6 +1711,30 @@ class DataExtractionAgent(BaseAgent):
                     "raw_text": raw_payload.get("raw_text", ""),
                 }
 
+            requires_review = (not validation_payload["is_valid"]) or bool(
+                validation_payload["errors"] or validation_payload["warnings"]
+            )
+            validation_payload["requires_review"] = requires_review
+
+            traceability = self._build_traceability(
+                object_key=object_key,
+                text_bundle=text_bundle,
+                validation=validation_payload,
+                metadata=metadata_payload,
+            )
+            data["traceability"] = traceability
+
+            header_table = DOC_TYPE_TO_TABLE.get(doc_type, (None, None))[0]
+            if pk_value:
+                self._record_etl_errors(
+                    doc_type=doc_type,
+                    record_id=str(pk_value),
+                    object_key=object_key,
+                    validation=validation_payload,
+                    table_name=header_table,
+                    trace_metadata=traceability,
+                )
+
             self._persist_to_postgres(header, line_items, doc_type, pk_value)
             self._vectorize_structured_data(header, line_items, doc_type, pk_value, product_type)
 
@@ -1446,7 +1746,31 @@ class DataExtractionAgent(BaseAgent):
                 data["raw_text"] = text_bundle.raw_text
             data["ocr_text"] = text_bundle.ocr_text
             data["page_routes"] = text_bundle.routing_log
+            result["needs_review"] = data["validation"].get("requires_review", False)
+            result["traceability"] = data.get("traceability", {})
+            accuracy_report = self._structured_output_metrics(
+                doc_type, header, line_items
+            )
+            data["accuracy_report"] = accuracy_report
+            self._log_structured_analysis(doc_type, header, line_items)
             result["data"] = data
+        duration = time.perf_counter() - start_time
+        validation_payload = data.get("validation") if data else None
+        warnings = validation_payload.get("warnings") if validation_payload else None
+        errors = validation_payload.get("errors") if validation_payload else None
+        self._log_workflow_event(
+            event="document_complete",
+            workflow_id=workflow_id,
+            agent_name=agent_name,
+            object_key=object_key,
+            status=result.get("status"),
+            doc_type=doc_type,
+            record_id=str(pk_value) if pk_value else None,
+            needs_review=result.get("needs_review"),
+            duration_seconds=duration,
+            warnings=warnings,
+            errors=errors,
+        )
         return result
 
     # ============================ EXTRACTION HELPERS ======================
@@ -4908,7 +5232,11 @@ class DataExtractionAgent(BaseAgent):
         except Exception:
             logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
 
-        chunks = self._chunk_text(full_text)
+        chunk_fn = self._chunk_text
+        try:
+            chunks = chunk_fn(full_text, doc_type=doc_type)
+        except TypeError:
+            chunks = chunk_fn(full_text)  # type: ignore[misc]
         if not chunks:
             return
 
@@ -4916,11 +5244,11 @@ class DataExtractionAgent(BaseAgent):
             chunks, normalize_embeddings=True, show_progress_bar=False
         )
 
-        summary = full_text[:200]
         record_id = pk_value or object_key
 
         points: List[models.PointStruct] = []
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            chunk_summary = chunk.strip()[:240]
             payload = {
                 "record_id": record_id,
                 "document_type": _normalize_label(doc_type),
@@ -4928,7 +5256,7 @@ class DataExtractionAgent(BaseAgent):
                 "s3_key": object_key,
                 "chunk_id": idx,
                 "content": chunk,
-                "summary": summary,
+                "summary": chunk_summary,
             }
             point_id = _normalize_point_id(f"{record_id}_{idx}")
             points.append(
@@ -5056,24 +5384,72 @@ class DataExtractionAgent(BaseAgent):
                 raise
 
     # ============================ TEXT CHUNKING ===========================
-    def _chunk_text(self, text: str, max_tokens: int = 256, overlap: int = 20) -> List[str]:
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
+    def _chunk_text(
+        self,
+        text: str,
+        *,
+        doc_type: Any = None,
+        max_tokens: int = 720,
+        overlap: int = 80,
+    ) -> List[str]:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
             return []
+
+        doc_label = _normalize_label(doc_type) or "document"
+        default_section = f"{doc_label}_overview"
+        base_metadata = {
+            "document_type": doc_label,
+            "source_type": doc_label.title() if doc_label else "Document",
+            "title": doc_label.replace("_", " ").title() or "Document",
+        }
+
+        try:
+            structured = self._layout_parser.from_text(cleaned, scanned=False)
+            semantic_chunks = self._semantic_chunker.build_from_structured(
+                structured,
+                document_type=doc_label or "document",
+                base_metadata=base_metadata,
+                title_hint=base_metadata["title"],
+                default_section=default_section,
+            )
+        except Exception:
+            logger.debug(
+                "Semantic chunking failed; falling back to token-based splitter",
+                exc_info=True,
+            )
+            semantic_chunks = []
+
+        if semantic_chunks:
+            return [chunk.content for chunk in semantic_chunks if chunk.content.strip()]
+
         try:
             import tiktoken
+
             enc = tiktoken.get_encoding("cl100k_base")
-            tokens = enc.encode(text)
+            tokens = enc.encode(cleaned)
             step = max_tokens - overlap if max_tokens > overlap else max_tokens
-            chunks = []
+            slices: List[str] = []
             for i in range(0, len(tokens), step):
-                chunk_tokens = tokens[i: i + max_tokens]
-                chunks.append(enc.decode(chunk_tokens))
-            return chunks
+                chunk_tokens = tokens[i : i + max_tokens]
+                decoded = enc.decode(chunk_tokens)
+                if decoded.strip():
+                    slices.append(decoded)
+            if slices:
+                return slices
         except Exception:
-            max_chars = max_tokens
-            step = max_chars - overlap if max_chars > overlap else max_chars
-            return [text[i: i + max_chars] for i in range(0, len(text), step)]
+            logger.debug(
+                "Token chunking fallback failed; reverting to character windows",
+                exc_info=True,
+            )
+
+        max_chars = max_tokens * 4
+        step_chars = max_chars - overlap * 4 if max_chars > overlap * 4 else max_chars
+        return [
+            cleaned[i : i + max_chars]
+            for i in range(0, len(cleaned), max(1, step_chars))
+            if cleaned[i : i + max_chars].strip()
+        ]
 
     # ============================ NORMALIZE / VALIDATE ====================
     def _clean_numeric(self, value: str | int | float) -> Optional[float]:
@@ -5241,7 +5617,270 @@ class DataExtractionAgent(BaseAgent):
 
         return cast_header, cast_lines
 
+    def _ensure_staging_table(
+        self,
+        cur,
+        *,
+        target_table: str,
+        columns: List[str],
+    ) -> Tuple[str, str]:
+        staging_schema = self._staging_schema()
+        try:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{staging_schema}"')
+        except Exception:
+            logger.warning("Unable to ensure staging schema %s", staging_schema, exc_info=True)
+            staging_schema = DEFAULT_STAGING_SCHEMA
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{staging_schema}"')
+
+        staging_table = f"{target_table}_staging"
+        cur.execute(
+            f'CREATE TABLE IF NOT EXISTS "{staging_schema}"."{staging_table}" '
+            "(ingestion_id uuid PRIMARY KEY, ingested_at timestamp without time zone DEFAULT now())"
+        )
+
+        for column in columns:
+            safe_column = self._safe_identifier(column)
+            if not safe_column:
+                continue
+            cur.execute(
+                f'ALTER TABLE "{staging_schema}"."{staging_table}" '
+                f'ADD COLUMN IF NOT EXISTS "{safe_column}" text'
+            )
+
+        return staging_schema, staging_table
+
+    def _insert_staging_record(
+        self,
+        cur,
+        staging_schema: str,
+        staging_table: str,
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        if not payload:
+            return None
+
+        safe_payload: "OrderedDict[str, Any]" = OrderedDict()
+        ingestion_id = str(uuid.uuid4())
+        safe_payload["ingestion_id"] = ingestion_id
+        for key, value in payload.items():
+            safe_key = self._safe_identifier(key)
+            if not safe_key:
+                continue
+            if isinstance(value, (dict, list)):
+                stage_value = json.dumps(value, default=self._json_default, ensure_ascii=False)
+            elif isinstance(value, (datetime, date)):
+                stage_value = value.isoformat()
+            else:
+                stage_value = value
+            safe_payload[safe_key] = stage_value
+
+        if len(safe_payload) <= 1:  # only ingestion_id present
+            return None
+
+        columns = []
+        placeholders = []
+        values: List[Any] = []
+        for key, value in safe_payload.items():
+            columns.append(f'"{key}"')
+            placeholders.append("%s")
+            values.append(value)
+
+        sql_stmt = (
+            f'INSERT INTO "{staging_schema}"."{staging_table}" '
+            f'({", ".join(columns)}) VALUES ({", ".join(placeholders)})'
+        )
+        cur.execute(sql_stmt, values)
+        return ingestion_id
+
+    def _merge_from_staging(
+        self,
+        cur,
+        *,
+        target_schema: str,
+        target_table: str,
+        payload: Dict[str, Any],
+        conflict_cols: List[str],
+        update_cols: List[str],
+    ) -> None:
+        if not payload:
+            return
+
+        safe_payload: "OrderedDict[str, Any]" = OrderedDict()
+        for key, value in payload.items():
+            safe_key = self._safe_identifier(key)
+            if not safe_key:
+                continue
+            safe_payload[safe_key] = value
+
+        if not safe_payload:
+            return
+
+        staging_schema, staging_table = self._ensure_staging_table(
+            cur,
+            target_table=target_table,
+            columns=list(safe_payload.keys()),
+        )
+        ingestion_id = self._insert_staging_record(cur, staging_schema, staging_table, safe_payload)
+        if not ingestion_id:
+            return
+
+        column_clause = ", ".join(f'"{col}"' for col in safe_payload.keys())
+        select_clause = column_clause
+
+        sql_stmt = (
+            f'INSERT INTO "{target_schema}"."{target_table}" ({column_clause}) '
+            f'SELECT {select_clause} FROM "{staging_schema}"."{staging_table}" '
+            "WHERE ingestion_id = %s"
+        )
+
+        conflict_candidates = [
+            col for col in conflict_cols if self._safe_identifier(col)
+        ]
+        update_targets = [
+            col
+            for col in update_cols
+            if self._safe_identifier(col) and col in safe_payload and col not in conflict_candidates
+        ]
+
+        if conflict_candidates:
+            conflict_clause = ", ".join(f'"{col}"' for col in conflict_candidates)
+            if update_targets:
+                update_clause = ", ".join(
+                    f'"{col}" = EXCLUDED."{col}"' for col in update_targets
+                )
+                sql_stmt += f" ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause}"
+            else:
+                sql_stmt += f" ON CONFLICT ({conflict_clause}) DO NOTHING"
+        else:
+            sql_stmt += " ON CONFLICT DO NOTHING"
+
+        cur.execute(sql_stmt, [ingestion_id])
+        cur.execute(
+            f'DELETE FROM "{staging_schema}"."{staging_table}" WHERE ingestion_id = %s',
+            [ingestion_id],
+        )
+
     # ============================ PERSISTENCE =============================
+    def _record_etl_errors(
+        self,
+        *,
+        doc_type: str,
+        record_id: Optional[str],
+        object_key: str,
+        validation: Dict[str, Any],
+        table_name: Optional[str],
+        trace_metadata: Dict[str, Any],
+    ) -> None:
+        if not validation or not record_id:
+            return
+
+        try:
+            confidence = float(validation.get("confidence_score") or 0.0)
+        except Exception:
+            confidence = 0.0
+        is_valid = bool(validation.get("is_valid", True))
+        errors = list(validation.get("errors") or [])
+        warnings = list(validation.get("warnings") or [])
+
+        if is_valid and not errors and not warnings:
+            return
+
+        detail_payload = {
+            "errors": errors,
+            "warnings": warnings,
+            "notes": validation.get("notes"),
+            "confidence_score": confidence,
+            "traceability": trace_metadata,
+        }
+        if not is_valid or errors:
+            error_category = "validation_error"
+        else:
+            error_category = "warning"
+
+        payload = OrderedDict(
+            [
+                ("record_id", str(record_id)),
+                ("document_type", doc_type),
+                ("source_object_key", object_key),
+                ("error_category", error_category),
+                (
+                    "error_detail",
+                    json.dumps(detail_payload, ensure_ascii=False),
+                ),
+                ("confidence_score", confidence),
+            ]
+        )
+        if table_name:
+            payload["source_table"] = table_name
+
+        trace_json = json.dumps(trace_metadata, ensure_ascii=False)
+
+        try:
+            conn = self.agent_nick.get_db_connection()
+        except Exception:
+            logger.warning("Unable to log ETL error: database connection failed", exc_info=True)
+            return
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema=%s AND table_name=%s
+                        """,
+                        ("proc", "etl_errors"),
+                    )
+                    available = {row[0] for row in cur.fetchall()}
+                    if not available:
+                        return
+
+                    columns: List[str] = []
+                    values: List[Any] = []
+                    for key, value in payload.items():
+                        if key in available and value is not None:
+                            columns.append(key)
+                            values.append(value)
+
+                    trace_column = None
+                    for candidate in ("trace_metadata", "traceability"):
+                        if candidate in available:
+                            trace_column = candidate
+                            break
+                    if trace_column:
+                        columns.append(trace_column)
+                        values.append(trace_json)
+
+                    if not columns:
+                        return
+
+                    col_list = ", ".join(columns)
+                    placeholders = ", ".join(["%s"] * len(columns))
+                    sql = f"INSERT INTO proc.etl_errors ({col_list}) VALUES ({placeholders})"
+
+                    conflict_candidates = [
+                        col
+                        for col in ("record_id", "document_type", "error_category")
+                        if col in columns and col in available
+                    ]
+                    if conflict_candidates:
+                        update_cols = ", ".join(
+                            f"{col}=EXCLUDED.{col}"
+                            for col in columns
+                            if col not in conflict_candidates
+                        )
+                        if update_cols:
+                            sql += f" ON CONFLICT ({', '.join(conflict_candidates)}) DO UPDATE SET {update_cols}"
+                        else:
+                            sql += f" ON CONFLICT ({', '.join(conflict_candidates)}) DO NOTHING"
+                    else:
+                        sql += " ON CONFLICT DO NOTHING"
+
+                    cur.execute(sql, values)
+        except Exception:
+            logger.warning("Failed to persist ETL error record", exc_info=True)
+
     def _persist_to_postgres(self, header: Dict[str, str], line_items: List[Dict], doc_type: str, pk_value: str) -> None:
         pk_map = {
             "Invoice": "invoice_id",
@@ -5315,7 +5954,7 @@ class DataExtractionAgent(BaseAgent):
                     (schema, table),
                 )
                 columns = {r[0]: r[1] for r in cur.fetchall()}
-                payload = {}
+                payload: "OrderedDict[str, Any]" = OrderedDict()
                 numeric_types = {"integer", "bigint", "smallint", "numeric", "decimal", "double precision", "real"}
                 for k, v in header.items():
                     if k not in columns:
@@ -5339,18 +5978,18 @@ class DataExtractionAgent(BaseAgent):
                     payload[k] = sanitized
                 if not payload:
                     return False
-                cols = ", ".join(payload.keys())
-                placeholders = ", ".join(["%s"] * len(payload))
-                update_cols = ", ".join(f"{c}=EXCLUDED.{c}" for c in payload.keys() if c != pk_col)
-                sql_base = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders}) "
+                conflict_cols: List[str] = []
                 if self._has_unique_constraint(cur, schema, table, [pk_col]):
-                    if update_cols:
-                        sql = sql_base + f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_cols}"
-                    else:
-                        sql = sql_base + f"ON CONFLICT ({pk_col}) DO NOTHING"
-                else:
-                    sql = sql_base + "ON CONFLICT DO NOTHING"
-                cur.execute(sql, list(payload.values()))
+                    conflict_cols = [pk_col]
+                update_cols = [col for col in payload.keys() if col != pk_col]
+                self._merge_from_staging(
+                    cur,
+                    target_schema=schema,
+                    target_table=table,
+                    payload=payload,
+                    conflict_cols=conflict_cols,
+                    update_cols=update_cols,
+                )
             if close_conn:
                 conn.commit()
             return True
@@ -5454,7 +6093,7 @@ class DataExtractionAgent(BaseAgent):
                             continue
                         if col in columns and item.get(source) is not None:
                             payload[col] = item[source]
-                    sanitized = {}
+                    sanitized: "OrderedDict[str, Any]" = OrderedDict()
                     for k, v in payload.items():
                         val = self._sanitize_value(v, k)
                         if k in numeric_fields:
@@ -5465,12 +6104,9 @@ class DataExtractionAgent(BaseAgent):
                             if val in (None, "") or not isinstance(val, (int, float)):
                                 logger.warning("Dropping field %s due to non-numeric value. Payload: %s", k, payload)
                                 continue
-                            val = float(val)
+                                val = float(val)
                         sanitized[k] = val
 
-                    cols = ", ".join(sanitized.keys())
-                    placeholders = ", ".join(["%s"] * len(sanitized))
-                    update_cols = ", ".join(f"{c}=EXCLUDED.{c}" for c in sanitized.keys() if c not in {fk_col, line_no_col})
                     if doc_type == "Invoice" and "invoice_line_id" in columns:
                         conflict_cols = ["invoice_line_id"]
                     elif doc_type == "Purchase_Order" and "po_line_id" in columns:
@@ -5479,16 +6115,17 @@ class DataExtractionAgent(BaseAgent):
                         conflict_cols = [fk_col, line_no_col]
                     if not self._has_unique_constraint(cur, schema, table, conflict_cols):
                         conflict_cols = []
-                    sql = f"INSERT INTO {schema}.{table} ({cols}) VALUES ({placeholders})"
-                    if conflict_cols:
-                        target_cols = ", ".join(conflict_cols)
-                        if update_cols:
-                            sql += f" ON CONFLICT ({target_cols}) DO UPDATE SET {update_cols}"
-                        else:
-                            sql += f" ON CONFLICT ({target_cols}) DO NOTHING"
-                    else:
-                        sql += " ON CONFLICT DO NOTHING"
-                    cur.execute(sql, list(sanitized.values()))
+                    update_cols = [
+                        col for col in sanitized.keys() if col not in set(conflict_cols)
+                    ]
+                    self._merge_from_staging(
+                        cur,
+                        target_schema=schema,
+                        target_table=table,
+                        payload=sanitized,
+                        conflict_cols=conflict_cols,
+                        update_cols=update_cols,
+                    )
             if close_conn:
                 conn.commit()
         except Exception as exc:

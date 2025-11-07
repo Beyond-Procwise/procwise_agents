@@ -7,15 +7,18 @@ import logging
 import os
 import threading
 import time
+from dataclasses import MISSING
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from repositories import (
     draft_rfq_emails_repo,
     supplier_response_repo,
     workflow_email_tracking_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from services.email_watcher_v2 import EmailWatcherV2
+from services.email_watcher import EmailWatcher, EmailWatcherConfig
+from services.event_bus import get_event_bus
 
 try:  # pragma: no cover - settings import may fail in minimal environments
     from config.settings import settings as app_settings
@@ -23,6 +26,26 @@ except Exception:  # pragma: no cover - fallback when settings module unavailabl
     app_settings = None
 
 logger = logging.getLogger(__name__)
+
+
+MAX_IMAP_AUTH_RETRIES = 3
+
+
+def send_alert(alert_code: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Publish an alert event for operational visibility."""
+
+    message = {"alert_code": alert_code}
+    if payload:
+        message.update(payload)
+    try:
+        bus = get_event_bus()
+    except Exception:
+        logger.exception("Failed to initialise event bus for alert %s", alert_code)
+        return
+    try:
+        bus.publish("alerts", message)
+    except Exception:
+        logger.exception("Failed to publish alert %s", alert_code)
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -42,6 +65,48 @@ def _setting(*attr_names: str) -> Optional[str]:
     return None
 
 
+def _resolve_float(env_key: str, setting_keys: Sequence[str], default: float) -> float:
+    raw_env = _env(env_key)
+    if raw_env not in (None, ""):
+        try:
+            return float(raw_env)
+        except Exception:
+            logger.warning("Invalid %s value %s; falling back to %s", env_key, raw_env, default)
+    for key in setting_keys:
+        raw_setting = _setting(key)
+        if raw_setting in (None, ""):
+            continue
+        try:
+            return float(raw_setting)
+        except Exception:
+            logger.warning("Invalid setting %s=%s; falling back to %s", key, raw_setting, default)
+    return default
+
+
+def _resolve_optional_int(env_key: str, setting_keys: Sequence[str]) -> Optional[int]:
+    raw_env = _env(env_key)
+    if raw_env not in (None, ""):
+        try:
+            candidate = int(float(raw_env))
+        except Exception:
+            logger.warning("Invalid %s value %s; ignoring", env_key, raw_env)
+        else:
+            if candidate > 0:
+                return candidate
+    for key in setting_keys:
+        raw_setting = _setting(key)
+        if raw_setting in (None, ""):
+            continue
+        try:
+            candidate = int(float(raw_setting))
+        except Exception:
+            logger.warning("Invalid setting %s=%s; ignoring", key, raw_setting)
+            continue
+        if candidate > 0:
+            return candidate
+    return None
+
+
 def _load_dispatch_rows(workflow_id: str) -> List[WorkflowDispatchRow]:
     try:
         workflow_email_tracking_repo.init_schema()
@@ -56,7 +121,9 @@ def _serialise_response(row: Dict[str, Any], mailbox: Optional[str]) -> Dict[str
         "workflow_id": row.get("workflow_id"),
         "unique_id": row.get("unique_id"),
         "supplier_id": row.get("supplier_id"),
+        "rfq_id": row.get("rfq_id"),
         "body_text": row.get("response_text", ""),
+        "body_html": row.get("response_body"),
         "subject": row.get("subject"),
         "from_addr": row.get("from_addr"),
         "message_id": row.get("message_id"),
@@ -152,15 +219,18 @@ def run_email_watcher_for_workflow(
     orchestrator: Optional[Any] = None,
     supplier_agent: Optional[Any] = None,
     negotiation_agent: Optional[Any] = None,
+    process_routing_service: Optional[Any] = None,
     max_workers: int = 8,
+    workflow_memory: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Collect supplier responses for ``workflow_id`` using ``EmailWatcherV2``."""
+    """Collect supplier responses for ``workflow_id`` using the unified EmailWatcher."""
 
     _ = run_id  # maintained for backwards compatibility
     _ = agent_registry
     _ = orchestrator
     _ = max_workers
     _ = lookback_minutes
+    _ = workflow_memory
 
     workflow_key = (workflow_id or "").strip()
     if not workflow_key:
@@ -185,7 +255,57 @@ def run_email_watcher_for_workflow(
     expected_unique_ids, _, _ = draft_rfq_emails_repo.expected_unique_ids_and_last_dispatch(
         workflow_id=workflow_key
     )
-    expected_dispatch_total = len(expected_unique_ids) or len(dispatch_rows)
+    expected_unique_ids = {
+        (unique_id or "").strip()
+        for unique_id in expected_unique_ids
+        if unique_id and unique_id.strip()
+    }
+
+    rows_by_uid = {
+        (row.unique_id or "").strip(): row
+        for row in dispatch_rows
+        if (row.unique_id or "").strip()
+    }
+
+    if not expected_unique_ids:
+        logger.debug(
+            "Workflow %s has no expected dispatch records from drafting; deferring watcher",
+            workflow_key,
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "No expected dispatches recorded",
+            "workflow_id": workflow_key,
+            "expected": len(dispatch_rows),
+            "found": 0,
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": [],
+            "missing_required_fields": {},
+        }
+
+    missing_expected_rows = sorted(
+        uid for uid in expected_unique_ids if uid not in rows_by_uid
+    )
+    if missing_expected_rows:
+        logger.debug(
+            "Workflow %s awaiting dispatch rows for %s; deferring watcher",
+            workflow_key,
+            missing_expected_rows,
+        )
+        return {
+            "status": "waiting_for_dispatch",
+            "reason": "Waiting for all dispatches to complete",
+            "workflow_id": workflow_key,
+            "expected": len(expected_unique_ids),
+            "found": len(expected_unique_ids) - len(missing_expected_rows),
+            "rows": [],
+            "matched_unique_ids": [],
+            "pending_unique_ids": missing_expected_rows,
+            "missing_required_fields": {uid: ["dispatch_record"] for uid in missing_expected_rows},
+        }
+
+    expected_dispatch_total = len(expected_unique_ids)
 
     imap_host = _env("IMAP_HOST") or _setting("imap_host")
     imap_user = _env("IMAP_USER")
@@ -224,6 +344,8 @@ def run_email_watcher_for_workflow(
         return username
 
     imap_login = _pick_login()
+    if not imap_username and imap_login:
+        imap_username = imap_login.strip() or None
     try:
         imap_port = int(_env("IMAP_PORT")) if _env("IMAP_PORT") else None
     except Exception:
@@ -251,9 +373,9 @@ def run_email_watcher_for_workflow(
         or "INBOX"
     )
 
-    if not all([imap_host, imap_username, imap_password]):
+    if not imap_host or not imap_password or not (imap_username or imap_login):
         logger.warning(
-            "IMAP credentials are not configured; skipping EmailWatcherV2 (host=%s user=%s)",
+            "IMAP credentials are not configured; skipping EmailWatcher (host=%s user=%s)",
             imap_host,
             imap_username,
         )
@@ -270,23 +392,33 @@ def run_email_watcher_for_workflow(
     missing_required_fields: Dict[str, List[str]] = {}
     missing_message_ids: List[str] = []
 
-    for index, row in enumerate(dispatch_rows):
-        unique_id = (row.unique_id or "").strip()
-        identifier = unique_id or f"row-{index}"
-
+    for unique_id in sorted(expected_unique_ids):
+        row = rows_by_uid.get(unique_id)
         missing_fields: List[str] = []
-        if getattr(row, "dispatched_at", None) is None:
-            missing_fields.append("dispatched_at")
-        if not unique_id:
-            missing_fields.append("unique_id")
+        if not row:
+            missing_fields.append("dispatch_record")
+        else:
+            if getattr(row, "dispatched_at", None) is None:
+                missing_fields.append("dispatched_at")
+            message_id = (row.message_id or "").strip()
+            if not message_id:
+                missing_message_ids.append(unique_id)
+                missing_fields.append("message_id")
 
         if missing_fields:
-            missing_required_fields[identifier] = missing_fields
-            continue
+            missing_required_fields[unique_id] = missing_fields
 
-        message_id = (row.message_id or "").strip()
-        if not message_id:
-            missing_message_ids.append(identifier)
+        supplier_email = (row.supplier_email or "").strip()
+        if not supplier_email:
+            missing_fields.append("supplier_email")
+
+        subject_value = (row.subject or "").strip()
+        if not subject_value:
+            missing_fields.append("subject")
+
+        if missing_fields:
+            missing_required_fields[unique_id] = missing_fields
+            continue
 
     if missing_message_ids:
         logger.warning(
@@ -314,11 +446,11 @@ def run_email_watcher_for_workflow(
         }
 
     completed_unique_ids = {
-        row.unique_id
-        for row in dispatch_rows
-        if row.unique_id
-        and row.message_id
-        and getattr(row, "dispatched_at", None) is not None
+        unique_id
+        for unique_id in expected_unique_ids
+        if unique_id in rows_by_uid
+        and (rows_by_uid[unique_id].message_id or "").strip()
+        and getattr(rows_by_uid[unique_id], "dispatched_at", None) is not None
     }
     if expected_unique_ids and expected_unique_ids - completed_unique_ids:
         pending = sorted(expected_unique_ids - completed_unique_ids)
@@ -348,26 +480,84 @@ def run_email_watcher_for_workflow(
     except Exception:
         max_attempts = 10
 
+    poll_backoff_factor = _resolve_float(
+        "IMAP_POLL_BACKOFF_FACTOR",
+        ("imap_poll_backoff_factor", "poll_backoff_factor"),
+        1.8,
+    )
+    poll_jitter_seconds = max(
+        0.0,
+        _resolve_float(
+            "IMAP_POLL_JITTER_SECONDS",
+            ("imap_poll_jitter_seconds", "poll_jitter_seconds"),
+            2.0,
+        ),
+    )
+    poll_max_interval_default = float(max(poll_interval * 6, poll_interval))
+    poll_max_interval = _resolve_float(
+        "IMAP_POLL_MAX_INTERVAL",
+        ("imap_poll_max_interval", "poll_max_interval_seconds"),
+        poll_max_interval_default,
+    )
+    poll_max_interval_seconds = max(int(poll_max_interval), poll_interval)
+    poll_timeout_seconds = _resolve_optional_int(
+        "IMAP_POLL_TIMEOUT_SECONDS",
+        ("imap_poll_timeout_seconds", "poll_timeout_seconds"),
+    )
+
     supplier_agent = supplier_agent or _resolve_agent_dependency(
         agent_registry, orchestrator, ("supplier_interaction", "SupplierInteractionAgent")
     )
     negotiation_agent = negotiation_agent or _resolve_agent_dependency(
         agent_registry, orchestrator, ("negotiation", "NegotiationAgent")
     )
+    process_routing_service = process_routing_service or _resolve_agent_dependency(
+        agent_registry,
+        orchestrator,
+        ("process_routing_service", "process_router", "ProcessRoutingService"),
+    )
+    if process_routing_service is None and supplier_agent is not None:
+        process_routing_service = getattr(supplier_agent, "process_routing_service", None)
 
-    watcher = EmailWatcherV2(
-        dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
-        poll_interval_seconds=max(1, poll_interval),
-        max_poll_attempts=max(1, max_attempts),
-        supplier_agent=supplier_agent,
-        negotiation_agent=negotiation_agent,
-        mailbox=mailbox,
+    response_grace_seconds = _resolve_optional_int(
+        "EMAIL_WATCHER_RESPONSE_GRACE_SECONDS",
+        ("email_response_grace_seconds", "response_grace_seconds"),
+    )
+    default_grace_field = EmailWatcherConfig.__dataclass_fields__["response_grace_seconds"]
+    default_grace_seconds = default_grace_field.default
+    if default_grace_seconds is MISSING:
+        default_grace_seconds = 180
+
+    config = EmailWatcherConfig(
         imap_host=imap_host,
         imap_username=imap_username,
         imap_password=imap_password,
-        imap_port=imap_port,
-        imap_use_ssl=imap_use_ssl,
+        imap_port=imap_port or 993,
+        imap_use_ssl=True if imap_use_ssl is None else imap_use_ssl,
         imap_login=imap_login,
+        imap_mailbox=mailbox or "INBOX",
+        dispatch_wait_seconds=max(0, int(wait_seconds_after_last_dispatch)),
+        poll_interval_seconds=max(1, poll_interval),
+        max_poll_attempts=max(1, max_attempts),
+        poll_backoff_factor=max(1.0, poll_backoff_factor),
+        poll_jitter_seconds=poll_jitter_seconds,
+        poll_max_interval_seconds=poll_max_interval_seconds,
+        poll_timeout_seconds=poll_timeout_seconds,
+        response_grace_seconds=response_grace_seconds
+        if response_grace_seconds is not None
+        else int(default_grace_seconds),
+    )
+    watcher = EmailWatcher(
+        config=config,
+        supplier_agent=supplier_agent,
+        negotiation_agent=negotiation_agent,
+        process_router=process_routing_service,
+        sleep=time.sleep,
+    )
+    logger.info(
+        "watcher_started workflow=%s expected=%s status=active",
+        workflow_key,
+        expected_dispatch_total,
     )
     logger.info(
         "watcher_started workflow=%s expected=%s status=active",
@@ -375,7 +565,7 @@ def run_email_watcher_for_workflow(
         expected_dispatch_total,
     )
     try:
-        result = watcher.wait_and_collect_responses(workflow_key)
+        result = watcher.wait_for_responses(workflow_key)
     except imaplib.IMAP4.error as exc:
         logger.error(
             "IMAP authentication failed for host=%s user=%s: %s",
@@ -414,8 +604,33 @@ def run_email_watcher_for_workflow(
         "rows": responses,
         "matched_unique_ids": matched_ids,
     }
+    if workflow_status:
+        response_payload["workflow_status"] = workflow_status
+    if "expected_responses" in result:
+        response_payload["expected_responses"] = result.get("expected_responses")
+    if "elapsed_seconds" in result:
+        response_payload["elapsed_seconds"] = result.get("elapsed_seconds")
+    if "timeout_reached" in result:
+        response_payload["timeout_reached"] = bool(result.get("timeout_reached"))
+    if "pending_suppliers" in result:
+        response_payload["pending_suppliers"] = result.get("pending_suppliers")
+    if "pending_unique_ids" in result:
+        response_payload["pending_unique_ids"] = result.get("pending_unique_ids")
+    if "last_capture_ts" in result:
+        response_payload["last_capture_ts"] = result.get("last_capture_ts")
+    if "timeout_deadline" in result:
+        response_payload["timeout_deadline"] = result.get("timeout_deadline")
 
-    expected_ids = {row.unique_id for row in dispatch_rows}
+    if result.get("pending_unique_ids"):
+        response_payload["pending_unique_ids"] = list(result["pending_unique_ids"])
+    if result.get("pending_suppliers"):
+        response_payload["pending_suppliers"] = list(result["pending_suppliers"])
+    if result.get("timeout_reason"):
+        response_payload["timeout_reason"] = result["timeout_reason"]
+
+    expected_ids = expected_unique_ids or {
+        row.unique_id for row in dispatch_rows if row.unique_id
+    }
     if status not in {"processed", "completed"}:
         missing = sorted(expected_ids - set(matched_ids))
         response_payload["reason"] = (
@@ -442,7 +657,7 @@ def run_email_watcher_for_workflow(
 
 
 class EmailWatcherService:
-    """Run ``EmailWatcherV2`` as a background polling service."""
+    """Run the unified :class:`EmailWatcher` as a background polling service."""
 
     def __init__(
         self,
@@ -455,6 +670,7 @@ class EmailWatcherService:
         orchestrator: Optional[Any] = None,
         supplier_agent: Optional[Any] = None,
         negotiation_agent: Optional[Any] = None,
+        process_routing_service: Optional[Any] = None,
     ) -> None:
         if poll_interval_seconds is None:
             poll_interval_seconds = self._env_int("EMAIL_WATCHER_SERVICE_INTERVAL", fallback="90")
@@ -481,11 +697,54 @@ class EmailWatcherService:
         self._orchestrator = orchestrator
         self._supplier_agent = supplier_agent
         self._negotiation_agent = negotiation_agent
+        self._process_router = process_routing_service
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._forced_lock = threading.Lock()
         self._forced_workflows: Set[str] = set()
+
+    def watch_workflow(
+        self,
+        *,
+        workflow_id: str,
+        run_id: Optional[str],
+        wait_seconds_after_last_dispatch: int = 0,
+        lookback_minutes: int = 240,
+        mailbox_name: Optional[str] = None,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+        process_routing_service: Optional[Any] = None,
+        max_workers: int = 8,
+        workflow_memory: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run the watcher synchronously for ``workflow_id``.
+
+        This helper mirrors :func:`run_email_watcher_for_workflow` while
+        defaulting to dependencies captured by the service instance.  It is
+        primarily used by orchestration flows that need to force a watcher
+        pass immediately after dispatch without waiting for the background
+        loop.
+        """
+
+        return self._runner(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            wait_seconds_after_last_dispatch=wait_seconds_after_last_dispatch,
+            lookback_minutes=lookback_minutes,
+            mailbox_name=mailbox_name,
+            agent_registry=agent_registry or self._agent_registry,
+            orchestrator=orchestrator or self._orchestrator,
+            supplier_agent=supplier_agent or self._supplier_agent,
+            negotiation_agent=negotiation_agent or self._negotiation_agent,
+            process_routing_service=(
+                process_routing_service or self._process_router
+            ),
+            max_workers=max_workers,
+            workflow_memory=workflow_memory,
+        )
 
     @staticmethod
     def _env_int(name: str, *, fallback: str) -> int:
@@ -529,6 +788,10 @@ class EmailWatcherService:
         if not workflow_key:
             return
 
+        self._preempt_existing_workflows(workflow_key)
+        if self._thread and self._thread.is_alive():
+            self.stop()
+            self.start()
         with self._forced_lock:
             self._forced_workflows.add(workflow_key)
         self._wake_event.set()
@@ -538,6 +801,95 @@ class EmailWatcherService:
             items = list(self._forced_workflows)
             self._forced_workflows.clear()
         return items
+
+    def _preempt_existing_workflows(self, new_workflow_id: str) -> None:
+        try:
+            active_workflows = workflow_email_tracking_repo.load_active_workflow_ids()
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to enumerate active workflows before preemption"
+            )
+            return
+
+        seen: Set[str] = set()
+        for workflow_id in active_workflows:
+            workflow_key = (workflow_id or "").strip()
+            if not workflow_key or workflow_key == new_workflow_id:
+                continue
+            if workflow_key in seen:
+                continue
+            seen.add(workflow_key)
+            try:
+                workflow_email_tracking_repo.reset_workflow(workflow_key)
+                workflow_lifecycle_repo.record_watcher_event(
+                    workflow_key,
+                    "watcher_stopped",
+                    expected_responses=0,
+                    received_responses=0,
+                    metadata={
+                        "stop_reason": "preempted_by_new_workflow",
+                        "preempted_by": new_workflow_id,
+                    },
+                )
+                logger.info(
+                    "EmailWatcherService preempted workflow=%s in favour of workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+            except Exception:
+                logger.exception(
+                    "EmailWatcherService failed to preempt workflow=%s before starting workflow=%s",
+                    workflow_key,
+                    new_workflow_id,
+                )
+        if seen:
+            with self._forced_lock:
+                self._forced_workflows = {
+                    wf for wf in self._forced_workflows if wf == new_workflow_id
+                }
+
+    def _should_skip_workflow(self, workflow_id: str) -> bool:
+        """Return ``True`` when ``workflow_id`` should not be processed."""
+
+        workflow_key = (workflow_id or "").strip()
+        if not workflow_key:
+            return False
+
+        try:
+            lifecycle = workflow_lifecycle_repo.get_lifecycle(workflow_key)
+        except Exception:
+            logger.exception(
+                "EmailWatcherService failed to load lifecycle for workflow=%s",
+                workflow_key,
+            )
+            return False
+
+        if not lifecycle:
+            return False
+
+        negotiation_status = str(
+            lifecycle.get("negotiation_status") or ""
+        ).strip().lower()
+        if negotiation_status not in {"completed", "finalized"}:
+            return False
+
+        watcher_status = str(lifecycle.get("watcher_status") or "").strip().lower()
+        if watcher_status != "stopped":
+            return False
+
+        metadata = lifecycle.get("metadata") or {}
+        stop_reason = str(metadata.get("stop_reason") or "").strip().lower()
+        if stop_reason in {
+            "negotiation_completed",
+            "negotiation_completed_pending_responses",
+        }:
+            logger.debug(
+                "EmailWatcherService suppressing workflow=%s due to completed negotiation",
+                workflow_key,
+            )
+            return True
+
+        return False
 
     def _wait_for_next_cycle(self, seconds: float) -> None:
         if seconds <= 0:
@@ -551,6 +903,25 @@ class EmailWatcherService:
             if awakened:
                 self._wake_event.clear()
                 break
+
+    def update_dependencies(
+        self,
+        *,
+        agent_registry: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        supplier_agent: Optional[Any] = None,
+        negotiation_agent: Optional[Any] = None,
+    ) -> None:
+        """Refresh shared dependency references used by the watcher."""
+
+        if agent_registry is not None:
+            self._agent_registry = agent_registry
+        if orchestrator is not None:
+            self._orchestrator = orchestrator
+        if supplier_agent is not None:
+            self._supplier_agent = supplier_agent
+        if negotiation_agent is not None:
+            self._negotiation_agent = negotiation_agent
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -577,6 +948,10 @@ class EmailWatcherService:
                 if not workflow_id:
                     continue
 
+                if self._should_skip_workflow(workflow_id):
+                    processed_workflow = True
+                    continue
+
                 try:
                     result = self._runner(
                         workflow_id=workflow_id,
@@ -586,6 +961,7 @@ class EmailWatcherService:
                         orchestrator=self._orchestrator,
                         supplier_agent=self._supplier_agent,
                         negotiation_agent=self._negotiation_agent,
+                        process_routing_service=self._process_router,
                     )
                     status = str(result.get("status") or "").lower()
                     processed_workflow = True

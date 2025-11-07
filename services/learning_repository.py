@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
@@ -107,6 +108,66 @@ class LearningRepository:
             )
         except Exception:
             logger.exception("Failed to persist learning record for %s", event_type)
+            return None
+
+        return point_id
+
+    def record_model_plan(
+        self,
+        *,
+        model_name: str,
+        plan_text: str,
+        plan_metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[Iterable[str]] = None,
+    ) -> Optional[str]:
+        """Persist a lightweight fine-tuning plan for a model.
+
+        The record is stored in the learning collection so that agents can
+        retrieve the latest humanisation playbook directly from Qdrant.
+        """
+
+        if self.qdrant_client is None or self.embedder is None:
+            logger.debug("Model plan repository disabled (missing client or embedder)")
+            return None
+
+        cleaned_plan = str(plan_text or "").strip()
+        if not cleaned_plan:
+            logger.debug("Skipping model plan for %s – empty body", model_name)
+            return None
+
+        metadata = self._normalise_metadata(plan_metadata)
+        metadata["model_name"] = model_name
+
+        vector = self._encode_text(cleaned_plan)
+        if vector is None:
+            return None
+
+        payload: Dict[str, Any] = {
+            "document_type": "model_plan",
+            "model_name": model_name,
+            "plan_text": cleaned_plan,
+            "metadata": metadata,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if tags:
+            cleaned_tags = [
+                str(tag).strip() for tag in tags if isinstance(tag, str) and str(tag).strip()
+            ]
+            if cleaned_tags:
+                payload["tags"] = sorted(set(cleaned_tags))
+
+        point_id = str(uuid.uuid4())
+        point = models.PointStruct(id=point_id, vector=vector, payload=payload)
+
+        try:
+            self.qdrant_client.upsert(
+                collection_name=self.collection_name,
+                points=[point],
+                wait=True,
+            )
+        except Exception:
+            logger.exception("Failed to persist model plan for %s", model_name)
             return None
 
         return point_id
@@ -256,6 +317,59 @@ class LearningRepository:
             "events": records,
         }
 
+    def fetch_model_plans(
+        self,
+        *,
+        model_name: str,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve stored model plans for a given model name."""
+
+        client = self.qdrant_client
+        if client is None:
+            return []
+
+        must_conditions: List[models.FieldCondition] = [
+            models.FieldCondition(
+                key="document_type", match=models.MatchValue(value="model_plan")
+            ),
+            models.FieldCondition(
+                key="model_name", match=models.MatchValue(value=model_name)
+            ),
+        ]
+
+        query_filter = models.Filter(must=must_conditions)
+        results: List[Dict[str, Any]] = []
+        offset = None
+
+        while len(results) < limit:
+            batch_size = min(64, limit - len(results))
+            try:
+                batch, offset = client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                logger.exception("Failed to scroll model plans for %s", model_name)
+                break
+
+            for point in batch or []:
+                payload = getattr(point, "payload", None)
+                if isinstance(payload, dict) and payload.get("document_type") == "model_plan":
+                    results.append(payload)
+            if offset is None:
+                break
+
+        results.sort(
+            key=lambda item: item.get("created_at") or "",
+            reverse=True,
+        )
+        return results[:limit]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -301,6 +415,8 @@ class LearningRepository:
             "workflow_id": models.PayloadSchemaType.KEYWORD,
             "rfq_id": models.PayloadSchemaType.KEYWORD,
             "supplier_id": models.PayloadSchemaType.KEYWORD,
+            "source_type": models.PayloadSchemaType.KEYWORD,
+            "model_name": models.PayloadSchemaType.KEYWORD,
         }
 
         for field, schema_type in required.items():
