@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -164,9 +165,17 @@ class RAGAgent(BaseAgent):
                         )
 
                     if feedback_sentiment == FeedbackSentiment.POSITIVE:
+                        html_answer = self._build_html_answer(
+                            query=classification_query,
+                            raw_answer=acknowledgment_text or "Thank you for the feedback.",
+                            extracted_data={
+                                "main_points": [acknowledgment_text or "Appreciate the update."]
+                            },
+                            plan=None,
+                        )
                         data = {
                             "question": self._last_interaction.get("query", classification_query),
-                            "answer": acknowledgment_text,
+                            "answer": html_answer,
                             "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
                             "related_prompts": [],
                             "structured": False,
@@ -282,13 +291,19 @@ class RAGAgent(BaseAgent):
             structured_answer = (
                 f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
             )
+        html_answer = self._build_html_answer(
+            query=classification_query,
+            raw_answer=structured_answer,
+            extracted_data=extracted,
+            plan=plan,
+        )
         followups = self._generate_contextual_followups(
             classification_query, query_type, extracted, depth_mode
         )
 
         response = {
             "question": qa_entry.question,
-            "answer": structured_answer,
+            "answer": html_answer,
             "topic": topic_entry.topic,
             "related_prompts": followups if followups else related_prompts,
             "structured": query_type != "simple_lookup",
@@ -348,7 +363,7 @@ class RAGAgent(BaseAgent):
             "user_id": user_id,
             "session_id": session_id,
             "query": classification_query,
-            "response": structured_answer,
+            "response": html_answer,
             "doc_ids": source_labels if source_labels else [record_id],
             "topic": topic_entry.topic,
             "query_type": query_type,
@@ -946,6 +961,188 @@ class RAGAgent(BaseAgent):
             return opening if query_type != "simple_lookup" else section_bodies["direct_answer"]
 
         return "\n\n".join(formatted_sections)
+
+    def _build_html_answer(
+        self,
+        *,
+        query: str,
+        raw_answer: Optional[str],
+        extracted_data: Optional[Dict[str, Any]] = None,
+        plan: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Render the final answer as semantic HTML."""
+
+        extracted = extracted_data or {}
+        plan = plan or {}
+        raw_answer = (raw_answer or "").strip()
+        stripped_answer = self._strip_markdown(raw_answer)
+
+        focus = self._derive_focus_from_query(query)
+        focus_text = focus if focus and focus != "the topic" else "this topic"
+        acknowledgement = (
+            f"I reviewed your question about {focus_text} and here’s the latest."  # semi-formal tone
+        )
+
+        candidate_sentences = self._split_sentences(stripped_answer) if stripped_answer else []
+        main_points: List[str] = [
+            point
+            for point in extracted.get("main_points", [])
+            if isinstance(point, str) and point.strip()
+        ]
+        if not main_points and candidate_sentences:
+            main_points = candidate_sentences[:5]
+        if not main_points and stripped_answer:
+            main_points = [stripped_answer]
+
+        summary_text = (
+            candidate_sentences[0]
+            if candidate_sentences
+            else (main_points[0] if main_points else "I could not find documented guidance yet.")
+        )
+
+        can_items: List[str] = []
+        cannot_items: List[str] = []
+        positive_markers = (
+            " can ",
+            " can.",
+            " allowed",
+            " allow",
+            " should ",
+            " recommended",
+            " may ",
+        )
+        negative_markers = (
+            " cannot",
+            " can't",
+            " not allowed",
+            " forbidden",
+            " must not",
+            " avoid",
+            " prohibited",
+            " restriction",
+        )
+
+        for line in self._extract_candidate_lines(raw_answer):
+            clean_line = self._normalise_line(line)
+            if not clean_line:
+                continue
+            lowered = clean_line.lower()
+            if any(marker in lowered for marker in positive_markers):
+                can_items.append(clean_line)
+            if any(marker in lowered for marker in negative_markers):
+                cannot_items.append(clean_line)
+
+        if not can_items and main_points:
+            can_items = main_points[:2]
+        if not can_items:
+            can_items = [
+                "No clear allowances surfaced in the records—let me know the scenario and I can dig further.",
+            ]
+
+        if not cannot_items and plan.get("type") == "policy_lookup":
+            cannot_items = [
+                "I didn’t see explicit prohibitions yet; check the policy for any red flags before proceeding.",
+            ]
+        elif not cannot_items:
+            cannot_items = [
+                "No specific restrictions were referenced in the retrieved material.",
+            ]
+
+        table_rows: List[Tuple[str, str]] = []
+        for idx, point in enumerate(main_points[:3], start=1):
+            condition, description = self._split_condition_description(point, idx)
+            table_rows.append((condition, description))
+        if not table_rows:
+            table_rows = [("Key Insight", "No supporting details available yet.")]
+
+        note_candidates = candidate_sentences[1:4] if len(candidate_sentences) > 1 else []
+        if not note_candidates:
+            note_candidates = main_points[1:3]
+        notes_text = " ".join(note_candidates).strip()
+        if not notes_text:
+            notes_text = (
+                "If you need more specifics—limits, approvals, or documentation—I can look them up."
+            )
+
+        def _escape_list(items: Sequence[str]) -> str:
+            return "\n".join(
+                f"      <li>{html.escape(item.strip())}</li>" for item in items if item.strip()
+            ) or "      <li>No additional guidance captured.</li>"
+
+        table_html_rows = "\n".join(
+            (
+                "      <tr>\n"
+                f"        <td style=\"padding:6px;border-bottom:1px solid #f0f0f0;\">{html.escape(condition)}</td>\n"
+                f"        <td style=\"padding:6px;border-bottom:1px solid #f0f0f0;\">{html.escape(description)}</td>\n"
+                "      </tr>"
+            )
+            for condition, description in table_rows
+        )
+
+        html_parts = [
+            "<section>",
+            f"  <p>{html.escape(acknowledgement)}</p>",
+            "  <h2>Summary</h2>",
+            f"  <p>{html.escape(summary_text)}</p>",
+            "  <h3>What You Can Do</h3>",
+            "  <ul>",
+            _escape_list(can_items),
+            "  </ul>",
+            "  <h3>What You Cannot Do</h3>",
+            "  <ul>",
+            _escape_list(cannot_items),
+            "  </ul>",
+            "  <h3>Key Details</h3>",
+            "  <table style=\"border-collapse:collapse;width:100%;border:1px solid #ddd;\">",
+            "    <thead>",
+            "      <tr>",
+            "        <th style=\"text-align:left;padding:6px;border-bottom:1px solid #ddd;\">Condition</th>",
+            "        <th style=\"text-align:left;padding:6px;border-bottom:1px solid #ddd;\">Description</th>",
+            "      </tr>",
+            "    </thead>",
+            "    <tbody>",
+            table_html_rows,
+            "    </tbody>",
+            "  </table>",
+            "  <h3>Notes</h3>",
+            f"  <p>{html.escape(notes_text)}</p>",
+            "</section>",
+        ]
+
+        return "\n".join(html_parts)
+
+    def _strip_markdown(self, text: str) -> str:
+        cleaned = text.replace("**", "")
+        cleaned = cleaned.replace("__", "")
+        cleaned = re.sub(r"`([^`]*)`", r"\\1", cleaned)
+        cleaned = re.sub(r"#+\\s*", "", cleaned)
+        cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\\1", cleaned)
+        return cleaned
+
+    def _extract_candidate_lines(self, text: str) -> List[str]:
+        if not text:
+            return []
+        lines = [segment.strip() for segment in text.splitlines() if segment.strip()]
+        return lines
+
+    def _normalise_line(self, text: str) -> str:
+        cleaned = re.sub(r"^[\-•*]+", "", text).strip()
+        cleaned = re.sub(r"^\d+\.\s*", "", cleaned)
+        cleaned = cleaned.replace("**", "")
+        cleaned = cleaned.replace("__", "")
+        return cleaned.strip()
+
+    def _split_condition_description(self, text: str, index: int) -> Tuple[str, str]:
+        cleaned = self._normalise_line(self._strip_markdown(text))
+        if ":" in cleaned:
+            condition, description = cleaned.split(":", 1)
+            return condition.strip() or f"Key Insight {index}", description.strip() or cleaned
+        if "-" in cleaned:
+            parts = cleaned.split("-", 1)
+            left, right = parts[0].strip(), parts[1].strip()
+            if left and right:
+                return left, right
+        return f"Key Insight {index}", cleaned or "Detail not provided."
 
     def _generate_opening_section(
         self, query: str, data: Dict[str, Any], query_type: str

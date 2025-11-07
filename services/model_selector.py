@@ -414,9 +414,12 @@ class RAGPipeline:
             )
         )
 
+        stripped_answer = answer_text.lstrip()
         structured = (
             bool(payload.get("structured"))
-            or answer_text.lstrip().startswith("##")
+            or stripped_answer.startswith("##")
+            or stripped_answer.startswith("<section")
+            or "<section" in stripped_answer
             or is_feedback_ack
         )
 
