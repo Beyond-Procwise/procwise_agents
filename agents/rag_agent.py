@@ -508,7 +508,8 @@ class RAGAgent(BaseAgent):
 
             summary = self._extract_summary_from_payload(payload)
             title = self._extract_title_from_payload(payload)
-            document_type = payload.get("document_type") or payload.get("source_type")
+            raw_document_type = payload.get("document_type") or payload.get("source_type")
+            document_type = self._coerce_metadata_to_string(raw_document_type)
             source_label = self._build_source_label_from_details(
                 title, document_type, collection
             )
@@ -569,6 +570,26 @@ class RAGAgent(BaseAgent):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return ""
+
+    def _coerce_metadata_to_string(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item
+            if value:
+                return str(value[0])
+            return ""
+        if isinstance(value, dict):
+            for key in ("name", "label", "type", "value"):
+                item = value.get(key)
+                if isinstance(item, str) and item.strip():
+                    return item
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return ""
+        return str(value)
 
     def _build_source_label_from_details(
         self, title: str, document_type: Optional[str], collection: str
