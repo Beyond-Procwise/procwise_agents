@@ -52,7 +52,13 @@ class ResponseStructure:
             "style": "comparative",
         },
         "policy_lookup": {
-            "sections": ["policy_summary", "key_requirements", "examples", "related_policies"],
+            "sections": [
+                "summary",
+                "allowed_conditions",
+                "restricted_conditions",
+                "compliance_notes",
+                "next_steps",
+            ],
             "style": "reference",
         },
         "exploratory": {
@@ -256,6 +262,7 @@ class RAGAgent(BaseAgent):
                 focus_answer=qa_entry.answer,
                 depth_mode=depth_mode,
                 policy_docs=policy_docs,
+                primary_docs=primary_docs,
             )
 
         structured_answer = self._generate_structured_response(
@@ -839,6 +846,9 @@ class RAGAgent(BaseAgent):
             "key_requirements": "Key Requirements",
             "examples": "Practical Examples",
             "related_policies": "Related Policies",
+            "allowed_conditions": "Allowed Conditions",
+            "restricted_conditions": "Restricted Conditions",
+            "compliance_notes": "Compliance Notes",
             "context": "Context",
             "findings": "Findings",
             "details": "Supporting Details",
@@ -873,7 +883,7 @@ class RAGAgent(BaseAgent):
                     "examples": [],
                     "exceptions": [],
                 }
-            return self._render_policy_response(policy_payload, depth_mode)
+            return self._render_policy_response(policy_payload, depth_mode, query)
 
         opening = self._generate_opening_section(query, extracted_data, query_type)
         closing = self._generate_closing_section(query, extracted_data, query_type)
@@ -1152,126 +1162,167 @@ class RAGAgent(BaseAgent):
         focus_answer: str,
         depth_mode: str,
         policy_docs: Sequence[SimpleNamespace] = (),
+        primary_docs: Sequence[SimpleNamespace] = (),
     ) -> Dict[str, Any]:
         categories: Dict[str, List[str]] = defaultdict(list)
+        dynamic_presence: Set[str] = set()
+        doc_overview_candidates: List[str] = []
 
-        for qa in topic_entry.qas:
-            question_lower = qa.question.lower()
-            sentences = self._split_sentences(qa.answer)
+        def _record(key: str, clause: str, *, dynamic: bool) -> None:
+            cleaned = self._clean_policy_clause(clause)
+            if not cleaned:
+                return
+            if not dynamic and dynamic_presence and key in dynamic_presence:
+                return
+            categories[key].append(cleaned)
+            if dynamic:
+                dynamic_presence.add(key)
+
+        def _ingest_text(block: str, *, dynamic: bool) -> None:
+            if not block:
+                return
+            sentences = self._split_sentences(block)
             for sentence in sentences:
-                clause = self._clean_policy_clause(sentence)
-                lowered = clause.lower()
-                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
-                    categories["requirements"].append(clause)
+                lowered = sentence.lower()
+                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep|require)\b", lowered):
+                    _record("requirements", sentence, dynamic=dynamic)
                 if re.search(
-                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
+                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined|never)\b",
                     lowered,
                 ) or "non-claimable" in lowered:
-                    categories["restrictions"].append(clause)
-                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
-                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
+                    _record("restrictions", sentence, dynamic=dynamic)
+                if re.search(r"[£$€]\s*[\d,.]+", sentence) or re.search(
+                    r"\b(limit|cap|threshold|per person|per day|per month|ceiling)\b",
                     lowered,
                 ):
-                    categories["spending_limits"].append(clause)
-                if re.search(r"approval|approve|authoris|manager|finance", lowered):
-                    categories["approval_process"].append(clause)
+                    _record("spending_limits", sentence, dynamic=dynamic)
+                if re.search(
+                    r"approval|approve|authoris|manager|finance|sign-off|review",
+                    lowered,
+                ):
+                    _record("approval_process", sentence, dynamic=dynamic)
                 if re.search(r"for example|such as|e.g.|include", lowered):
-                    categories["examples"].append(clause)
-                if re.search(r"unless|exception|exemption|waiver", lowered):
-                    categories["exceptions"].append(clause)
+                    _record("examples", sentence, dynamic=dynamic)
+                if re.search(r"unless|exception|exemption|waiver|if you need an exception", lowered):
+                    _record("exceptions", sentence, dynamic=dynamic)
+                if re.search(
+                    r"workflow|process|document|retain|attach|audit|reconcile|submit|evidence|record",
+                    lowered,
+                ) or re.search(r"\b(po|purchase order|invoice|coding)\b", lowered):
+                    _record("operational_notes", sentence, dynamic=dynamic)
 
-            if "exception" in question_lower or "waiver" in question_lower:
-                categories["exceptions"].extend(sentences)
-            if "example" in question_lower:
-                categories["examples"].extend(sentences)
-            if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
-                categories["spending_limits"].extend(sentences)
-            if "approval" in question_lower or "pre-approv" in question_lower:
-                categories["approval_process"].extend(sentences)
-            if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
-                categories["requirements"].extend(sentences)
+        def _ingest_payload(payload: Dict[str, Any], *, dynamic: bool) -> None:
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                if dynamic:
+                    doc_overview_candidates.append(summary)
+                _ingest_text(summary, dynamic=dynamic)
 
-        doc_overview_candidates: List[str] = []
+            for key in ("highlights", "sections", "key_points"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    _ingest_text(value, dynamic=dynamic)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, str):
+                            _ingest_text(item, dynamic=dynamic)
+                        elif isinstance(item, dict):
+                            for field in ("text", "content", "summary", "value"):
+                                text_value = item.get(field)
+                                if isinstance(text_value, str):
+                                    _ingest_text(text_value, dynamic=dynamic)
+
         for doc in policy_docs or []:
             payload = getattr(doc, "payload", {}) or {}
-            summary = payload.get("summary") or ""
-            if summary:
-                doc_overview_candidates.append(summary)
-            sentences = self._split_sentences(summary)
-            for sentence in sentences:
-                clause = self._clean_policy_clause(sentence)
-                lowered = clause.lower()
-                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
-                    categories["requirements"].append(clause)
-                if re.search(
-                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
-                    lowered,
-                ):
-                    categories["restrictions"].append(clause)
-                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
-                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
-                    lowered,
-                ):
-                    categories["spending_limits"].append(clause)
-                if re.search(r"approval|approve|authoris|manager|finance", lowered):
-                    categories["approval_process"].append(clause)
-                if re.search(r"for example|such as|e.g.|include", lowered):
-                    categories["examples"].append(clause)
-                if re.search(r"unless|exception|exemption|waiver", lowered):
-                    categories["exceptions"].append(clause)
+            _ingest_payload(payload, dynamic=True)
 
-        overview_sentences = self._split_sentences(focus_answer)
-        overview = overview_sentences[0] if overview_sentences else focus_answer
+        for doc in primary_docs or []:
+            payload = getattr(doc, "payload", {}) or {}
+            _ingest_payload(payload, dynamic=True)
+
+        if not dynamic_presence:
+            for qa in topic_entry.qas:
+                question_lower = qa.question.lower()
+                _ingest_text(qa.answer, dynamic=False)
+                if "exception" in question_lower or "waiver" in question_lower:
+                    categories["exceptions"].extend(self._split_sentences(qa.answer))
+                if "example" in question_lower:
+                    categories["examples"].extend(self._split_sentences(qa.answer))
+                if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
+                    categories["spending_limits"].extend(self._split_sentences(qa.answer))
+                if "approval" in question_lower or "pre-approv" in question_lower:
+                    categories["approval_process"].extend(self._split_sentences(qa.answer))
+                if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
+                    categories["requirements"].extend(self._split_sentences(qa.answer))
+
+        overview = ""
         if doc_overview_candidates:
             overview = doc_overview_candidates[0]
+        elif focus_answer:
+            sentences = self._split_sentences(focus_answer)
+            overview = sentences[0] if sentences else focus_answer
 
         payload = {
             "policy_name": policy_name,
-            "overview": self._ensure_sentence(self._clean_policy_clause(overview)),
+            "overview": self._ensure_sentence(self._clean_policy_clause(overview)) if overview else "",
             "requirements": self._unique_ordered(categories.get("requirements", [])),
             "restrictions": self._unique_ordered(categories.get("restrictions", [])),
             "spending_limits": self._unique_ordered(categories.get("spending_limits", [])),
             "approval_process": self._unique_ordered(categories.get("approval_process", [])),
             "examples": self._unique_ordered(categories.get("examples", [])),
             "exceptions": self._unique_ordered(categories.get("exceptions", [])),
+            "operational_notes": self._unique_ordered(categories.get("operational_notes", [])),
         }
 
         if depth_mode == "expanded":
-            for key in ["requirements", "restrictions", "spending_limits", "approval_process"]:
-                values = payload[key]
-                if not values and payload["overview"]:
+            for key in ["requirements", "restrictions", "spending_limits", "approval_process", "operational_notes"]:
+                values = payload.get(key, [])
+                if not values and payload.get("overview"):
                     values.append(payload["overview"])
                 payload[key] = values
 
         return payload
 
     def _render_policy_response(
-        self, payload: Dict[str, Any], depth_mode: str
+        self,
+        payload: Dict[str, Any],
+        depth_mode: str,
+        query: Optional[str] = None,
     ) -> str:
         policy_name = self._format_policy_title(payload.get("policy_name", "Policy Guidance"))
+        focus = self._derive_focus_from_query(query or policy_name)
+        focus_text = focus if focus and focus != "the topic" else "this request"
         overview = payload.get("overview", "")
         overview_text = self._ensure_sentence(self._clean_policy_clause(overview)) if overview else ""
 
-        lines: List[str] = [f"## {policy_name}"]
-        if overview_text:
-            lines.append(overview_text)
+        detail = overview_text or "I pulled the relevant guardrails straight from our policy library and procurement records."
+        summary_line = f"Here’s what {policy_name} says about {focus_text}: {detail}"
 
-        sections = [
-            ("What You Must Do", "requirements"),
-            ("What's Prohibited", "restrictions"),
-            ("Spending Limits", "spending_limits"),
-            ("Approval Requirements", "approval_process"),
-            ("Examples", "examples"),
-            ("Exceptions", "exceptions"),
-        ]
+        lines: List[str] = [self._ensure_sentence(summary_line)]
 
-        for title, key in sections:
-            bullets = self._policy_section_bullets(payload, key, depth_mode)
+        def _append_section(title: str, items: Sequence[str]) -> None:
+            bullets = [self._ensure_sentence(text) for text in self._unique_ordered(items)]
             if not bullets:
-                continue
+                return
             lines.append("")
             lines.append(title)
             lines.extend(f"- {bullet}" for bullet in bullets)
+
+        allowed = self._policy_section_bullets(payload, "requirements", depth_mode)
+        restricted = self._policy_section_bullets(payload, "restrictions", depth_mode)
+
+        notes_pool: List[str] = []
+        for key in ("spending_limits", "approval_process", "operational_notes"):
+            notes_pool.extend(self._policy_section_bullets(payload, key, depth_mode))
+        for key in ("examples", "exceptions"):
+            notes_pool.extend(self._policy_section_bullets(payload, key, depth_mode))
+
+        _append_section("✅ **Allowed Conditions / Requirements**", allowed)
+        _append_section("❌ **Prohibited / Restricted Conditions**", restricted)
+        _append_section("📎 **Important Notes / Compliance Obligations**", notes_pool)
+
+        next_steps = "Need help submitting an expense claim or checking approvals? Just ask and I’ll walk you through it."
+        _append_section("➡️ **Next Steps**", [next_steps])
 
         return "\n".join(lines)
 
@@ -1324,6 +1375,7 @@ class RAGAgent(BaseAgent):
             "approval_process": "Capture written approval in advance for any exception.",
             "examples": "Model your claim on the compliant scenarios described in the policy.",
             "exceptions": "Escalate unusual circumstances to Finance for documented exceptions.",
+            "operational_notes": "Keep documentation tidy—attach receipts, coding, and approvals in the workflow.",
         }
 
         bullets = [self._ensure_sentence(item) for item in self._unique_ordered(bullets)]
@@ -1392,6 +1444,8 @@ class RAGAgent(BaseAgent):
                 )
             else:
                 bullets.append(f"Exception: {clause}")
+        elif section == "operational_notes":
+            bullets.append(self._ensure_sentence(clause))
 
         return bullets
 
