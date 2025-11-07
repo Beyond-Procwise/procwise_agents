@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Set
 
 import ollama
 import pdfplumber
@@ -182,7 +182,7 @@ class RAGPipeline:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
 
         candidate = (configured_model or "").strip()
-        if candidate and "phi4" in candidate.lower():
+        if candidate and "qwen3" in candidate.lower():
             return candidate
         if candidate:
             logger.warning(
@@ -1940,3 +1940,49 @@ class RAGPipeline:
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }
+
+    def rag_answer(self, query: str, user_id: Optional[str] = None, session_id: Optional[str] = None, *, ensure_min_docs: int = 3) -> Dict[str, Any]:
+        """High-precision RAG answer entrypoint that uses qwen3-30b-procwise via Ollama.
+
+        Workflow:
+        - Attempt static QA (fast path). If a high-confidence static answer exists return it.
+        - Otherwise invoke the RAGQwen30b pipeline which implements retrieval, rerank, dedupe,
+          per-doc capping, extractive compression and context packing before generation.
+
+        Returns the dictionary produced by the underlying pipeline (keys: answer, sources, diagnostics, used_context_chunks).
+        """
+        # Try static QA first (policy lookup)
+        try:
+            static = self._try_static_answer(query, user_id or "", session_id=session_id)
+            if static is not None:
+                # Ensure returned dict has expected shape
+                return {
+                    "answer": static.get("answer"),
+                    "sources": static.get("sources", []),
+                    "diagnostics": {"static": True},
+                    "used_context_chunks": static.get("used_context_chunks", []),
+                }
+        except Exception:
+            logger.exception("Static QA attempt failed; falling through to RAG")
+
+        # Invoke the qwen3-30b-procwise RAG pipeline
+        try:
+            from services.rag_qwen30b import RAGQwen30b, REFUSAL_SENTENCE  # imported lazily to avoid import cycles during tests
+
+            rag = RAGQwen30b(self.agent_nick)
+            result = rag.answer(query, ensure_min_docs=ensure_min_docs)
+            # Normalize result: ensure keys exist
+            result.setdefault("answer", REFUSAL_SENTENCE + "\n\nSources: ")
+            result.setdefault("sources", [])
+            result.setdefault("diagnostics", {})
+            result.setdefault("used_context_chunks", [])
+            return result
+        except Exception:
+            logger.exception("RAG qwen30b pipeline failed")
+            # predictable refusal
+            return {
+                "answer": "I don't have enough information in the provided documents.\n\nSources: ",
+                "sources": [],
+                "diagnostics": {"error": "rag_pipeline_failure"},
+                "used_context_chunks": [],
+            }
