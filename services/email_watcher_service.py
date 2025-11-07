@@ -559,6 +559,11 @@ def run_email_watcher_for_workflow(
         workflow_key,
         expected_dispatch_total,
     )
+    logger.info(
+        "watcher_started workflow=%s expected=%s status=active",
+        workflow_key,
+        expected_dispatch_total,
+    )
     try:
         result = watcher.wait_for_responses(workflow_key)
     except imaplib.IMAP4.error as exc:

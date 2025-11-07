@@ -66,6 +66,10 @@ class _FakeCursor:
 
         if upper_stmt.startswith("CREATE SCHEMA"):
             return
+        if upper_stmt.startswith("CREATE SEQUENCE"):
+            # Sequences aren't materialised in the in-memory store but the
+            # statement should succeed to mirror Postgres behaviour.
+            return
         if upper_stmt.startswith("CREATE TABLE") or upper_stmt.startswith(
             "CREATE INDEX"
         ) or upper_stmt.startswith("CREATE UNIQUE INDEX"):
