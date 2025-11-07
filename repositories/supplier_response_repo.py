@@ -371,6 +371,32 @@ def insert_response(row: SupplierResponseRow) -> None:
         if serialisable is not None:
             raw_headers_json = json.dumps(serialisable)
 
+    in_reply_to_json = _serialise_optional_json(row.in_reply_to)
+    references_json = _serialise_optional_json(row.references)
+    def _coerce_text_field(value: Optional[object]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return ", ".join(items) if items else None
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, default=_json_default)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    currency = _coerce_text_field(getattr(row, "currency", None))
+    payment_terms = _coerce_text_field(getattr(row, "payment_terms", None))
+    warranty = _coerce_text_field(getattr(row, "warranty", None))
+    validity = _coerce_text_field(getattr(row, "validity", None))
+    exceptions = _coerce_text_field(getattr(row, "exceptions", None))
+    match_evidence = _serialise_match_evidence(getattr(row, "match_evidence", None))
+    tables_json = _serialise_optional_json(getattr(row, "tables", None))
+    attachments_json = _serialise_optional_json(getattr(row, "attachments", None))
+    matched_on = matched_on_json
+    raw_headers = raw_headers_json
+
     with get_conn() as conn:
         cur = conn.cursor()
         if response_message_id:
