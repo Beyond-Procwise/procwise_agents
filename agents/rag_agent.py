@@ -1240,20 +1240,33 @@ class RAGAgent(BaseAgent):
             payload = getattr(doc, "payload", {}) or {}
             _ingest_payload(payload, dynamic=True)
 
-        if not dynamic_presence:
-            for qa in topic_entry.qas:
-                question_lower = qa.question.lower()
-                _ingest_text(qa.answer, dynamic=False)
-                if "exception" in question_lower or "waiver" in question_lower:
-                    categories["exceptions"].extend(self._split_sentences(qa.answer))
-                if "example" in question_lower:
-                    categories["examples"].extend(self._split_sentences(qa.answer))
-                if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
-                    categories["spending_limits"].extend(self._split_sentences(qa.answer))
-                if "approval" in question_lower or "pre-approv" in question_lower:
-                    categories["approval_process"].extend(self._split_sentences(qa.answer))
-                if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
-                    categories["requirements"].extend(self._split_sentences(qa.answer))
+        for qa in topic_entry.qas:
+            question_lower = qa.question.lower()
+            answer_sentences = self._split_sentences(qa.answer)
+
+            _ingest_text(qa.answer, dynamic=False)
+
+            if "exceptions" not in dynamic_presence and (
+                "exception" in question_lower or "waiver" in question_lower
+            ):
+                categories["exceptions"].extend(answer_sentences)
+            if "examples" not in dynamic_presence and "example" in question_lower:
+                categories["examples"].extend(answer_sentences)
+            if (
+                "spending_limits" not in dynamic_presence
+                and any(keyword in question_lower for keyword in ["limit", "cap", "threshold"])
+            ):
+                categories["spending_limits"].extend(answer_sentences)
+            if (
+                "approval_process" not in dynamic_presence
+                and ("approval" in question_lower or "pre-approv" in question_lower)
+            ):
+                categories["approval_process"].extend(answer_sentences)
+            if (
+                "requirements" not in dynamic_presence
+                and any(keyword in question_lower for keyword in ["must", "how do i comply"])
+            ):
+                categories["requirements"].extend(answer_sentences)
 
         overview = ""
         if doc_overview_candidates:
