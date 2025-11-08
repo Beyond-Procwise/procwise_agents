@@ -31,3 +31,5 @@ langgraph
 httpx
 langcache
 nltk
+neo4j
+requests
