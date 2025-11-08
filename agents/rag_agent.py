@@ -19,6 +19,253 @@ from services.rag_service import RAGService
 logger = logging.getLogger(__name__)
 
 
+_MAX_ATOM_LIST_ITEMS = 6
+_BANNED_TOKENS: Tuple[str, ...] = (
+    "Thanks for flagging this",
+    "[redacted]",
+    "document_id",
+    "static_policy",
+)
+
+
+ATOM_EXTRACTION_SYSTEM = """Answer in a concise, semi-formal, human tone for procurement guidance.
+Only produce HTML-friendly building blocks as JSON atoms; the runtime renderer will craft the final markup.
+OUTPUT FORMAT: HTML scaffold with <section>, <h2>, <h3>, <p>, <ul>, <li>, and <table>.
+Sections must map to Summary, What You Can Do, What You Cannot Do, Key Details, and Next Steps when they have content.
+Avoid internal IDs, collection names, or placeholders. End with one short helpful follow-up suggestion.
+
+Example 1
+Question: "Can I expense client dinners during negotiations?"
+Context:
+- Policy library: Client entertainment tied to approved negotiations is reimbursable when logged with the deal code.
+- Spend guide: Alcohol above £50 per head is not reimbursed.
+JSON:
+{
+  "summary": "Client dinners related to active negotiations are reimbursable when you log them against the approved deal code.",
+  "allowed": [
+    "Expense dinners connected to live negotiations once the budget holder has cleared the meeting.",
+    "Claim reasonable food and non-alcoholic beverages with itemised receipts."
+  ],
+  "prohibited": [
+    "Do not claim alcohol above £50 per person.",
+    "Skip expenses for social events that are unrelated to negotiation activity."
+  ],
+  "details": [
+    ["Pre-approval", "Secure written approval from the budget owner before hosting the dinner."],
+    ["Receipt logging", "Upload the itemised bill within 48 hours using the negotiation deal code."],
+    ["Spend ceiling", "Stay within the £150 per head cap, inclusive of gratuity."]
+  ],
+  "notes": [
+    "Alcohol caps reset per person and cannot be pooled.",
+    "Flag any government attendees so compliance can review the guest list."
+  ],
+  "followup": "I can pull the claim workflow steps if you need a refresher."
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>Client dinners related to active negotiations are reimbursable when you log them against the approved deal code.</p>
+  <h3>What You Can Do</h3>
+  <ul><li>Expense dinners connected to live negotiations once the budget holder has cleared the meeting.</li><li>Claim reasonable food and non-alcoholic beverages with itemised receipts.</li></ul>
+  <h3>What You Cannot Do</h3>
+  <ul><li>Do not claim alcohol above £50 per person.</li><li>Skip expenses for social events that are unrelated to negotiation activity.</li></ul>
+  <h3>Key Details</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Pre-approval</td><td>Secure written approval from the budget owner before hosting the dinner.</td></tr><tr><td>Receipt logging</td><td>Upload the itemised bill within 48 hours using the negotiation deal code.</td></tr><tr><td>Spend ceiling</td><td>Stay within the £150 per head cap, inclusive of gratuity.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>Set a reminder to submit receipts within 48 hours.</li><li>Notify compliance if guests include public officials.</li></ul>
+  <p><small>I can pull the claim workflow steps if you need a refresher.</small></p>
+</section>
+
+Example 2
+Question: "What are the rules for short-haul travel?"
+Context:
+- Travel handbook: Economy class is the default for trips under four hours.
+- Sustainability charter: Encourage rail when under three hours door-to-door.
+JSON:
+{
+  "summary": "Short-haul trips default to economy flights or rail, with sustainability nudges favouring trains under three hours door-to-door.",
+  "allowed": [
+    "Book economy flights for journeys up to four hours when rail is impractical.",
+    "Choose rail as the preferred option when total travel time stays under three hours."
+  ],
+  "prohibited": [
+    "Avoid booking business class for sub-four-hour routes unless a VP signs off.",
+    "Skip flights where a same-day rail option meets the schedule."
+  ],
+  "details": [
+    ["Default cabin", "Economy only, unless medical or accessibility needs are documented."],
+    ["Sustainability check", "Use rail when it keeps the itinerary under three hours."],
+    ["Approval path", "VP approval recorded in ProcWise before upgrading seats."]
+  ],
+  "notes": [
+    "Add the sustainability checkbox when you log the booking.",
+    "Attach medical documentation securely if requesting an upgrade."
+  ],
+  "followup": "Happy to summarise the approval matrix if you need it."
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>Short-haul trips default to economy flights or rail, with sustainability nudges favouring trains under three hours door-to-door.</p>
+  <h3>What You Can Do</h3>
+  <ul><li>Book economy flights for journeys up to four hours when rail is impractical.</li><li>Choose rail as the preferred option when total travel time stays under three hours.</li></ul>
+  <h3>What You Cannot Do</h3>
+  <ul><li>Avoid booking business class for sub-four-hour routes unless a VP signs off.</li><li>Skip flights where a same-day rail option meets the schedule.</li></ul>
+  <h3>Key Details</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Default cabin</td><td>Economy only, unless medical or accessibility needs are documented.</td></tr><tr><td>Sustainability check</td><td>Use rail when it keeps the itinerary under three hours.</td></tr><tr><td>Approval path</td><td>VP approval recorded in ProcWise before upgrading seats.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>Confirm the rail timetable before requesting flights.</li><li>Upload any approval emails alongside the booking.</li></ul>
+  <p><small>Happy to summarise the approval matrix if you need it.</small></p>
+</section>
+
+Example 3
+Question: "How should I handle supplier onboarding delays?"
+Context:
+- Onboarding runbook: Suppliers must complete compliance docs before first PO.
+- Support note: Escalate if onboarding exceeds ten business days.
+JSON:
+{
+  "summary": "Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.",
+  "allowed": [
+    "Remind the supplier to submit compliance and banking forms through the portal.",
+    "Loop in the onboarding squad when legal review is pending."
+  ],
+  "prohibited": [
+    "Do not raise a purchase order until onboarding is fully approved.",
+    "Avoid bypassing the AML checks even for urgent projects."
+  ],
+  "details": [
+    ["Compliance pack", "Includes AML, tax forms, and sustainability attestations."],
+    ["Escalation trigger", "Start an escalation on day eleven if documents are still missing."],
+    ["Support channel", "Use the onboarding squad queue in ProcWise for rapid triage."]
+  ],
+  "notes": [
+    "Record all chaser emails on the supplier profile.",
+    "Tag the category manager so they stay informed."
+  ],
+  "followup": "Let me know if you want the escalation email template next."
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.</p>
+  <h3>What You Can Do</h3>
+  <ul><li>Remind the supplier to submit compliance and banking forms through the portal.</li><li>Loop in the onboarding squad when legal review is pending.</li></ul>
+  <h3>What You Cannot Do</h3>
+  <ul><li>Do not raise a purchase order until onboarding is fully approved.</li><li>Avoid bypassing the AML checks even for urgent projects.</li></ul>
+  <h3>Key Details</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Compliance pack</td><td>Includes AML, tax forms, and sustainability attestations.</td></tr><tr><td>Escalation trigger</td><td>Start an escalation on day eleven if documents are still missing.</td></tr><tr><td>Support channel</td><td>Use the onboarding squad queue in ProcWise for rapid triage.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>Schedule a check-in with the supplier if documents remain outstanding.</li><li>Prepare the escalation summary for leadership if needed.</li></ul>
+  <p><small>Let me know if you want the escalation email template next.</small></p>
+</section>
+
+Always respond with valid JSON containing exactly the keys summary, allowed, prohibited, details, notes, and followup.
+"""
+
+
+def compose_html_answer(
+    summary: str,
+    allowed: Optional[List[str]] | None = None,
+    prohibited: Optional[List[str]] | None = None,
+    details: Optional[List[Tuple[str, str]]] | None = None,
+    notes: Optional[List[str]] | None = None,
+    followup: Optional[str] | None = None,
+) -> str:
+    def _trim(items: Optional[Sequence[Any]]) -> List[str]:
+        if not items:
+            return []
+        result: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                result.append(text)
+            if len(result) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        return result
+
+    def bullets(items: Optional[List[str]]) -> str:
+        cleaned = _trim(items)
+        if not cleaned:
+            cleaned = ["No guidance captured yet."]
+        escaped = "".join(f"<li>{html.escape(entry)}</li>" for entry in cleaned)
+        return f"<ul>{escaped}</ul>"
+
+    def table(rows: Optional[List[Tuple[str, str]]]) -> str:
+        if not rows:
+            return ""
+        trimmed: List[Tuple[str, str]] = []
+        for condition, description in rows:
+            cond_text = str(condition).strip()
+            desc_text = str(description).strip()
+            if not cond_text and not desc_text:
+                continue
+            trimmed.append((cond_text or "Key Insight", desc_text or "Detail not provided."))
+            if len(trimmed) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        if not trimmed:
+            return ""
+        head = "<thead><tr><th>Condition</th><th>Description</th></tr></thead>"
+        body_rows = "".join(
+            f"<tr><td>{html.escape(cond)}</td><td>{html.escape(desc)}</td></tr>"
+            for cond, desc in trimmed
+        )
+        body = f"<tbody>{body_rows}</tbody>"
+        return (
+            "<table style='border-collapse:collapse;width:100%'>"
+            f"{head}{body}</table>"
+        )
+
+    summary_text = html.escape((summary or "No summary available.").strip() or "No summary available.")
+    allowed_section = bullets(allowed)
+    prohibited_section = bullets(prohibited)
+    notes_section = bullets(notes)
+    details_table = table(details)
+    followup_text = html.escape((followup or "Happy to explore more detail when you need it.").strip())
+
+    html_parts = [
+        "<section>",
+        "  <h2>Summary</h2>",
+        f"  <p>{summary_text}</p>",
+        "  <h3>What You Can Do</h3>",
+        f"  {allowed_section}",
+        "  <h3>What You Cannot Do</h3>",
+        f"  {prohibited_section}",
+    ]
+
+    if details_table:
+        html_parts.extend(
+            [
+                "  <h3>Key Details</h3>",
+                f"  {details_table}",
+            ]
+        )
+
+    html_parts.extend(
+        [
+            "  <h3>Next Steps</h3>",
+            f"  {notes_section}",
+            f"  <p><small>{followup_text}</small></p>",
+            "</section>",
+        ]
+    )
+
+    return "\n".join(html_parts)
+
+
+def sanitize_html(answer: str) -> str:
+    if not isinstance(answer, str):
+        return ""
+    cleaned = re.sub(r"(?is)<\s*(script|iframe)[^>]*>.*?<\s*/\s*\1\s*>", "", answer)
+    cleaned = re.sub(r"(?i)\s+on[a-z]+\s*=\s*\"[^\"]*\"", "", cleaned)
+    cleaned = re.sub(r"(?i)\s+on[a-z]+\s*=\s*'[^']*'", "", cleaned)
+    cleaned = re.sub(r"(?i)javascript:", "", cleaned)
+    for token in _BANNED_TOKENS:
+        cleaned = cleaned.replace(token, "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 @dataclass(frozen=True)
 class QARecord:
     """Represents a single procurement Q&A pair."""
@@ -291,14 +538,16 @@ class RAGAgent(BaseAgent):
             structured_answer = (
                 f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
             )
+        followups = self._generate_contextual_followups(
+            classification_query, query_type, extracted, depth_mode
+        )
         html_answer = self._build_html_answer(
             query=classification_query,
             raw_answer=structured_answer,
             extracted_data=extracted,
             plan=plan,
-        )
-        followups = self._generate_contextual_followups(
-            classification_query, query_type, extracted, depth_mode
+            docs=docs,
+            followups=followups,
         )
 
         response = {
@@ -983,6 +1232,7 @@ class RAGAgent(BaseAgent):
 
         return "\n\n".join(formatted_sections)
 
+
     def _build_html_answer(
         self,
         *,
@@ -990,39 +1240,79 @@ class RAGAgent(BaseAgent):
         raw_answer: Optional[str],
         extracted_data: Optional[Dict[str, Any]] = None,
         plan: Optional[Dict[str, Any]] = None,
+        docs: Optional[Sequence[Any]] = None,
+        followups: Optional[Sequence[str]] = None,
     ) -> str:
-        """Render the final answer as semantic HTML."""
+        """Render the final answer using JSON atoms and a controlled HTML composer."""
 
         extracted = extracted_data or {}
         plan = plan or {}
-        raw_answer = (raw_answer or "").strip()
-        stripped_answer = self._strip_markdown(raw_answer)
-
-        focus = self._derive_focus_from_query(query)
-        focus_text = focus if focus and focus != "the topic" else "this topic"
-        acknowledgement = (
-            f"I reviewed your question about {focus_text} and here’s the latest."  # semi-formal tone
+        raw_answer = raw_answer or ""
+        heuristics = self._build_heuristic_atoms(
+            query=query,
+            raw_answer=raw_answer,
+            extracted_data=extracted,
+            plan=plan,
+            followups=followups,
         )
 
+        model_atoms: Dict[str, Any] = {}
+        if self._should_invoke_atom_model():
+            try:
+                model_atoms = self._request_atoms_via_llm(
+                    query=query,
+                    raw_answer=raw_answer,
+                    docs=list(docs or []),
+                    heuristics=heuristics,
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.exception("Failed to extract HTML atoms via LLM; using heuristics")
+                model_atoms = {}
+
+        merged_atoms = self._merge_atom_payloads(heuristics, model_atoms)
+        final_atoms = self._finalise_atoms(merged_atoms)
+
+        html_answer = compose_html_answer(
+            summary=final_atoms["summary"],
+            allowed=final_atoms["allowed"],
+            prohibited=final_atoms["prohibited"],
+            details=final_atoms["details"],
+            notes=final_atoms["notes"],
+            followup=final_atoms["followup"],
+        )
+        return sanitize_html(html_answer)
+
+    def _should_invoke_atom_model(self) -> bool:
+        disabled = getattr(self.agent_nick.settings, "disable_rag_atoms_llm", False)
+        return not bool(disabled)
+
+    def _build_heuristic_atoms(
+        self,
+        *,
+        query: str,
+        raw_answer: str,
+        extracted_data: Dict[str, Any],
+        plan: Dict[str, Any],
+        followups: Optional[Sequence[str]],
+    ) -> Dict[str, Any]:
+        stripped_answer = self._strip_markdown(raw_answer)
         candidate_sentences = self._split_sentences(stripped_answer) if stripped_answer else []
         main_points: List[str] = [
             point
-            for point in extracted.get("main_points", [])
+            for point in extracted_data.get("main_points", [])
             if isinstance(point, str) and point.strip()
         ]
         if not main_points and candidate_sentences:
-            main_points = candidate_sentences[:5]
+            main_points = candidate_sentences[:_MAX_ATOM_LIST_ITEMS]
         if not main_points and stripped_answer:
             main_points = [stripped_answer]
 
         summary_text = (
             candidate_sentences[0]
             if candidate_sentences
-            else (main_points[0] if main_points else "I could not find documented guidance yet.")
+            else (main_points[0] if main_points else "No documented guidance yet.")
         )
 
-        can_items: List[str] = []
-        cannot_items: List[str] = []
         positive_markers = (
             " can ",
             " can.",
@@ -1031,6 +1321,7 @@ class RAGAgent(BaseAgent):
             " should ",
             " recommended",
             " may ",
+            " must ",
         )
         negative_markers = (
             " cannot",
@@ -1041,8 +1332,11 @@ class RAGAgent(BaseAgent):
             " avoid",
             " prohibited",
             " restriction",
+            " no longer",
         )
 
+        can_items: List[str] = []
+        cannot_items: List[str] = []
         for line in self._extract_candidate_lines(raw_answer):
             clean_line = self._normalise_line(line)
             if not clean_line:
@@ -1054,83 +1348,283 @@ class RAGAgent(BaseAgent):
                 cannot_items.append(clean_line)
 
         if not can_items and main_points:
-            can_items = main_points[:2]
+            can_items = main_points[: min(len(main_points), 2)]
         if not can_items:
             can_items = [
-                "No clear allowances surfaced in the records—let me know the scenario and I can dig further.",
+                "No explicit allowances surfaced in the retrieved material.",
             ]
 
         if not cannot_items and plan.get("type") == "policy_lookup":
             cannot_items = [
-                "I didn’t see explicit prohibitions yet; check the policy for any red flags before proceeding.",
+                "No prohibitions were highlighted, so double-check the policy before proceeding.",
             ]
         elif not cannot_items:
             cannot_items = [
-                "No specific restrictions were referenced in the retrieved material.",
+                "No specific restrictions were called out in the references.",
             ]
 
         table_rows: List[Tuple[str, str]] = []
-        for idx, point in enumerate(main_points[:3], start=1):
+        for idx, point in enumerate(main_points[: _MAX_ATOM_LIST_ITEMS], start=1):
             condition, description = self._split_condition_description(point, idx)
             table_rows.append((condition, description))
         if not table_rows:
-            table_rows = [("Key Insight", "No supporting details available yet.")]
+            focus = self._derive_focus_from_query(query)
+            table_rows = [("Key Insight", f"No detailed records found for {focus or 'this topic'}.")]
 
-        note_candidates = candidate_sentences[1:4] if len(candidate_sentences) > 1 else []
-        if not note_candidates:
+        notes: List[str] = []
+        note_candidates = candidate_sentences[1:4]
+        if not note_candidates and len(main_points) > 1:
             note_candidates = main_points[1:3]
-        notes_text = " ".join(note_candidates).strip()
-        if not notes_text:
-            notes_text = (
-                "If you need more specifics—limits, approvals, or documentation—I can look them up."
-            )
+        for text in note_candidates:
+            cleaned = text.strip()
+            if cleaned:
+                notes.append(cleaned)
+            if len(notes) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        if not notes:
+            notes = [
+                "Capture any approvals or documentation before you proceed.",
+            ]
 
-        def _escape_list(items: Sequence[str]) -> str:
-            return "\n".join(
-                f"      <li>{html.escape(item.strip())}</li>" for item in items if item.strip()
-            ) or "      <li>No additional guidance captured.</li>"
+        return {
+            "summary": summary_text,
+            "allowed": can_items,
+            "prohibited": cannot_items,
+            "details": table_rows,
+            "notes": notes,
+            "followup": self._format_followup_text(followups),
+        }
 
-        table_html_rows = "\n".join(
-            (
-                "      <tr>\n"
-                f"        <td style=\"padding:6px;border-bottom:1px solid #f0f0f0;\">{html.escape(condition)}</td>\n"
-                f"        <td style=\"padding:6px;border-bottom:1px solid #f0f0f0;\">{html.escape(description)}</td>\n"
-                "      </tr>"
-            )
-            for condition, description in table_rows
+    def _format_followup_text(self, followups: Optional[Sequence[str]]) -> str:
+        if followups:
+            first = None
+            for item in followups:
+                if isinstance(item, str) and item.strip():
+                    first = item.strip()
+                    break
+            if first:
+                cleaned = first.rstrip("?.!").strip()
+                if cleaned:
+                    return f"I can also cover {cleaned.lower()} if that would help next."
+        return "Happy to explore more detail whenever you need it."
+
+    def _request_atoms_via_llm(
+        self,
+        *,
+        query: str,
+        raw_answer: str,
+        docs: Sequence[Any],
+        heuristics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        context_snippets = self._collect_atom_context(raw_answer, docs)
+        payload = {
+            "question": query,
+            "context_snippets": context_snippets,
+            "heuristics": heuristics,
+        }
+        user_instruction = (
+            json.dumps(payload, ensure_ascii=False, indent=2)
+            + "\nReturn ONLY valid JSON with keys: summary, allowed, prohibited, details, notes, followup."
         )
 
-        html_parts = [
-            "<section>",
-            f"  <p>{html.escape(acknowledgement)}</p>",
-            "  <h2>Summary</h2>",
-            f"  <p>{html.escape(summary_text)}</p>",
-            "  <h3>What You Can Do</h3>",
-            "  <ul>",
-            _escape_list(can_items),
-            "  </ul>",
-            "  <h3>What You Cannot Do</h3>",
-            "  <ul>",
-            _escape_list(cannot_items),
-            "  </ul>",
-            "  <h3>Key Details</h3>",
-            "  <table style=\"border-collapse:collapse;width:100%;border:1px solid #ddd;\">",
-            "    <thead>",
-            "      <tr>",
-            "        <th style=\"text-align:left;padding:6px;border-bottom:1px solid #ddd;\">Condition</th>",
-            "        <th style=\"text-align:left;padding:6px;border-bottom:1px solid #ddd;\">Description</th>",
-            "      </tr>",
-            "    </thead>",
-            "    <tbody>",
-            table_html_rows,
-            "    </tbody>",
-            "  </table>",
-            "  <h3>Notes</h3>",
-            f"  <p>{html.escape(notes_text)}</p>",
-            "</section>",
-        ]
+        model_name = self.get_agent_model("rag_agent_html_atoms", fallback="phi4:latest")
+        response = self.call_ollama(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": ATOM_EXTRACTION_SYSTEM},
+                {"role": "user", "content": user_instruction},
+            ],
+            options={
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "num_ctx": 8192,
+                "num_predict": 1024,
+            },
+        )
+        raw_text = self._extract_llm_message(response)
+        return self._parse_atom_json(raw_text)
 
-        return "\n".join(html_parts)
+    @staticmethod
+    def _extract_llm_message(response: Dict[str, Any]) -> str:
+        if not isinstance(response, dict):
+            return ""
+        message = response.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+        content = response.get("response")
+        if isinstance(content, str):
+            return content.strip()
+        return ""
+
+    def _collect_atom_context(self, raw_answer: str, docs: Sequence[Any]) -> List[str]:
+        snippets: List[str] = []
+        stripped = self._clean_prompt_text(self._strip_markdown(raw_answer or ""))
+        if stripped:
+            snippets.append(self._truncate_context(f"Answer scope: {stripped}"))
+        for doc in docs[:8]:
+            payload = getattr(doc, "payload", {}) or {}
+            summary = payload.get("summary") or payload.get("text_summary")
+            label = payload.get("source_label") or payload.get("record_id") or "Context"
+            snippet = f"{label}: {summary}" if summary else str(label)
+            cleaned = self._clean_prompt_text(snippet)
+            if cleaned:
+                snippets.append(self._truncate_context(cleaned))
+            if len(snippets) >= 8:
+                break
+        return snippets
+
+    def _truncate_context(self, text: str, limit: int = 600) -> str:
+        cleaned = text.strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 1].rstrip() + "…"
+
+    def _clean_prompt_text(self, text: str) -> str:
+        cleaned = (text or "").replace("static_policy", "policy library")
+        cleaned = re.sub(r"document_id\s*[:=]\s*\S+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"procwise_document_embeddings", "procurement knowledge base", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _parse_atom_json(self, text: str) -> Dict[str, Any]:
+        if not text:
+            return {}
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            cleaned = re.sub(r'\\(?!["\/bfnrtu])', "", candidate)
+            try:
+                parsed = json.loads(cleaned)
+            except Exception:
+                return {}
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
+
+    def _merge_atom_payloads(
+        self,
+        fallback: Dict[str, Any],
+        model_atoms: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(fallback)
+        for key in ("summary", "followup"):
+            value = model_atoms.get(key)
+            if isinstance(value, str) and value.strip():
+                merged[key] = value.strip()
+
+        for key in ("allowed", "prohibited", "notes"):
+            value = model_atoms.get(key)
+            if isinstance(value, (list, tuple)):
+                cleaned: List[str] = []
+                for item in value:
+                    text = str(item).strip()
+                    if text:
+                        cleaned.append(text)
+                    if len(cleaned) >= _MAX_ATOM_LIST_ITEMS:
+                        break
+                if cleaned:
+                    merged[key] = cleaned
+
+        details_value = model_atoms.get("details")
+        if isinstance(details_value, (list, tuple)):
+            rows: List[Tuple[str, str]] = []
+            for entry in details_value:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    condition = str(entry[0]).strip()
+                    description = str(entry[1]).strip()
+                    if condition or description:
+                        rows.append((condition or "Key Insight", description or "Detail not provided."))
+                elif isinstance(entry, dict):
+                    condition = str(entry.get("condition") or entry.get("title") or "").strip()
+                    description = str(entry.get("description") or entry.get("value") or "").strip()
+                    if condition or description:
+                        rows.append((condition or "Key Insight", description or "Detail not provided."))
+                elif isinstance(entry, str) and entry.strip():
+                    idx = len(rows) + 1
+                    rows.append(self._split_condition_description(entry, idx))
+                if len(rows) >= _MAX_ATOM_LIST_ITEMS:
+                    break
+            if rows:
+                merged["details"] = rows
+        return merged
+
+    def _finalise_atoms(self, atoms: Dict[str, Any]) -> Dict[str, Any]:
+        summary = str(atoms.get("summary") or "").strip()
+        if not summary:
+            summary = "No documented guidance surfaced yet; consider checking with procurement operations."
+
+        def _ensure_list(name: str, default: List[str]) -> List[str]:
+            value = atoms.get(name)
+            if isinstance(value, (list, tuple)):
+                cleaned = [str(item).strip() for item in value if str(item).strip()]
+                if cleaned:
+                    return cleaned[:_MAX_ATOM_LIST_ITEMS]
+            return default
+
+        allowed = _ensure_list(
+            "allowed",
+            ["No explicit allowances were identified in the retrieved records."],
+        )
+        prohibited = _ensure_list(
+            "prohibited",
+            ["No prohibitions were captured; double-check the policy for edge cases."],
+        )
+        notes = _ensure_list(
+            "notes",
+            ["Raise a ticket if you need deeper analysis or updated approvals."],
+        )
+
+        details_value = atoms.get("details")
+        details: List[Tuple[str, str]] = []
+        if isinstance(details_value, (list, tuple)):
+            for entry in details_value:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    condition = str(entry[0]).strip() or "Key Insight"
+                    description = str(entry[1]).strip() or "Detail not provided."
+                    details.append((condition, description))
+                elif isinstance(entry, dict):
+                    condition = str(entry.get("condition") or entry.get("title") or "").strip() or "Key Insight"
+                    description = str(entry.get("description") or entry.get("value") or "").strip() or "Detail not provided."
+                    details.append((condition, description))
+                elif isinstance(entry, str) and entry.strip():
+                    idx = len(details) + 1
+                    details.append(self._split_condition_description(entry, idx))
+                if len(details) >= _MAX_ATOM_LIST_ITEMS:
+                    break
+        if not details:
+            details = [("Key Insight", "No supporting detail was retrieved.")]
+
+        followup = str(atoms.get("followup") or "").strip()
+        if not followup:
+            followup = "Let me know if you want me to gather additional procurement detail next."
+
+        def _strip_banned(text: str) -> str:
+            cleaned = text
+            for token in _BANNED_TOKENS:
+                cleaned = cleaned.replace(token, "")
+            return cleaned.strip()
+
+        summary = _strip_banned(summary)
+        allowed = [_strip_banned(item) for item in allowed]
+        prohibited = [_strip_banned(item) for item in prohibited]
+        notes = [_strip_banned(item) for item in notes]
+        details = [(_strip_banned(cond), _strip_banned(desc)) for cond, desc in details]
+        followup = _strip_banned(followup)
+
+        return {
+            "summary": summary,
+            "allowed": allowed,
+            "prohibited": prohibited,
+            "details": details,
+            "notes": notes,
+            "followup": followup,
+        }
 
     def _strip_markdown(self, text: str) -> str:
         cleaned = text.replace("**", "")
