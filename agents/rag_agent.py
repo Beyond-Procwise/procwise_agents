@@ -1427,7 +1427,7 @@ class RAGAgent(BaseAgent):
             + "\nReturn ONLY valid JSON with keys: summary, allowed, prohibited, details, notes, followup."
         )
 
-        model_name = self.get_agent_model("rag_agent_html_atoms", fallback="phi4:latest")
+        model_name = self._resolve_atom_model_name()
         response = self.call_ollama(
             model=model_name,
             messages=[
@@ -1443,6 +1443,37 @@ class RAGAgent(BaseAgent):
         )
         raw_text = self._extract_llm_message(response)
         return self._parse_atom_json(raw_text)
+
+    def _resolve_atom_model_name(self, fallback: str = "phi4:latest") -> str:
+        """Return the preferred LLM identifier for HTML atom extraction."""
+
+        # ``BaseAgent`` exposes ``get_agent_model`` in newer deployments. Older
+        # builds might not, so we defensively probe before invoking to avoid the
+        # AttributeError observed in production.
+        resolver = getattr(self, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                model_name = resolver("rag_agent_html_atoms", fallback=fallback)
+            except TypeError:
+                model_name = resolver("rag_agent_html_atoms")  # type: ignore[misc]
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+
+        # Allow the agent nickname wrapper to supply overrides when available.
+        nick_resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(nick_resolver):
+            try:
+                model_name = nick_resolver("rag_agent_html_atoms", fallback=fallback)
+            except TypeError:
+                model_name = nick_resolver("rag_agent_html_atoms")  # type: ignore[misc]
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+
+        configured = getattr(self.settings, "rag_model", None)
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+
+        return fallback
 
     @staticmethod
     def _extract_llm_message(response: Dict[str, Any]) -> str:
