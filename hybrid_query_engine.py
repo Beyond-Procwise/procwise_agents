@@ -68,6 +68,15 @@ class OllamaChatClient:
         return data.get("embedding") or data.get("data", [{}])[0].get("embedding")
 
 
+ALLOWED_SPEND_DIMENSIONS = {
+    "category": "category_id",
+    "supplier": "supplier_id",
+    "product": "product_id",
+    "department": "department_id",
+    "business_unit": "business_unit_id",
+}
+
+
 class Neo4jQueryService:
     """Wraps Neo4j access with curated queries."""
 
@@ -107,10 +116,16 @@ class Neo4jQueryService:
         return {"responses": record["responses"] if record else 0}
 
     def spend_by_dimension(self, dimension: str, value: Optional[str] = None, period: Optional[Tuple[str, str]] = None) -> List[Dict[str, Any]]:
+        dimension_key = dimension.lower().strip()
+        if dimension_key not in ALLOWED_SPEND_DIMENSIONS:
+            raise ValueError(
+                f"Unsupported spend dimension '{dimension}'. Allowed values: {', '.join(sorted(ALLOWED_SPEND_DIMENSIONS))}"
+            )
+        property_name = ALLOWED_SPEND_DIMENSIONS[dimension_key]
         filters = []
         params: Dict[str, Any] = {}
         if value:
-            filters.append(f"po.{dimension}_id = $value")
+            filters.append(f"po.{property_name} = $value")
             params["value"] = value
         if period:
             filters.append("po.issued_at >= $start AND po.issued_at <= $end")
