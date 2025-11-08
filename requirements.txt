@@ -9,6 +9,7 @@ pdfplumber
 pymupdf
 python-dateutil
 qdrant-client
+requests
 sentence-transformers
 python-docx
 python-pptx
@@ -30,4 +31,8 @@ langchain-openai
 langgraph
 httpx
 langcache
+neo4j
 nltk
+loguru
+rapidfuzz
+retrying
