@@ -107,6 +107,21 @@ class Settings(BaseSettings):
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
 
+    neo4j_uri: str = Field(default="bolt://localhost:7687", env="NEO4J_URI")
+    neo4j_username: str = Field(default="neo4j", env="NEO4J_USERNAME")
+    neo4j_password: str = Field(default="neo4j", env="NEO4J_PASSWORD")
+
+    ollama_base_url: str = Field(
+        default="http://localhost:11434", env="OLLAMA_BASE_URL"
+    )
+    ollama_generate_model: str = Field(
+        default="llama3.2", env="OLLAMA_GENERATE_MODEL"
+    )
+    ollama_embedding_model: str = Field(
+        default="all-minilm", env="OLLAMA_EMBED_MODEL"
+    )
+    ollama_timeout: int = Field(default=120, env="OLLAMA_TIMEOUT")
+
     ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
     ses_secret_role_arn: Optional[str] = Field(
