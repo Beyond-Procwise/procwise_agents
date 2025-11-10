@@ -31,91 +31,103 @@ _BANNED_TOKENS: Tuple[str, ...] = (
 ATOM_EXTRACTION_SYSTEM = """Answer in a concise, semi-formal, human tone for procurement guidance.
 Only produce HTML-friendly building blocks as JSON atoms; the runtime renderer will craft the final markup.
 OUTPUT FORMAT: HTML scaffold with <section>, <h2>, <h3>, <p>, <ul>, <li>, and <table>.
-Sections must map to Summary, What You Can Do, What You Cannot Do, Key Details, and Next Steps when they have content.
+Sections must map to Summary, Scope & Applicability, Key Rules, Prohibited / Exclusions, Effective Dates & Ownership, and Next Steps when they have content.
 Avoid internal IDs, collection names, or placeholders. End with one short helpful follow-up suggestion.
 
 Example 1
-Question: "Can I expense client dinners during negotiations?"
+Question: "Can I expense rideshare trips for late-night client meetings?"
 Context:
-- Policy library: Client entertainment tied to approved negotiations is reimbursable when logged with the deal code.
-- Spend guide: Alcohol above £50 per head is not reimbursed.
+- Travel & Expense Policy section 4.1: Late-night transport after client meetings is claimable.
+- Exceptions note: Requires manager approval if exceeding £80 per trip.
 JSON:
 {
-  "summary": "Client dinners related to active negotiations are reimbursable when you log them against the approved deal code.",
-  "allowed": [
-    "Expense dinners connected to live negotiations once the budget holder has cleared the meeting.",
-    "Claim reasonable food and non-alcoholic beverages with itemised receipts."
+  "summary": "You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.",
+  "scope": [
+    "Applies when the journey starts after a client meeting and public transport is unavailable.",
+    "Relevant to employees travelling on approved client business."
   ],
-  "prohibited": [
-    "Do not claim alcohol above £50 per person.",
-    "Skip expenses for social events that are unrelated to negotiation activity."
+  "rules": [
+    "Claim rideshare fares after client meetings when public transport is unavailable.",
+    "Submit the meeting agenda or notes with the expense to evidence the business purpose."
   ],
-  "details": [
-    ["Pre-approval", "Secure written approval from the budget owner before hosting the dinner."],
-    ["Receipt logging", "Upload the itemised bill within 48 hours using the negotiation deal code."],
-    ["Spend ceiling", "Stay within the £150 per head cap, inclusive of gratuity."]
+  "exclusions": [
+    "Do not expense rides taken for personal errands before or after the meeting.",
+    "Avoid booking premium vehicle classes unless the standard tier is unavailable."
   ],
-  "notes": [
-    "Alcohol caps reset per person and cannot be pooled.",
-    "Flag any government attendees so compliance can review the guest list."
+  "policies": [
+    ["Standard limit", "Up to £80", "Manager approval required beyond the threshold."],
+    ["Documentation", "On submission", "Include client name, meeting purpose, and time in the claim."],
+    ["Approvals", "Before claiming", "Secure sign-off if you expect higher costs."]
   ],
-  "followup": "I can pull the claim workflow steps if you need a refresher."
+  "next_steps": [
+    "If you expect higher costs, request pre-approval before the meeting.",
+    "Attach the rideshare receipt showing pickup/drop-off times."
+  ],
+  "followup": "Let me know if you want the policy excerpt or a claim checklist."
 }
 HTML:
 <section>
   <h2>Summary</h2>
-  <p>Client dinners related to active negotiations are reimbursable when you log them against the approved deal code.</p>
-  <h3>What You Can Do</h3>
-  <ul><li>Expense dinners connected to live negotiations once the budget holder has cleared the meeting.</li><li>Claim reasonable food and non-alcoholic beverages with itemised receipts.</li></ul>
-  <h3>What You Cannot Do</h3>
-  <ul><li>Do not claim alcohol above £50 per person.</li><li>Skip expenses for social events that are unrelated to negotiation activity.</li></ul>
-  <h3>Key Details</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Pre-approval</td><td>Secure written approval from the budget owner before hosting the dinner.</td></tr><tr><td>Receipt logging</td><td>Upload the itemised bill within 48 hours using the negotiation deal code.</td></tr><tr><td>Spend ceiling</td><td>Stay within the £150 per head cap, inclusive of gratuity.</td></tr></tbody></table>
+  <p>You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.</p>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies when the journey starts after a client meeting and public transport is unavailable.</li><li>Relevant to employees travelling on approved client business.</li></ul>
+  <h3>Key Rules</h3>
+  <ul><li>Claim rideshare fares after client meetings when public transport is unavailable.</li><li>Submit the meeting agenda or notes with the expense to evidence the business purpose.</li></ul>
+  <h3>Prohibited / Exclusions</h3>
+  <ul><li>Do not expense rides taken for personal errands before or after the meeting.</li><li>Avoid booking premium vehicle classes unless the standard tier is unavailable.</li></ul>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Standard limit</td><td>Up to £80</td><td>Manager approval required beyond the threshold.</td></tr><tr><td>Documentation</td><td>On submission</td><td>Include client name, meeting purpose, and time in the claim.</td></tr><tr><td>Approvals</td><td>Before claiming</td><td>Secure sign-off if you expect higher costs.</td></tr></tbody></table>
   <h3>Next Steps</h3>
-  <ul><li>Set a reminder to submit receipts within 48 hours.</li><li>Notify compliance if guests include public officials.</li></ul>
-  <p><small>I can pull the claim workflow steps if you need a refresher.</small></p>
+  <ul><li>If you expect higher costs, request pre-approval before the meeting.</li><li>Attach the rideshare receipt showing pickup/drop-off times.</li></ul>
+  <p><small>Let me know if you want the policy excerpt or a claim checklist.</small></p>
 </section>
 
 Example 2
-Question: "What are the rules for short-haul travel?"
+Question: "Are alcohol expenses reimbursable for client dinners?"
 Context:
-- Travel handbook: Economy class is the default for trips under four hours.
-- Sustainability charter: Encourage rail when under three hours door-to-door.
+- Spend policy: Alcohol allowed only with VP approval.
+- Hospitality guidelines: Limit of two drinks per attendee.
 JSON:
 {
-  "summary": "Short-haul trips default to economy flights or rail, with sustainability nudges favouring trains under three hours door-to-door.",
-  "allowed": [
-    "Book economy flights for journeys up to four hours when rail is impractical.",
-    "Choose rail as the preferred option when total travel time stays under three hours."
+  "summary": "Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.",
+  "scope": [
+    "Applies to hosted client dinners under the hospitality policy.",
+    "Requires advance VP approval before the event."
   ],
-  "prohibited": [
-    "Avoid booking business class for sub-four-hour routes unless a VP signs off.",
-    "Skip flights where a same-day rail option meets the schedule."
+  "rules": [
+    "Include alcohol on the claim only if a VP has signed off in advance.",
+    "Keep receipts itemised to show drink counts per attendee."
   ],
-  "details": [
-    ["Default cabin", "Economy only, unless medical or accessibility needs are documented."],
-    ["Sustainability check", "Use rail when it keeps the itinerary under three hours."],
-    ["Approval path", "VP approval recorded in ProcWise before upgrading seats."]
+  "exclusions": [
+    "Do not expense bar tabs without food or client presence.",
+    "Avoid claiming premium bottles unless the client specifically requests it and approval is documented."
   ],
-  "notes": [
-    "Add the sustainability checkbox when you log the booking.",
-    "Attach medical documentation securely if requesting an upgrade."
+  "policies": [
+    ["Hospitality limit", "Per event", "Two alcoholic drinks per attendee."],
+    ["Receipt standard", "On submission", "Itemised invoice showing alcohol separately."],
+    ["Approval", "Before dinner", "Retain VP pre-approval email with the claim."]
   ],
-  "followup": "Happy to summarise the approval matrix if you need it."
+  "next_steps": [
+    "Flag any cultural sensitivities before booking venues.",
+    "Use the hospitality policy template for VP approvals."
+  ],
+  "followup": "Need the VP approval template or hospitality checklist?"
 }
 HTML:
 <section>
   <h2>Summary</h2>
-  <p>Short-haul trips default to economy flights or rail, with sustainability nudges favouring trains under three hours door-to-door.</p>
-  <h3>What You Can Do</h3>
-  <ul><li>Book economy flights for journeys up to four hours when rail is impractical.</li><li>Choose rail as the preferred option when total travel time stays under three hours.</li></ul>
-  <h3>What You Cannot Do</h3>
-  <ul><li>Avoid booking business class for sub-four-hour routes unless a VP signs off.</li><li>Skip flights where a same-day rail option meets the schedule.</li></ul>
-  <h3>Key Details</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Default cabin</td><td>Economy only, unless medical or accessibility needs are documented.</td></tr><tr><td>Sustainability check</td><td>Use rail when it keeps the itinerary under three hours.</td></tr><tr><td>Approval path</td><td>VP approval recorded in ProcWise before upgrading seats.</td></tr></tbody></table>
+  <p>Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.</p>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies to hosted client dinners under the hospitality policy.</li><li>Requires advance VP approval before the event.</li></ul>
+  <h3>Key Rules</h3>
+  <ul><li>Include alcohol on the claim only if a VP has signed off in advance.</li><li>Keep receipts itemised to show drink counts per attendee.</li></ul>
+  <h3>Prohibited / Exclusions</h3>
+  <ul><li>Do not expense bar tabs without food or client presence.</li><li>Avoid claiming premium bottles unless the client specifically requests it and approval is documented.</li></ul>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Hospitality limit</td><td>Per event</td><td>Two alcoholic drinks per attendee.</td></tr><tr><td>Receipt standard</td><td>On submission</td><td>Itemised invoice showing alcohol separately.</td></tr><tr><td>Approval</td><td>Before dinner</td><td>Retain VP pre-approval email with the claim.</td></tr></tbody></table>
   <h3>Next Steps</h3>
-  <ul><li>Confirm the rail timetable before requesting flights.</li><li>Upload any approval emails alongside the booking.</li></ul>
-  <p><small>Happy to summarise the approval matrix if you need it.</small></p>
+  <ul><li>Flag any cultural sensitivities before booking venues.</li><li>Use the hospitality policy template for VP approvals.</li></ul>
+  <p><small>Need the VP approval template or hospitality checklist?</small></p>
 </section>
 
 Example 3
@@ -126,22 +138,26 @@ Context:
 JSON:
 {
   "summary": "Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.",
-  "allowed": [
+  "scope": [
+    "Applies to supplier onboarding before the first purchase order is issued.",
+    "Relevant for procurement and onboarding squads managing compliance checks."
+  ],
+  "rules": [
     "Remind the supplier to submit compliance and banking forms through the portal.",
     "Loop in the onboarding squad when legal review is pending."
   ],
-  "prohibited": [
+  "exclusions": [
     "Do not raise a purchase order until onboarding is fully approved.",
     "Avoid bypassing the AML checks even for urgent projects."
   ],
-  "details": [
-    ["Compliance pack", "Includes AML, tax forms, and sustainability attestations."],
-    ["Escalation trigger", "Start an escalation on day eleven if documents are still missing."],
-    ["Support channel", "Use the onboarding squad queue in ProcWise for rapid triage."]
+  "policies": [
+    ["Compliance pack", "Before PO", "Includes AML, tax forms, and sustainability attestations."],
+    ["Escalation trigger", "Day 11", "Start an escalation if documents remain outstanding."],
+    ["Support channel", "During delays", "Use the onboarding squad queue in ProcWise for rapid triage."]
   ],
-  "notes": [
-    "Record all chaser emails on the supplier profile.",
-    "Tag the category manager so they stay informed."
+  "next_steps": [
+    "Schedule a check-in with the supplier if documents remain outstanding.",
+    "Prepare the escalation summary for leadership if needed."
   ],
   "followup": "Let me know if you want the escalation email template next."
 }
@@ -149,27 +165,30 @@ HTML:
 <section>
   <h2>Summary</h2>
   <p>Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.</p>
-  <h3>What You Can Do</h3>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies to supplier onboarding before the first purchase order is issued.</li><li>Relevant for procurement and onboarding squads managing compliance checks.</li></ul>
+  <h3>Key Rules</h3>
   <ul><li>Remind the supplier to submit compliance and banking forms through the portal.</li><li>Loop in the onboarding squad when legal review is pending.</li></ul>
-  <h3>What You Cannot Do</h3>
+  <h3>Prohibited / Exclusions</h3>
   <ul><li>Do not raise a purchase order until onboarding is fully approved.</li><li>Avoid bypassing the AML checks even for urgent projects.</li></ul>
-  <h3>Key Details</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Condition</th><th>Description</th></tr></thead><tbody><tr><td>Compliance pack</td><td>Includes AML, tax forms, and sustainability attestations.</td></tr><tr><td>Escalation trigger</td><td>Start an escalation on day eleven if documents are still missing.</td></tr><tr><td>Support channel</td><td>Use the onboarding squad queue in ProcWise for rapid triage.</td></tr></tbody></table>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Compliance pack</td><td>Before PO</td><td>Includes AML, tax forms, and sustainability attestations.</td></tr><tr><td>Escalation trigger</td><td>Day 11</td><td>Start an escalation if documents remain outstanding.</td></tr><tr><td>Support channel</td><td>During delays</td><td>Use the onboarding squad queue in ProcWise for rapid triage.</td></tr></tbody></table>
   <h3>Next Steps</h3>
   <ul><li>Schedule a check-in with the supplier if documents remain outstanding.</li><li>Prepare the escalation summary for leadership if needed.</li></ul>
   <p><small>Let me know if you want the escalation email template next.</small></p>
 </section>
 
-Always respond with valid JSON containing exactly the keys summary, allowed, prohibited, details, notes, and followup.
+Always respond with valid JSON containing exactly the keys summary, scope, rules, exclusions, policies, next_steps, and followup.
 """
 
 
 def compose_html_answer(
     summary: str,
-    allowed: Optional[List[str]] | None = None,
-    prohibited: Optional[List[str]] | None = None,
-    details: Optional[List[Tuple[str, str]]] | None = None,
-    notes: Optional[List[str]] | None = None,
+    scope: Optional[List[str]] | None = None,
+    rules: Optional[List[str]] | None = None,
+    exclusions: Optional[List[str]] | None = None,
+    policies: Optional[List[Tuple[str, str, str]]] | None = None,
+    next_steps: Optional[List[str]] | None = None,
     followup: Optional[str] | None = None,
 ) -> str:
     def _trim(items: Optional[Sequence[Any]]) -> List[str]:
@@ -191,24 +210,46 @@ def compose_html_answer(
         escaped = "".join(f"<li>{html.escape(entry)}</li>" for entry in cleaned)
         return f"<ul>{escaped}</ul>"
 
-    def table(rows: Optional[List[Tuple[str, str]]]) -> str:
+    def table(rows: Optional[List[Tuple[str, str, str]]]) -> str:
         if not rows:
             return ""
-        trimmed: List[Tuple[str, str]] = []
-        for condition, description in rows:
-            cond_text = str(condition).strip()
-            desc_text = str(description).strip()
-            if not cond_text and not desc_text:
+        trimmed: List[Tuple[str, str, str]] = []
+        for entry in rows:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                name, effective, notes_value = entry[:3]
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                name, notes_value = entry
+                effective = "Not specified"
+            elif isinstance(entry, (list, tuple)) and len(entry) == 1:
+                name = entry[0]
+                effective = "Not specified"
+                notes_value = "No notes captured."
+            else:
+                name = getattr(entry, "name", "") or str(entry)
+                effective = getattr(entry, "effective", "")
+                notes_value = getattr(entry, "notes", "")
+            name_text = str(name).strip()
+            effective_text = str(effective).strip()
+            notes_text = str(notes_value).strip()
+            if not name_text and not effective_text and not notes_text:
                 continue
-            trimmed.append((cond_text or "Key Insight", desc_text or "Detail not provided."))
+            trimmed.append(
+                (
+                    name_text or "Reference",
+                    effective_text or "Not specified",
+                    notes_text or "No notes captured.",
+                )
+            )
             if len(trimmed) >= _MAX_ATOM_LIST_ITEMS:
                 break
         if not trimmed:
             return ""
-        head = "<thead><tr><th>Condition</th><th>Description</th></tr></thead>"
+        head = (
+            "<thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead>"
+        )
         body_rows = "".join(
-            f"<tr><td>{html.escape(cond)}</td><td>{html.escape(desc)}</td></tr>"
-            for cond, desc in trimmed
+            f"<tr><td>{html.escape(name)}</td><td>{html.escape(effective)}</td><td>{html.escape(notes_val)}</td></tr>"
+            for name, effective, notes_val in trimmed
         )
         body = f"<tbody>{body_rows}</tbody>"
         return (
@@ -217,34 +258,37 @@ def compose_html_answer(
         )
 
     summary_text = html.escape((summary or "No summary available.").strip() or "No summary available.")
-    allowed_section = bullets(allowed)
-    prohibited_section = bullets(prohibited)
-    notes_section = bullets(notes)
-    details_table = table(details)
+    scope_section = bullets(scope)
+    rules_section = bullets(rules)
+    exclusions_section = bullets(exclusions)
+    next_section = bullets(next_steps)
+    policies_table = table(policies)
     followup_text = html.escape((followup or "Happy to explore more detail when you need it.").strip())
 
     html_parts = [
         "<section>",
         "  <h2>Summary</h2>",
         f"  <p>{summary_text}</p>",
-        "  <h3>What You Can Do</h3>",
-        f"  {allowed_section}",
-        "  <h3>What You Cannot Do</h3>",
-        f"  {prohibited_section}",
+        "  <h3>Scope &amp; Applicability</h3>",
+        f"  {scope_section}",
+        "  <h3>Key Rules</h3>",
+        f"  {rules_section}",
+        "  <h3>Prohibited / Exclusions</h3>",
+        f"  {exclusions_section}",
     ]
 
-    if details_table:
+    if policies_table:
         html_parts.extend(
             [
-                "  <h3>Key Details</h3>",
-                f"  {details_table}",
+                "  <h3>Effective Dates &amp; Ownership</h3>",
+                f"  {policies_table}",
             ]
         )
 
     html_parts.extend(
         [
             "  <h3>Next Steps</h3>",
-            f"  {notes_section}",
+            f"  {next_section}",
             f"  <p><small>{followup_text}</small></p>",
             "</section>",
         ]
@@ -1274,10 +1318,11 @@ class RAGAgent(BaseAgent):
 
         html_answer = compose_html_answer(
             summary=final_atoms["summary"],
-            allowed=final_atoms["allowed"],
-            prohibited=final_atoms["prohibited"],
-            details=final_atoms["details"],
-            notes=final_atoms["notes"],
+            scope=final_atoms["scope"],
+            rules=final_atoms["rules"],
+            exclusions=final_atoms["exclusions"],
+            policies=final_atoms["policies"],
+            next_steps=final_atoms["next_steps"],
             followup=final_atoms["followup"],
         )
         return sanitize_html(html_answer)
@@ -1313,6 +1358,20 @@ class RAGAgent(BaseAgent):
             else (main_points[0] if main_points else "No documented guidance yet.")
         )
 
+        candidate_lines = self._extract_candidate_lines(raw_answer)
+        scope_markers = (
+            "applies",
+            "applicable",
+            "available to",
+            "covers",
+            "eligible",
+            "limited to",
+            "for all",
+            "for any",
+            "governs",
+            "responsible",
+            "subject to",
+        )
         positive_markers = (
             " can ",
             " can.",
@@ -1335,17 +1394,40 @@ class RAGAgent(BaseAgent):
             " no longer",
         )
 
+        scope_items: List[str] = []
         can_items: List[str] = []
         cannot_items: List[str] = []
-        for line in self._extract_candidate_lines(raw_answer):
+        for line in candidate_lines:
             clean_line = self._normalise_line(line)
             if not clean_line:
                 continue
             lowered = clean_line.lower()
+            if any(marker in lowered for marker in scope_markers) or lowered.startswith(
+                ("employees", "suppliers", "vendors", "requesters", "approvers", "teams")
+            ):
+                scope_items.append(clean_line)
             if any(marker in lowered for marker in positive_markers):
                 can_items.append(clean_line)
             if any(marker in lowered for marker in negative_markers):
                 cannot_items.append(clean_line)
+
+        if not scope_items:
+            entities = [
+                str(entity).strip()
+                for entity in extracted_data.get("entities", [])
+                if str(entity).strip()
+            ]
+            focus = self._derive_focus_from_query(query)
+            if entities:
+                audience = ", ".join(entities[:2])
+                scope_items.append(
+                    f"Most relevant to {audience} when working on {focus or 'this topic'}."
+                )
+            else:
+                scope_items.append(
+                    f"Applies to procurement activity related to {focus or 'this topic'} unless the policy states otherwise."
+                )
+        scope_items = scope_items[:_MAX_ATOM_LIST_ITEMS]
 
         if not can_items and main_points:
             can_items = main_points[: min(len(main_points), 2)]
@@ -1388,10 +1470,11 @@ class RAGAgent(BaseAgent):
 
         return {
             "summary": summary_text,
-            "allowed": can_items,
-            "prohibited": cannot_items,
-            "details": table_rows,
-            "notes": notes,
+            "scope": scope_items,
+            "rules": can_items,
+            "exclusions": cannot_items,
+            "policies": table_rows,
+            "next_steps": notes,
             "followup": self._format_followup_text(followups),
         }
 
@@ -1424,7 +1507,7 @@ class RAGAgent(BaseAgent):
         }
         user_instruction = (
             json.dumps(payload, ensure_ascii=False, indent=2)
-            + "\nReturn ONLY valid JSON with keys: summary, allowed, prohibited, details, notes, followup."
+            + "\nReturn ONLY valid JSON with keys: summary, scope, rules, exclusions, policies, next_steps, followup."
         )
 
         model_name = self._resolve_atom_model_name()
@@ -1549,40 +1632,92 @@ class RAGAgent(BaseAgent):
             if isinstance(value, str) and value.strip():
                 merged[key] = value.strip()
 
-        for key in ("allowed", "prohibited", "notes"):
+        list_mappings: Dict[str, Tuple[str, ...]] = {
+            "scope": ("scope", "applicability", "audience", "coverage"),
+            "rules": ("rules", "allowed"),
+            "exclusions": ("exclusions", "prohibited"),
+            "next_steps": ("next_steps", "notes"),
+        }
+
+        for target, candidates in list_mappings.items():
+            for candidate in candidates:
+                value = model_atoms.get(candidate)
+                if isinstance(value, (list, tuple)):
+                    cleaned: List[str] = []
+                    for item in value:
+                        text = str(item).strip()
+                        if text:
+                            cleaned.append(text)
+                        if len(cleaned) >= _MAX_ATOM_LIST_ITEMS:
+                            break
+                    if cleaned:
+                        merged[target] = cleaned
+                        break
+                elif isinstance(value, str) and value.strip():
+                    merged[target] = [value.strip()]
+                    break
+
+        policy_value = None
+        for key in ("policies", "policy_rows", "details"):
             value = model_atoms.get(key)
             if isinstance(value, (list, tuple)):
-                cleaned: List[str] = []
-                for item in value:
-                    text = str(item).strip()
-                    if text:
-                        cleaned.append(text)
-                    if len(cleaned) >= _MAX_ATOM_LIST_ITEMS:
-                        break
-                if cleaned:
-                    merged[key] = cleaned
-
-        details_value = model_atoms.get("details")
-        if isinstance(details_value, (list, tuple)):
-            rows: List[Tuple[str, str]] = []
-            for entry in details_value:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    condition = str(entry[0]).strip()
-                    description = str(entry[1]).strip()
-                    if condition or description:
-                        rows.append((condition or "Key Insight", description or "Detail not provided."))
+                policy_value = value
+                break
+        if policy_value is not None:
+            rows: List[Tuple[str, str, str]] = []
+            for idx, entry in enumerate(policy_value, start=1):
+                name: str
+                effective: str
+                note_text: str
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 3:
+                        name = str(entry[0]).strip()
+                        effective = str(entry[1]).strip()
+                        note_text = str(entry[2]).strip()
+                    elif len(entry) == 2:
+                        name = str(entry[0]).strip()
+                        effective = ""
+                        note_text = str(entry[1]).strip()
+                    elif len(entry) == 1:
+                        name = str(entry[0]).strip()
+                        effective = ""
+                        note_text = ""
+                    else:
+                        continue
                 elif isinstance(entry, dict):
-                    condition = str(entry.get("condition") or entry.get("title") or "").strip()
-                    description = str(entry.get("description") or entry.get("value") or "").strip()
-                    if condition or description:
-                        rows.append((condition or "Key Insight", description or "Detail not provided."))
+                    name = str(
+                        entry.get("name")
+                        or entry.get("policy")
+                        or entry.get("title")
+                        or entry.get("condition")
+                        or f"Item {idx}"
+                    ).strip()
+                    effective = str(
+                        entry.get("effective")
+                        or entry.get("date")
+                        or entry.get("timeline")
+                        or entry.get("window")
+                        or ""
+                    ).strip()
+                    note_text = str(
+                        entry.get("notes")
+                        or entry.get("owner")
+                        or entry.get("description")
+                        or entry.get("value")
+                        or ""
+                    ).strip()
                 elif isinstance(entry, str) and entry.strip():
-                    idx = len(rows) + 1
-                    rows.append(self._split_condition_description(entry, idx))
+                    name, description = self._split_condition_description(entry, idx)
+                    name = name.strip()
+                    note_text = description.strip()
+                    effective = ""
+                else:
+                    continue
+                rows.append((name, effective, note_text))
                 if len(rows) >= _MAX_ATOM_LIST_ITEMS:
                     break
             if rows:
-                merged["details"] = rows
+                merged["policies"] = rows
         return merged
 
     def _finalise_atoms(self, atoms: Dict[str, Any]) -> Dict[str, Any]:
@@ -1590,46 +1725,103 @@ class RAGAgent(BaseAgent):
         if not summary:
             summary = "No documented guidance surfaced yet; consider checking with procurement operations."
 
-        def _ensure_list(name: str, default: List[str]) -> List[str]:
-            value = atoms.get(name)
-            if isinstance(value, (list, tuple)):
-                cleaned = [str(item).strip() for item in value if str(item).strip()]
-                if cleaned:
-                    return cleaned[:_MAX_ATOM_LIST_ITEMS]
+        def _ensure_named_list(primary: str, default: List[str], *aliases: str) -> List[str]:
+            candidates = (primary,) + aliases
+            for name in candidates:
+                value = atoms.get(name)
+                if isinstance(value, (list, tuple)):
+                    cleaned = [str(item).strip() for item in value if str(item).strip()]
+                    if cleaned:
+                        return cleaned[:_MAX_ATOM_LIST_ITEMS]
+                elif isinstance(value, str) and value.strip():
+                    return [value.strip()]
             return default
 
-        allowed = _ensure_list(
-            "allowed",
+        scope = _ensure_named_list(
+            "scope",
+            [
+                "Applies across procurement activity unless a policy clause narrows the audience.",
+            ],
+            "applicability",
+            "audience",
+        )
+        rules = _ensure_named_list(
+            "rules",
             ["No explicit allowances were identified in the retrieved records."],
+            "allowed",
         )
-        prohibited = _ensure_list(
-            "prohibited",
+        exclusions = _ensure_named_list(
+            "exclusions",
             ["No prohibitions were captured; double-check the policy for edge cases."],
+            "prohibited",
         )
-        notes = _ensure_list(
-            "notes",
+        next_steps = _ensure_named_list(
+            "next_steps",
             ["Raise a ticket if you need deeper analysis or updated approvals."],
+            "notes",
         )
 
-        details_value = atoms.get("details")
-        details: List[Tuple[str, str]] = []
-        if isinstance(details_value, (list, tuple)):
-            for entry in details_value:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    condition = str(entry[0]).strip() or "Key Insight"
-                    description = str(entry[1]).strip() or "Detail not provided."
-                    details.append((condition, description))
+        policies_value = atoms.get("policies") or atoms.get("details")
+        policies: List[Tuple[str, str, str]] = []
+        if isinstance(policies_value, (list, tuple)):
+            for idx, entry in enumerate(policies_value, start=1):
+                name: str
+                effective: str
+                note_text: str
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 3:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = str(entry[1]).strip()
+                        note_text = str(entry[2]).strip()
+                    elif len(entry) == 2:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = ""
+                        note_text = str(entry[1]).strip()
+                    elif len(entry) == 1:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = ""
+                        note_text = ""
+                    else:
+                        continue
                 elif isinstance(entry, dict):
-                    condition = str(entry.get("condition") or entry.get("title") or "").strip() or "Key Insight"
-                    description = str(entry.get("description") or entry.get("value") or "").strip() or "Detail not provided."
-                    details.append((condition, description))
+                    name = str(
+                        entry.get("name")
+                        or entry.get("policy")
+                        or entry.get("title")
+                        or entry.get("condition")
+                        or f"Item {idx}"
+                    ).strip()
+                    effective = str(
+                        entry.get("effective")
+                        or entry.get("date")
+                        or entry.get("timeline")
+                        or entry.get("window")
+                        or ""
+                    ).strip()
+                    note_text = str(
+                        entry.get("notes")
+                        or entry.get("owner")
+                        or entry.get("description")
+                        or entry.get("value")
+                        or ""
+                    ).strip()
                 elif isinstance(entry, str) and entry.strip():
-                    idx = len(details) + 1
-                    details.append(self._split_condition_description(entry, idx))
-                if len(details) >= _MAX_ATOM_LIST_ITEMS:
+                    name, description = self._split_condition_description(entry, idx)
+                    effective = ""
+                    note_text = description.strip()
+                else:
+                    continue
+                policies.append((name, effective, note_text))
+                if len(policies) >= _MAX_ATOM_LIST_ITEMS:
                     break
-        if not details:
-            details = [("Key Insight", "No supporting detail was retrieved.")]
+        if not policies:
+            policies = [
+                (
+                    "Reference",
+                    "Not specified",
+                    "No effective date or ownership details were highlighted in the retrieved material.",
+                )
+            ]
 
         followup = str(atoms.get("followup") or "").strip()
         if not followup:
@@ -1642,18 +1834,27 @@ class RAGAgent(BaseAgent):
             return cleaned.strip()
 
         summary = _strip_banned(summary)
-        allowed = [_strip_banned(item) for item in allowed]
-        prohibited = [_strip_banned(item) for item in prohibited]
-        notes = [_strip_banned(item) for item in notes]
-        details = [(_strip_banned(cond), _strip_banned(desc)) for cond, desc in details]
+        scope = [_strip_banned(item) for item in scope]
+        rules = [_strip_banned(item) for item in rules]
+        exclusions = [_strip_banned(item) for item in exclusions]
+        next_steps = [_strip_banned(item) for item in next_steps]
+        policies = [
+            (
+                _strip_banned(name),
+                _strip_banned(effective) or "Not specified",
+                _strip_banned(note) or "No notes captured.",
+            )
+            for name, effective, note in policies
+        ]
         followup = _strip_banned(followup)
 
         return {
             "summary": summary,
-            "allowed": allowed,
-            "prohibited": prohibited,
-            "details": details,
-            "notes": notes,
+            "scope": scope,
+            "rules": rules,
+            "exclusions": exclusions,
+            "policies": policies,
+            "next_steps": next_steps,
             "followup": followup,
         }
 

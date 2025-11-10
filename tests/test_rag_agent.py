@@ -47,9 +47,10 @@ def test_rag_agent_returns_static_answer(agent):
     answer = result.data["answer"]
     assert answer.startswith("<section>")
     assert "<h2>Summary</h2>" in answer
-    assert "<h3>What You Can Do</h3>" in answer
-    assert "<h3>What You Cannot Do</h3>" in answer
-    assert "<h3>Key Details</h3>" in answer
+    assert "<h3>Scope &amp; Applicability</h3>" in answer
+    assert "<h3>Key Rules</h3>" in answer
+    assert "<h3>Prohibited / Exclusions</h3>" in answer
+    assert "<h3>Effective Dates &amp; Ownership</h3>" in answer
     assert "<h3>Next Steps</h3>" in answer
     assert result.data["structure_type"] == "financial_analysis"
     assert result.data["structured"] is True
@@ -72,7 +73,7 @@ def test_rag_agent_maintains_topic_context(agent):
     )
     assert follow_up.data["topic"] == first.data["topic"]
     assert "<h2>Summary</h2>" in follow_up.data["answer"]
-    assert "<h3>What You Can Do</h3>" in follow_up.data["answer"]
+    assert "<h3>Scope &amp; Applicability</h3>" in follow_up.data["answer"]
 
 
 def test_rag_agent_switches_topic_on_new_question(agent):
