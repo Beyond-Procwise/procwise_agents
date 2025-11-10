@@ -425,8 +425,13 @@ class ProcurementKnowledgeGraph:
             message_id: row.message_id,
             responded_at: datetime(row.responded_at)
         }
-        WITH row, r
-        MATCH (n:NegotiationSession {rfq_id: toString(row.rfq_id), supplier_id: toString(row.supplier_id)})
+        WITH row, r,
+            toString(row.rfq_id) AS rfq_id,
+            toString(row.supplier_id) AS supplier_id,
+            toInteger(coalesce(row.round_number, 0)) AS round
+        WITH row, r, rfq_id, supplier_id, round,
+            rfq_id + '|' + supplier_id + '|' + toString(round) AS key
+        MATCH (n:NegotiationSession {key: key})
         MERGE (r)-[:RESPONDS_TO]->(n)
         WITH row, r
         OPTIONAL MATCH (s:Supplier {supplier_id: toString(row.supplier_id)})
