@@ -33,6 +33,8 @@ httpx
 langcache
 neo4j
 nltk
+neo4j
+requests
 loguru
 rapidfuzz
 retrying
