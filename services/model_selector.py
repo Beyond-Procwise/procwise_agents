@@ -290,6 +290,37 @@ class RAGPipeline:
             normalised = repr(payload)
         return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
+    def _build_history_fingerprint(
+        self, history: Sequence[Dict[str, Any]]
+    ) -> Optional[str]:
+        if not history:
+            return None
+        window: Sequence[Dict[str, Any]] = history[-5:]
+        payload = {
+            "length": len(history),
+            "tail": [],
+        }
+        for item in window:
+            try:
+                query = item.get("query")
+            except AttributeError:
+                query = None
+            try:
+                answer = item.get("answer")
+            except AttributeError:
+                answer = None
+            payload["tail"].append(
+                {
+                    "query": self._stringify_for_cache(query)[:256],
+                    "answer": self._stringify_for_cache(answer)[:256],
+                }
+            )
+        try:
+            serialised = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            serialised = repr(payload)
+        return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
+
     def _build_cache_key(
         self,
         query: str,
@@ -300,6 +331,7 @@ class RAGPipeline:
         product_type: Optional[str],
         *,
         context_fingerprint: Optional[str] = None,
+        history_fingerprint: Optional[str] = None,
     ) -> str:
         payload = {
             "query": str(query or "").strip(),
@@ -309,6 +341,7 @@ class RAGPipeline:
             "doc_type": str(doc_type).strip() if doc_type is not None else "",
             "product_type": str(product_type).strip() if product_type is not None else "",
             "uploads": str(context_fingerprint or "").strip(),
+            "history": str(history_fingerprint or "").strip(),
         }
         normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
@@ -1856,6 +1889,9 @@ class RAGPipeline:
             product_type,
         )
 
+        history = self.history_manager.get_history(user_id)
+        history_fingerprint = self._build_history_fingerprint(history)
+
         candidate_keys: List[str] = []
         cleaned_session = (
             session_id.strip()
@@ -1901,6 +1937,7 @@ class RAGPipeline:
                     doc_type,
                     product_type,
                     context_fingerprint=upload_fingerprint,
+                    history_fingerprint=history_fingerprint,
                 )
             except Exception:
                 cache_key = None
@@ -1944,7 +1981,6 @@ class RAGPipeline:
             self._store_cached_response(cache_key, static_response)
             return static_response
 
-        history = self.history_manager.get_history(user_id)
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
@@ -2135,9 +2171,23 @@ class RAGPipeline:
                 "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
             fallback = self._remove_placeholders(fallback)
-            history = self.history_manager.get_history(user_id)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
+            history_fingerprint = self._build_history_fingerprint(history)
+            if cache_key:
+                try:
+                    cache_key = self._build_cache_key(
+                        query,
+                        user_id,
+                        session_id,
+                        model_name or llm_to_use,
+                        doc_type,
+                        product_type,
+                        context_fingerprint=upload_fingerprint,
+                        history_fingerprint=history_fingerprint,
+                    )
+                except Exception:
+                    pass
             follow_ups = self._build_followups(query, [])
             html_answer = self._render_html_answer(fallback)
             result_payload = {
@@ -2181,6 +2231,21 @@ class RAGPipeline:
 
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
+        history_fingerprint = self._build_history_fingerprint(history)
+        if cache_key:
+            try:
+                cache_key = self._build_cache_key(
+                    query,
+                    user_id,
+                    session_id,
+                    model_name or llm_to_use,
+                    doc_type,
+                    product_type,
+                    context_fingerprint=upload_fingerprint,
+                    history_fingerprint=history_fingerprint,
+                )
+            except Exception:
+                pass
 
         html_answer = self._render_html_answer(answer)
         result_payload = {
