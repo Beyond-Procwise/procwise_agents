@@ -281,10 +281,12 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     result = pipeline.answer_question("q", "user")
     assert "record_id" not in result["retrieved_documents"][0]
     assert result["retrieved_documents"][0]["summary"] == "s"
-    assert "[doc" not in result["answer"]
-    assert "[redacted" not in result["answer"].lower()
-    assert "s" in result["answer"]
-    assert "\n-" not in result["answer"]
+    assert result["answer"].startswith("<p>")
+    plain_answer = result["answer_plaintext"]
+    assert "[doc" not in plain_answer
+    assert "[redacted" not in plain_answer.lower()
+    assert "s" in plain_answer
+    assert "\n-" not in plain_answer
     assert len(result["follow_ups"]) == 3
 
 
@@ -341,8 +343,9 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
     result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
 
+    assert result["answer"].startswith("<p>")
     assert (
-        result["answer"]
+        result["answer_plaintext"]
         == "I'm sorry, but I couldn't find that information in the available knowledge base."
     )
     assert result["retrieved_documents"] == []
@@ -410,14 +413,16 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
         "user-123",
     )
 
-    answer = result["answer"]
+    answer_html = result["answer"]
+    answer_plain = result["answer_plaintext"]
 
-    assert answer.startswith(
-        'For your question "How does this compare with the same period last year?",'
+    assert answer_html.startswith("<p>")
+    assert answer_plain.startswith(
+        'For your question "How does this compare with the same period last year?",' 
     )
-    assert "Sure" not in answer
-    assert "14% higher" in answer
-    assert answer.splitlines()[-1] in RAGPipeline._STATIC_CLOSINGS
+    assert "Sure" not in answer_plain
+    assert "14% higher" in answer_plain
+    assert answer_plain.splitlines()[-1] in RAGPipeline._STATIC_CLOSINGS
     assert result["follow_ups"] == [
         "Show me the savings trend over the past 6 months.",
         "How much is still in the savings pipeline?",
@@ -487,8 +492,9 @@ def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
 
     result = pipeline.answer_question("thank you", "user-abc")
 
-    assert result["answer"] == ack_message
-    assert "For your question" not in result["answer"]
+    assert result["answer"].startswith("<p>")
+    assert result["answer_plaintext"] == ack_message
+    assert "For your question" not in result["answer_plaintext"]
     assert result["follow_ups"] == []
     assert history_sink.get("saved")
 

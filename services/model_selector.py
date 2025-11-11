@@ -1,10 +1,14 @@
 # ProcWise/services/model_selector.py
 
+import copy
 import hashlib
 import inspect
 import json
 import logging
 import re
+import html
+import threading
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -177,6 +181,218 @@ class RAGPipeline:
         self._nltk_processor = NLTKProcessor() if use_nltk else None
         if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
+        self._cache_ttl = float(getattr(self.settings, "ask_cache_ttl_seconds", 90.0))
+        self._cache_max_entries = int(getattr(self.settings, "ask_cache_max_entries", 32))
+        self._answer_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_lock = threading.RLock()
+
+    def _cache_enabled(self) -> bool:
+        return self._cache_ttl > 0 and self._cache_max_entries > 0
+
+    def _purge_expired_cache(self, *, now: Optional[float] = None) -> None:
+        if not self._cache_enabled():
+            return
+        threshold = now if now is not None else time.monotonic()
+        with self._cache_lock:
+            expired_keys = [
+                key for key, (deadline, _)
+                in self._answer_cache.items()
+                if deadline <= threshold
+            ]
+            for key in expired_keys:
+                self._answer_cache.pop(key, None)
+
+    def _stringify_for_cache(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)) or value is None:
+            return str(value)
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return repr(value)
+
+    def _prepare_metadata_for_cache(self, metadata: Any) -> List[str]:
+        if not metadata:
+            return []
+        if isinstance(metadata, dict):
+            entries = [
+                f"{self._stringify_for_cache(key)}={self._stringify_for_cache(value)}"
+                for key, value in metadata.items()
+            ]
+            entries.sort()
+            return entries
+        if isinstance(metadata, (list, tuple, set)):
+            normalised = [self._stringify_for_cache(item) for item in metadata]
+            normalised.sort()
+            return normalised
+        return [self._stringify_for_cache(metadata)]
+
+    def _normalise_document_ids_for_cache(self, document_ids: Any) -> List[str]:
+        results: List[str] = []
+        for value in document_ids or []:
+            text = self._stringify_for_cache(value).strip()
+            if text:
+                results.append(text)
+        results.sort()
+        return results
+
+    def _build_upload_fingerprint(
+        self,
+        *,
+        candidate_keys: Sequence[str],
+        uploaded_scope: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        payload: Dict[str, Any] = {}
+        session_entries: List[Dict[str, Any]] = []
+        for key in candidate_keys:
+            record = self._session_uploads.get(key)
+            if not record:
+                continue
+            session_entries.append(
+                {
+                    "key": self._stringify_for_cache(key),
+                    "documents": self._normalise_document_ids_for_cache(
+                        record.get("document_ids")
+                    ),
+                    "metadata": self._prepare_metadata_for_cache(
+                        record.get("metadata")
+                    ),
+                    "registered_at": self._stringify_for_cache(
+                        record.get("registered_at")
+                    ),
+                }
+            )
+        if session_entries:
+            payload["session_uploads"] = session_entries
+
+        context = uploaded_scope or {}
+        if context:
+            payload["uploaded_context"] = {
+                "session": self._stringify_for_cache(context.get("session_id")),
+                "activated_at": self._stringify_for_cache(
+                    context.get("activated_at")
+                ),
+                "documents": self._normalise_document_ids_for_cache(
+                    context.get("document_ids")
+                ),
+                "metadata": self._prepare_metadata_for_cache(
+                    context.get("metadata")
+                ),
+            }
+
+        if not payload:
+            return None
+
+        try:
+            normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            normalised = repr(payload)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _build_cache_key(
+        self,
+        query: str,
+        user_id: str,
+        session_id: Optional[str],
+        model_name: Optional[str],
+        doc_type: Optional[str],
+        product_type: Optional[str],
+        *,
+        context_fingerprint: Optional[str] = None,
+    ) -> str:
+        payload = {
+            "query": str(query or "").strip(),
+            "user": str(user_id or "").strip(),
+            "session": str(session_id).strip() if session_id is not None else "",
+            "model": str(model_name).strip() if model_name is not None else "",
+            "doc_type": str(doc_type).strip() if doc_type is not None else "",
+            "product_type": str(product_type).strip() if product_type is not None else "",
+            "uploads": str(context_fingerprint or "").strip(),
+        }
+        normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _get_cached_response(self, cache_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not cache_key or not self._cache_enabled():
+            return None
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._answer_cache.get(cache_key)
+            if not entry:
+                return None
+            deadline, value = entry
+            if deadline <= now:
+                self._answer_cache.pop(cache_key, None)
+                return None
+            return copy.deepcopy(value)
+
+    def _store_cached_response(self, cache_key: Optional[str], value: Dict[str, Any]) -> None:
+        if not cache_key or not self._cache_enabled():
+            return
+        snapshot = copy.deepcopy(value)
+        expires_at = time.monotonic() + max(self._cache_ttl, 0.0)
+        with self._cache_lock:
+            self._purge_expired_cache(now=time.monotonic())
+            if len(self._answer_cache) >= self._cache_max_entries:
+                oldest_key: Optional[str] = None
+                oldest_deadline: Optional[float] = None
+                for key, (deadline, _) in self._answer_cache.items():
+                    if oldest_deadline is None or deadline < oldest_deadline:
+                        oldest_key = key
+                        oldest_deadline = deadline
+                if oldest_key is not None:
+                    self._answer_cache.pop(oldest_key, None)
+            self._answer_cache[cache_key] = (expires_at, snapshot)
+
+    def _render_html_answer(self, answer_text: str) -> str:
+        stripped = (answer_text or "").strip()
+        if not stripped:
+            return "<p></p>"
+
+        html_parts: List[str] = []
+        list_buffer: List[str] = []
+        list_type: Optional[str] = None
+
+        def flush_list() -> None:
+            nonlocal list_buffer, list_type
+            if not list_buffer:
+                return
+            tag = "ol" if list_type == "ol" else "ul"
+            html_parts.append(f"<{tag}>")
+            for item in list_buffer:
+                html_parts.append(f"<li>{html.escape(item)}</li>")
+            html_parts.append(f"</{tag}>")
+            list_buffer = []
+            list_type = None
+
+        for raw_line in stripped.splitlines():
+            line = raw_line.strip()
+            if not line:
+                flush_list()
+                continue
+            bullet_match = re.match(r"^[-*]\s+(.*)", line)
+            number_match = re.match(r"^(\d+)[\).]\s+(.*)", line)
+            if bullet_match:
+                if list_type not in (None, "ul"):
+                    flush_list()
+                list_type = "ul"
+                list_buffer.append(bullet_match.group(1).strip())
+                continue
+            if number_match:
+                if list_type not in (None, "ol"):
+                    flush_list()
+                list_type = "ol"
+                list_buffer.append(number_match.group(2).strip())
+                continue
+            flush_list()
+            html_parts.append(f"<p>{html.escape(line)}</p>")
+
+        flush_list()
+
+        if not html_parts:
+            return f"<p>{html.escape(stripped)}</p>"
+        return "".join(html_parts)
 
     def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
@@ -441,6 +657,8 @@ class RAGPipeline:
         history.append({"query": query, "answer": formatted_answer})
         self.history_manager.save_history(user_id, history)
 
+        html_answer = self._render_html_answer(formatted_answer)
+
         retrieved = {
             "source": "static_procurement_qa",
             "topic": payload.get("topic"),
@@ -449,7 +667,8 @@ class RAGPipeline:
         }
 
         return {
-            "answer": formatted_answer,
+            "answer": html_answer,
+            "answer_plaintext": formatted_answer,
             "follow_ups": follow_ups,
             "retrieved_documents": [retrieved],
         }
@@ -1637,27 +1856,6 @@ class RAGPipeline:
             product_type,
         )
 
-        raw_nltk_features: Optional[Dict[str, Any]] = None
-        if self._nltk_processor:
-            nltk_feature_record = self._nltk_processor.preprocess(query)
-            raw_nltk_features = {
-                "keywords": nltk_feature_record.keywords,
-                "key_phrases": nltk_feature_record.key_phrases,
-                "sentiment": nltk_feature_record.sentiment,
-            }
-            logger.debug(
-                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
-                [
-                    self._redact_identifiers(item)
-                    for item in nltk_feature_record.keywords[:6]
-                ],
-                [
-                    self._redact_identifiers(item)
-                    for item in nltk_feature_record.key_phrases[:4]
-                ],
-                nltk_feature_record.sentiment,
-            )
-
         candidate_keys: List[str] = []
         cleaned_session = (
             session_id.strip()
@@ -1685,6 +1883,52 @@ class RAGPipeline:
         if session_key is None and candidate_keys:
             session_key = candidate_keys[0]
 
+        uploaded_scope = dict(self._uploaded_context or {})
+        upload_fingerprint = self._build_upload_fingerprint(
+            candidate_keys=candidate_keys,
+            uploaded_scope=uploaded_scope,
+        )
+
+        cache_key: Optional[str] = None
+        cached_response: Optional[Dict[str, Any]] = None
+        if not files:
+            try:
+                cache_key = self._build_cache_key(
+                    query,
+                    user_id,
+                    session_id,
+                    model_name or llm_to_use,
+                    doc_type,
+                    product_type,
+                    context_fingerprint=upload_fingerprint,
+                )
+            except Exception:
+                cache_key = None
+            cached_response = self._get_cached_response(cache_key)
+            if cached_response:
+                return cached_response
+
+        raw_nltk_features: Optional[Dict[str, Any]] = None
+        if self._nltk_processor:
+            nltk_feature_record = self._nltk_processor.preprocess(query)
+            raw_nltk_features = {
+                "keywords": nltk_feature_record.keywords,
+                "key_phrases": nltk_feature_record.key_phrases,
+                "sentiment": nltk_feature_record.sentiment,
+            }
+            logger.debug(
+                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.keywords[:6]
+                ],
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.key_phrases[:4]
+                ],
+                nltk_feature_record.sentiment,
+            )
+
         static_session_token = (
             session_key
             or cleaned_session
@@ -1697,11 +1941,10 @@ class RAGPipeline:
             session_id=static_session_token,
         )
         if static_response:
+            self._store_cached_response(cache_key, static_response)
             return static_response
 
         history = self.history_manager.get_history(user_id)
-
-        uploaded_scope = dict(self._uploaded_context or {})
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
@@ -1896,11 +2139,15 @@ class RAGPipeline:
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
             follow_ups = self._build_followups(query, [])
-            return {
-                "answer": fallback,
+            html_answer = self._render_html_answer(fallback)
+            result_payload = {
+                "answer": html_answer,
+                "answer_plaintext": fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
+            self._store_cached_response(cache_key, result_payload)
+            return result_payload
 
         focus_items = self._select_focus_items(knowledge_items)
         enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
@@ -1935,54 +2182,12 @@ class RAGPipeline:
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
 
-        return {
-            "answer": answer,
+        html_answer = self._render_html_answer(answer)
+        result_payload = {
+            "answer": html_answer,
+            "answer_plaintext": answer,
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }
-
-    def rag_answer(self, query: str, user_id: Optional[str] = None, session_id: Optional[str] = None, *, ensure_min_docs: int = 3) -> Dict[str, Any]:
-        """High-precision RAG answer entrypoint that uses qwen3-30b-procwise via Ollama.
-
-        Workflow:
-        - Attempt static QA (fast path). If a high-confidence static answer exists return it.
-        - Otherwise invoke the RAGQwen30b pipeline which implements retrieval, rerank, dedupe,
-          per-doc capping, extractive compression and context packing before generation.
-
-        Returns the dictionary produced by the underlying pipeline (keys: answer, sources, diagnostics, used_context_chunks).
-        """
-        # Try static QA first (policy lookup)
-        try:
-            static = self._try_static_answer(query, user_id or "", session_id=session_id)
-            if static is not None:
-                # Ensure returned dict has expected shape
-                return {
-                    "answer": static.get("answer"),
-                    "sources": static.get("sources", []),
-                    "diagnostics": {"static": True},
-                    "used_context_chunks": static.get("used_context_chunks", []),
-                }
-        except Exception:
-            logger.exception("Static QA attempt failed; falling through to RAG")
-
-        # Invoke the qwen3-30b-procwise RAG pipeline
-        try:
-            from services.rag_qwen30b import RAGQwen30b, REFUSAL_SENTENCE  # imported lazily to avoid import cycles during tests
-
-            rag = RAGQwen30b(self.agent_nick)
-            result = rag.answer(query, ensure_min_docs=ensure_min_docs)
-            # Normalize result: ensure keys exist
-            result.setdefault("answer", REFUSAL_SENTENCE + "\n\nSources: ")
-            result.setdefault("sources", [])
-            result.setdefault("diagnostics", {})
-            result.setdefault("used_context_chunks", [])
-            return result
-        except Exception:
-            logger.exception("RAG qwen30b pipeline failed")
-            # predictable refusal
-            return {
-                "answer": "I don't have enough information in the provided documents.\n\nSources: ",
-                "sources": [],
-                "diagnostics": {"error": "rag_pipeline_failure"},
-                "used_context_chunks": [],
-            }
+        self._store_cached_response(cache_key, result_payload)
+        return result_payload
