@@ -23,6 +23,7 @@ from config.settings import settings
 from qdrant_client import models
 from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
+from services.redis_client import get_redis_client
 from .rag_service import RAGService
 from .nltk_pipeline import NLTKProcessor
 from utils.gpu import configure_gpu, load_cross_encoder
@@ -41,37 +42,198 @@ configure_gpu()
 
 
 class ChatHistoryManager:
-    """Manages chat history using an AWS S3 bucket."""
+    """Manages chat history in S3 with a Redis-backed ephemeral cache."""
 
-    def __init__(self, s3_client, bucket_name):
+    _CACHE_KEY_PREFIX = "chat_history_cache:data:"
+    _CACHE_INDEX_KEY = "chat_history_cache:index"
+
+    def __init__(
+        self,
+        s3_client,
+        bucket_name,
+        *,
+        cache_ttl: float = 0.0,
+        max_cache_entries: int = 0,
+        redis_client=None,
+    ):
         self.s3_client = s3_client
         self.bucket_name = bucket_name
         self.prefix = 'chat_history/'
+        self._cache_ttl = max(0.0, float(cache_ttl))
+        self._max_cache_entries = max(0, int(max_cache_entries))
+        self._cache_lock = threading.RLock()
+        self._redis = redis_client or get_redis_client()
+        self._cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+
+    def _cache_enabled(self) -> bool:
+        return self._cache_ttl > 0 and self._max_cache_entries > 0
+
+    def _use_redis(self) -> bool:
+        return self._redis is not None and self._cache_enabled()
+
+    def _redis_cache_key(self, key: str) -> str:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return f"{self._CACHE_KEY_PREFIX}{digest}"
+
+    def _evict_cache_entry(self, key: str) -> None:
+        if not key or not self._cache_enabled():
+            return
+        if self._use_redis():
+            redis_key = self._redis_cache_key(key)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.delete(redis_key)
+                pipe.zrem(self._CACHE_INDEX_KEY, redis_key)
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to evict chat history cache entry from Redis")
+        else:
+            with self._cache_lock:
+                self._cache.pop(key, None)
+
+    def _evict_redis_excess(self) -> None:
+        if not self._use_redis():
+            return
+        try:
+            current_size = self._redis.zcard(self._CACHE_INDEX_KEY) or 0
+            if current_size <= self._max_cache_entries:
+                return
+            excess = int(current_size - self._max_cache_entries)
+            if excess <= 0:
+                return
+            stale_keys = self._redis.zrange(self._CACHE_INDEX_KEY, 0, excess - 1) or []
+            if not stale_keys:
+                return
+            pipe = self._redis.pipeline()
+            pipe.delete(*stale_keys)
+            pipe.zrem(self._CACHE_INDEX_KEY, *stale_keys)
+            pipe.execute()
+        except Exception:
+            logger.exception("Failed to evict excess chat history cache entries from Redis")
+
+    def _get_cached(self, key: str) -> Optional[List[Dict[str, Any]]]:
+        if not self._cache_enabled() or not key:
+            return None
+        if self._use_redis():
+            redis_key = self._redis_cache_key(key)
+            try:
+                raw = self._redis.get(redis_key)
+            except Exception:
+                logger.exception("Failed to read chat history cache from Redis")
+                return None
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                try:
+                    raw = raw.decode("utf-8")
+                except Exception:
+                    self._evict_cache_entry(key)
+                    return None
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                self._evict_cache_entry(key)
+                return None
+            if not isinstance(payload, list):
+                return []
+            ttl_seconds = max(int(self._cache_ttl), 1)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.expire(redis_key, ttl_seconds)
+                pipe.zadd(self._CACHE_INDEX_KEY, {redis_key: time.time()})
+                pipe.expire(self._CACHE_INDEX_KEY, max(ttl_seconds * 2, ttl_seconds + 60))
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to refresh chat history cache TTL in Redis")
+            return copy.deepcopy(payload)
+
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if not cached:
+                return None
+            deadline, payload = cached
+            if deadline <= now:
+                self._cache.pop(key, None)
+                return None
+            return copy.deepcopy(payload)
+
+    def _store_cache(self, key: str, value: List[Dict[str, Any]]) -> None:
+        if not self._cache_enabled() or not key:
+            return
+        if self._use_redis():
+            try:
+                payload = json.dumps(value)
+            except Exception:
+                logger.exception("Failed to serialise chat history for Redis cache")
+                return
+            redis_key = self._redis_cache_key(key)
+            ttl_seconds = max(int(self._cache_ttl), 1)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.set(redis_key, payload, ex=ttl_seconds)
+                pipe.zadd(self._CACHE_INDEX_KEY, {redis_key: time.time()})
+                pipe.expire(self._CACHE_INDEX_KEY, max(ttl_seconds * 2, ttl_seconds + 60))
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to write chat history cache entry to Redis")
+                return
+            self._evict_redis_excess()
+            return
+
+        deadline = time.monotonic() + self._cache_ttl
+        snapshot = copy.deepcopy(value)
+        with self._cache_lock:
+            self._cache[key] = (deadline, snapshot)
+            if len(self._cache) > self._max_cache_entries:
+                # Drop the stalest entry to keep the cache bounded.
+                oldest_key = min(self._cache.items(), key=lambda item: item[1][0])[0]
+                if oldest_key != key:
+                    self._cache.pop(oldest_key, None)
 
     def get_history(self, user_id: str) -> List[Dict[str, Any]]:
         key = f"{self.prefix}{user_id}.json"
+        cached = self._get_cached(key)
+        if cached is not None:
+            return cached
+
         try:
             obj = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
-            history: List[Dict[str, Any]] = json.loads(obj['Body'].read().decode('utf-8'))
-            # Ensure answers are JSON-serialisable. Non-string primitives are cast to strings
-            # while structured data (dicts/lists) is preserved for downstream consumers.
-            for item in history:
-                ans = item.get("answer")
-                if ans is not None and not isinstance(ans, (str, list, dict)):
-                    item["answer"] = str(ans)
-            return history
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
+                history: List[Dict[str, Any]] = []
+                self._store_cache(key, history)
                 return []
             logger.error(f"S3 get_object error for key {key}: {e}")
             raise
 
+        history = json.loads(obj['Body'].read().decode('utf-8'))
+        if not isinstance(history, list):
+            history = []
+        # Ensure answers are JSON-serialisable. Non-string primitives are cast to strings
+        # while structured data (dicts/lists) is preserved for downstream consumers.
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            ans = item.get("answer")
+            if ans is not None and not isinstance(ans, (str, list, dict)):
+                item["answer"] = str(ans)
+
+        self._store_cache(key, history)
+        return history
+
     def save_history(self, user_id: str, history: List):
         key = f"{self.prefix}{user_id}.json"
         try:
-            self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=json.dumps(history, indent=2))
+            payload = json.dumps(history, indent=2)
+            self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=payload)
         except Exception as e:
             logger.error(f"S3 put_object error for key {key}: {e}")
+        else:
+            if history:
+                self._store_cache(key, list(history))
+            else:
+                self._evict_cache_entry(key)
 
 
 class RAGPipeline:
@@ -147,7 +309,14 @@ class RAGPipeline:
     ):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
-        self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
+        history_cache_ttl = getattr(self.settings, "chat_history_cache_ttl", 15.0)
+        history_cache_size = getattr(self.settings, "chat_history_cache_max_entries", 256)
+        self.history_manager = ChatHistoryManager(
+            agent_nick.s3_client,
+            agent_nick.settings.s3_bucket_name,
+            cache_ttl=float(history_cache_ttl),
+            max_cache_entries=int(history_cache_size),
+        )
         default_rag_model = getattr(self.settings, "rag_model", None)
         fallback_default = default_rag_model or getattr(
             self.settings, "extraction_model", settings.extraction_model

@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     redis_response_ttl_seconds: int = Field(
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
+    chat_history_cache_ttl: float = Field(
+        default=15.0, env="CHAT_HISTORY_CACHE_TTL"
+    )
+    chat_history_cache_max_entries: int = Field(
+        default=256, env="CHAT_HISTORY_CACHE_MAX_ENTRIES"
+    )
 
     neo4j_uri: str = Field(default="bolt://localhost:7687", env="NEO4J_URI")
     neo4j_username: str = Field(default="neo4j", env="NEO4J_USERNAME")
