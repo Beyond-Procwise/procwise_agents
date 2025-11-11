@@ -10,6 +10,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
+from html import escape
 import ollama
 import pdfplumber
 from botocore.exceptions import ClientError
@@ -434,8 +435,9 @@ class RAGPipeline:
             if isinstance(item, str) and item.strip()
         ][:3]
 
+        html_answer = self._normalise_answer_html(formatted_answer)
         history = self.history_manager.get_history(user_id)
-        history.append({"query": query, "answer": formatted_answer})
+        history.append({"query": query, "answer": html_answer})
         self.history_manager.save_history(user_id, history)
 
         retrieved = {
@@ -446,7 +448,7 @@ class RAGPipeline:
         }
 
         return {
-            "answer": formatted_answer,
+            "answer": html_answer,
             "follow_ups": follow_ups,
             "retrieved_documents": [retrieved],
         }
@@ -1381,6 +1383,58 @@ class RAGPipeline:
                 deduped.append(cleaned)
         return deduped[:3]
 
+    def _plain_text_to_html(self, text: str) -> str:
+        if not text:
+            return "<p>No answer available.</p>"
+
+        normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+        html_parts: List[str] = []
+        current_list: List[str] = []
+
+        def flush_list() -> None:
+            nonlocal current_list
+            if current_list:
+                html_parts.append("<ul>" + "".join(f"<li>{item}</li>" for item in current_list) + "</ul>")
+                current_list = []
+
+        bullet_pattern = re.compile(r"^(?:[-*\u2022]|\d+[\.)])\s+")
+
+        for raw_line in normalised.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                flush_list()
+                continue
+            if bullet_pattern.match(line):
+                content = bullet_pattern.sub("", line).strip()
+                current_list.append(escape(content))
+                continue
+            flush_list()
+            html_parts.append(f"<p>{escape(line)}</p>")
+
+        flush_list()
+
+        return "".join(html_parts) or "<p>No answer available.</p>"
+
+    def _normalise_answer_html(self, answer: Any) -> str:
+        if isinstance(answer, (list, dict)):
+            try:
+                serialised = json.dumps(answer, ensure_ascii=False)
+            except TypeError:
+                serialised = str(answer)
+            return self._normalise_answer_html(serialised)
+
+        text = "" if answer is None else str(answer)
+        stripped = text.strip()
+        if not stripped:
+            body = "<p>No answer available.</p>"
+        else:
+            if stripped.startswith("<section") and stripped.endswith("</section>"):
+                return stripped
+            cleaned = re.sub(r"<[^>]+>", "", stripped)
+            body = self._plain_text_to_html(cleaned)
+
+        return f"<section><h2>Response</h2>{body}</section>"
+
     def _build_structured_answer(
         self,
         query: str,
@@ -1820,12 +1874,13 @@ class RAGPipeline:
                 "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
             fallback = self._remove_placeholders(fallback)
+            html_fallback = self._normalise_answer_html(fallback)
             history = self.history_manager.get_history(user_id)
-            history.append({"query": self._redact_identifiers(query), "answer": fallback})
+            history.append({"query": self._redact_identifiers(query), "answer": html_fallback})
             self.history_manager.save_history(user_id, history)
             follow_ups = self._build_followups(query, [])
             return {
-                "answer": fallback,
+                "answer": html_fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
@@ -1860,11 +1915,12 @@ class RAGPipeline:
             base_followups, llm_payload.get("follow_ups")
         )
 
-        history.append({"query": self._redact_identifiers(query), "answer": answer})
+        html_answer = self._normalise_answer_html(answer)
+        history.append({"query": self._redact_identifiers(query), "answer": html_answer})
         self.history_manager.save_history(user_id, history)
 
         return {
-            "answer": answer,
+            "answer": html_answer,
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }

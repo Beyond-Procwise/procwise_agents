@@ -233,6 +233,8 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     assert result["retrieved_documents"][0]["summary"] == "s"
     assert "[doc" not in result["answer"]
     assert "[redacted" not in result["answer"].lower()
+    assert result["answer"].startswith("<section")
+    assert "<h2>Response</h2>" in result["answer"]
     assert "s" in result["answer"]
     assert "\n-" not in result["answer"]
     assert len(result["follow_ups"]) == 3
@@ -291,9 +293,12 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
     result = pipeline.answer_question("What is our current total savings year to date?", "user-123")
 
+    answer_html = result["answer"]
+    assert answer_html.startswith("<section")
+    assert "<h2>Response</h2>" in answer_html
     assert (
-        result["answer"]
-        == "I'm sorry, but I couldn't find that information in the available knowledge base."
+        "I'm sorry, but I couldn't find that information in the available knowledge base."
+        in answer_html
     )
     assert result["retrieved_documents"] == []
 
@@ -362,12 +367,14 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
 
     answer = result["answer"]
 
-    assert answer.startswith(
+    assert answer.startswith("<section")
+    assert (
         'For your question "How does this compare with the same period last year?",'
+        in answer
     )
     assert "Sure" not in answer
     assert "14% higher" in answer
-    assert answer.splitlines()[-1] in RAGPipeline._STATIC_CLOSINGS
+    assert any(closing in answer for closing in RAGPipeline._STATIC_CLOSINGS)
     assert result["follow_ups"] == [
         "Show me the savings trend over the past 6 months.",
         "How much is still in the savings pipeline?",
@@ -437,8 +444,10 @@ def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
 
     result = pipeline.answer_question("thank you", "user-abc")
 
-    assert result["answer"] == ack_message
-    assert "For your question" not in result["answer"]
+    answer = result["answer"]
+    assert answer.startswith("<section")
+    assert ack_message in answer
+    assert "For your question" not in answer
     assert result["follow_ups"] == []
     assert history_sink.get("saved")
 
