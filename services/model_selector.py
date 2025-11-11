@@ -1,14 +1,18 @@
 # ProcWise/services/model_selector.py
 
+import copy
 import hashlib
 import inspect
 import json
 import logging
 import re
+import html
+import threading
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Set
 
 from html import escape
 import ollama
@@ -178,12 +182,224 @@ class RAGPipeline:
         self._nltk_processor = NLTKProcessor() if use_nltk else None
         if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
+        self._cache_ttl = float(getattr(self.settings, "ask_cache_ttl_seconds", 90.0))
+        self._cache_max_entries = int(getattr(self.settings, "ask_cache_max_entries", 32))
+        self._answer_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_lock = threading.RLock()
+
+    def _cache_enabled(self) -> bool:
+        return self._cache_ttl > 0 and self._cache_max_entries > 0
+
+    def _purge_expired_cache(self, *, now: Optional[float] = None) -> None:
+        if not self._cache_enabled():
+            return
+        threshold = now if now is not None else time.monotonic()
+        with self._cache_lock:
+            expired_keys = [
+                key for key, (deadline, _)
+                in self._answer_cache.items()
+                if deadline <= threshold
+            ]
+            for key in expired_keys:
+                self._answer_cache.pop(key, None)
+
+    def _stringify_for_cache(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)) or value is None:
+            return str(value)
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return repr(value)
+
+    def _prepare_metadata_for_cache(self, metadata: Any) -> List[str]:
+        if not metadata:
+            return []
+        if isinstance(metadata, dict):
+            entries = [
+                f"{self._stringify_for_cache(key)}={self._stringify_for_cache(value)}"
+                for key, value in metadata.items()
+            ]
+            entries.sort()
+            return entries
+        if isinstance(metadata, (list, tuple, set)):
+            normalised = [self._stringify_for_cache(item) for item in metadata]
+            normalised.sort()
+            return normalised
+        return [self._stringify_for_cache(metadata)]
+
+    def _normalise_document_ids_for_cache(self, document_ids: Any) -> List[str]:
+        results: List[str] = []
+        for value in document_ids or []:
+            text = self._stringify_for_cache(value).strip()
+            if text:
+                results.append(text)
+        results.sort()
+        return results
+
+    def _build_upload_fingerprint(
+        self,
+        *,
+        candidate_keys: Sequence[str],
+        uploaded_scope: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        payload: Dict[str, Any] = {}
+        session_entries: List[Dict[str, Any]] = []
+        for key in candidate_keys:
+            record = self._session_uploads.get(key)
+            if not record:
+                continue
+            session_entries.append(
+                {
+                    "key": self._stringify_for_cache(key),
+                    "documents": self._normalise_document_ids_for_cache(
+                        record.get("document_ids")
+                    ),
+                    "metadata": self._prepare_metadata_for_cache(
+                        record.get("metadata")
+                    ),
+                    "registered_at": self._stringify_for_cache(
+                        record.get("registered_at")
+                    ),
+                }
+            )
+        if session_entries:
+            payload["session_uploads"] = session_entries
+
+        context = uploaded_scope or {}
+        if context:
+            payload["uploaded_context"] = {
+                "session": self._stringify_for_cache(context.get("session_id")),
+                "activated_at": self._stringify_for_cache(
+                    context.get("activated_at")
+                ),
+                "documents": self._normalise_document_ids_for_cache(
+                    context.get("document_ids")
+                ),
+                "metadata": self._prepare_metadata_for_cache(
+                    context.get("metadata")
+                ),
+            }
+
+        if not payload:
+            return None
+
+        try:
+            normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            normalised = repr(payload)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _build_cache_key(
+        self,
+        query: str,
+        user_id: str,
+        session_id: Optional[str],
+        model_name: Optional[str],
+        doc_type: Optional[str],
+        product_type: Optional[str],
+        *,
+        context_fingerprint: Optional[str] = None,
+    ) -> str:
+        payload = {
+            "query": str(query or "").strip(),
+            "user": str(user_id or "").strip(),
+            "session": str(session_id).strip() if session_id is not None else "",
+            "model": str(model_name).strip() if model_name is not None else "",
+            "doc_type": str(doc_type).strip() if doc_type is not None else "",
+            "product_type": str(product_type).strip() if product_type is not None else "",
+            "uploads": str(context_fingerprint or "").strip(),
+        }
+        normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _get_cached_response(self, cache_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not cache_key or not self._cache_enabled():
+            return None
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._answer_cache.get(cache_key)
+            if not entry:
+                return None
+            deadline, value = entry
+            if deadline <= now:
+                self._answer_cache.pop(cache_key, None)
+                return None
+            return copy.deepcopy(value)
+
+    def _store_cached_response(self, cache_key: Optional[str], value: Dict[str, Any]) -> None:
+        if not cache_key or not self._cache_enabled():
+            return
+        snapshot = copy.deepcopy(value)
+        expires_at = time.monotonic() + max(self._cache_ttl, 0.0)
+        with self._cache_lock:
+            self._purge_expired_cache(now=time.monotonic())
+            if len(self._answer_cache) >= self._cache_max_entries:
+                oldest_key: Optional[str] = None
+                oldest_deadline: Optional[float] = None
+                for key, (deadline, _) in self._answer_cache.items():
+                    if oldest_deadline is None or deadline < oldest_deadline:
+                        oldest_key = key
+                        oldest_deadline = deadline
+                if oldest_key is not None:
+                    self._answer_cache.pop(oldest_key, None)
+            self._answer_cache[cache_key] = (expires_at, snapshot)
+
+    def _render_html_answer(self, answer_text: str) -> str:
+        stripped = (answer_text or "").strip()
+        if not stripped:
+            return "<p></p>"
+
+        html_parts: List[str] = []
+        list_buffer: List[str] = []
+        list_type: Optional[str] = None
+
+        def flush_list() -> None:
+            nonlocal list_buffer, list_type
+            if not list_buffer:
+                return
+            tag = "ol" if list_type == "ol" else "ul"
+            html_parts.append(f"<{tag}>")
+            for item in list_buffer:
+                html_parts.append(f"<li>{html.escape(item)}</li>")
+            html_parts.append(f"</{tag}>")
+            list_buffer = []
+            list_type = None
+
+        for raw_line in stripped.splitlines():
+            line = raw_line.strip()
+            if not line:
+                flush_list()
+                continue
+            bullet_match = re.match(r"^[-*]\s+(.*)", line)
+            number_match = re.match(r"^(\d+)[\).]\s+(.*)", line)
+            if bullet_match:
+                if list_type not in (None, "ul"):
+                    flush_list()
+                list_type = "ul"
+                list_buffer.append(bullet_match.group(1).strip())
+                continue
+            if number_match:
+                if list_type not in (None, "ol"):
+                    flush_list()
+                list_type = "ol"
+                list_buffer.append(number_match.group(2).strip())
+                continue
+            flush_list()
+            html_parts.append(f"<p>{html.escape(line)}</p>")
+
+        flush_list()
+
+        if not html_parts:
+            return f"<p>{html.escape(stripped)}</p>"
+        return "".join(html_parts)
 
     def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
 
         candidate = (configured_model or "").strip()
-        if candidate and "phi4" in candidate.lower():
+        if candidate and "qwen3" in candidate.lower():
             return candidate
         if candidate:
             logger.warning(
@@ -415,9 +631,12 @@ class RAGPipeline:
             )
         )
 
+        stripped_answer = answer_text.lstrip()
         structured = (
             bool(payload.get("structured"))
-            or answer_text.lstrip().startswith("##")
+            or stripped_answer.startswith("##")
+            or stripped_answer.startswith("<section")
+            or "<section" in stripped_answer
             or is_feedback_ack
         )
 
@@ -439,6 +658,8 @@ class RAGPipeline:
         history = self.history_manager.get_history(user_id)
         history.append({"query": query, "answer": html_answer})
         self.history_manager.save_history(user_id, history)
+
+        html_answer = self._render_html_answer(formatted_answer)
 
         retrieved = {
             "source": "static_procurement_qa",
@@ -826,6 +1047,32 @@ class RAGPipeline:
         index = int(digest[:8], 16) % len(options)
         return options[index]
 
+    def _conversation_context_line(
+        self, query: str, focus_items: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        redacted_query = self._redact_identifiers(query)
+        if not redacted_query:
+            return ""
+
+        focus_phrase = self._extract_focus_phrase(query)
+        if not focus_phrase and focus_items:
+            for item in focus_items:
+                candidate = (
+                    item.get("document")
+                    or item.get("source_label")
+                    or item.get("collection")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    focus_phrase = candidate
+                    break
+
+        focus_phrase = self._redact_identifiers(focus_phrase)
+        if focus_phrase:
+            descriptor = self._topic_descriptor(focus_phrase)
+            if descriptor:
+                return f"You asked about {descriptor}, so here's what I found"
+        return f"You asked: {redacted_query}. Here's what stood out"
+
     def _select_focus_items(
         self, items: List[Dict[str, Any]], limit: int = 4
     ) -> List[Dict[str, Any]]:
@@ -906,6 +1153,7 @@ class RAGPipeline:
             if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
+            cleaned_entry["_focus_score"] = float(entry.get("_ordering_score", 0.0))
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
             if key:
@@ -916,12 +1164,38 @@ class RAGPipeline:
         if len(selected) < min(limit, len(sortable)):
             for entry in sortable:
                 candidate = dict(entry)
+                candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
                 candidate.pop("_ordering_score", None)
                 if candidate in selected:
                     continue
                 selected.append(candidate)
                 if len(selected) >= limit:
                     break
+
+        primary_collection = getattr(self.rag, "primary_collection", "")
+        if primary_collection:
+            has_primary_focus = any(
+                item.get("collection") == primary_collection for item in selected
+            )
+            if not has_primary_focus:
+                primary_candidates: List[Dict[str, Any]] = []
+                for entry in sortable:
+                    if entry.get("collection") != primary_collection:
+                        continue
+                    candidate = dict(entry)
+                    candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
+                    candidate.pop("_ordering_score", None)
+                    primary_candidates.append(candidate)
+                if primary_candidates:
+                    replacement = primary_candidates[0]
+                    if len(selected) < limit:
+                        selected.append(replacement)
+                    else:
+                        lowest_idx = min(
+                            range(len(selected)),
+                            key=lambda idx: selected[idx].get("_focus_score", 0.0),
+                        )
+                        selected[lowest_idx] = replacement
 
         def _original_index(value: Dict[str, Any]) -> int:
             for idx, item in enumerate(items):
@@ -930,7 +1204,10 @@ class RAGPipeline:
             return len(items)
 
         selected.sort(key=_original_index)
-        return selected[:limit]
+        trimmed = selected[:limit]
+        for entry in trimmed:
+            entry.pop("_focus_score", None)
+        return trimmed
 
     def _format_primary_statement(self, item: Dict[str, Any]) -> str:
         snippet = self._extract_snippet(item)
@@ -1022,14 +1299,16 @@ class RAGPipeline:
 
     def _analyse_session_history(
         self, history: List[Dict[str, Any]]
-    ) -> tuple[str, List[str], bool]:
+    ) -> tuple[str, List[str], Dict[str, bool]]:
         if not history:
-            return "", [], False
+            return "", [], {"policy": False, "supplier": False}
 
         recent_entries = history[-3:]
         hint_parts: List[str] = []
         fragments: List[str] = []
-        policy_signal = False
+        signals = {"policy": False, "supplier": False}
+        policy_tokens = ("policy", "policies", "compliance", "compliant", "approval", "approvals")
+        supplier_tokens = ("supplier", "suppliers", "vendor", "vendors")
 
         for entry in reversed(recent_entries):
             question = str(entry.get("query", "")).strip()
@@ -1038,8 +1317,10 @@ class RAGPipeline:
                 if cleaned_question:
                     hint_parts.append(f"Earlier question: {cleaned_question}")
                     lowered_q = cleaned_question.lower()
-                    if any(token in lowered_q for token in ("policy", "supplier", "approval")):
-                        policy_signal = True
+                    if any(token in lowered_q for token in policy_tokens):
+                        signals["policy"] = True
+                    if any(token in lowered_q for token in supplier_tokens):
+                        signals["supplier"] = True
 
             answer = entry.get("answer")
             answer_text: str = ""
@@ -1058,18 +1339,20 @@ class RAGPipeline:
             if snippet:
                 fragments.append(snippet)
                 lowered_snippet = snippet.lower()
-                if any(token in lowered_snippet for token in ("policy", "supplier", "approval")):
-                    policy_signal = True
+                if any(token in lowered_snippet for token in policy_tokens):
+                    signals["policy"] = True
+                if any(token in lowered_snippet for token in supplier_tokens):
+                    signals["supplier"] = True
 
         session_hint = " ".join(hint_parts[:2])
-        return session_hint, fragments[:3], policy_signal
+        return session_hint, fragments[:3], signals
 
     def _is_policy_question(
         self,
         query: str,
         doc_type: Optional[str],
         session_hint: str,
-        history_policy_signal: bool,
+        history_signals: Optional[Dict[str, bool]],
     ) -> bool:
         tokens = [query or "", session_hint or ""]
         if doc_type:
@@ -1088,7 +1371,8 @@ class RAGPipeline:
         )
         if any(keyword in combined for keyword in keyword_triggers):
             return True
-        return history_policy_signal
+        history_flags = history_signals or {}
+        return bool(history_flags.get("policy"))
 
     def _supported_search_kwargs(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1466,8 +1750,14 @@ class RAGPipeline:
 
         paragraphs: List[str] = []
         opening_line = self._friendly_opening(query, acknowledgements, focus_items)
+        context_line = self._conversation_context_line(query, focus_items)
+        intro_sentences: List[str] = []
         if opening_line:
-            paragraphs.append(self._to_sentence(opening_line))
+            intro_sentences.append(self._to_sentence(opening_line))
+        if context_line:
+            intro_sentences.append(self._to_sentence(context_line))
+        if intro_sentences:
+            paragraphs.append(" ".join(intro_sentences))
 
         if (focus_items or ad_hoc_context) and summary_intro_template:
             intro_line = self._craft_summary_intro(
@@ -1627,27 +1917,6 @@ class RAGPipeline:
             product_type,
         )
 
-        raw_nltk_features: Optional[Dict[str, Any]] = None
-        if self._nltk_processor:
-            nltk_feature_record = self._nltk_processor.preprocess(query)
-            raw_nltk_features = {
-                "keywords": nltk_feature_record.keywords,
-                "key_phrases": nltk_feature_record.key_phrases,
-                "sentiment": nltk_feature_record.sentiment,
-            }
-            logger.debug(
-                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
-                [
-                    self._redact_identifiers(item)
-                    for item in nltk_feature_record.keywords[:6]
-                ],
-                [
-                    self._redact_identifiers(item)
-                    for item in nltk_feature_record.key_phrases[:4]
-                ],
-                nltk_feature_record.sentiment,
-            )
-
         candidate_keys: List[str] = []
         cleaned_session = (
             session_id.strip()
@@ -1675,6 +1944,52 @@ class RAGPipeline:
         if session_key is None and candidate_keys:
             session_key = candidate_keys[0]
 
+        uploaded_scope = dict(self._uploaded_context or {})
+        upload_fingerprint = self._build_upload_fingerprint(
+            candidate_keys=candidate_keys,
+            uploaded_scope=uploaded_scope,
+        )
+
+        cache_key: Optional[str] = None
+        cached_response: Optional[Dict[str, Any]] = None
+        if not files:
+            try:
+                cache_key = self._build_cache_key(
+                    query,
+                    user_id,
+                    session_id,
+                    model_name or llm_to_use,
+                    doc_type,
+                    product_type,
+                    context_fingerprint=upload_fingerprint,
+                )
+            except Exception:
+                cache_key = None
+            cached_response = self._get_cached_response(cache_key)
+            if cached_response:
+                return cached_response
+
+        raw_nltk_features: Optional[Dict[str, Any]] = None
+        if self._nltk_processor:
+            nltk_feature_record = self._nltk_processor.preprocess(query)
+            raw_nltk_features = {
+                "keywords": nltk_feature_record.keywords,
+                "key_phrases": nltk_feature_record.key_phrases,
+                "sentiment": nltk_feature_record.sentiment,
+            }
+            logger.debug(
+                "NLTK query profile: keywords=%s | phrases=%s | sentiment=%s",
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.keywords[:6]
+                ],
+                [
+                    self._redact_identifiers(item)
+                    for item in nltk_feature_record.key_phrases[:4]
+                ],
+                nltk_feature_record.sentiment,
+            )
+
         static_session_token = (
             session_key
             or cleaned_session
@@ -1687,11 +2002,10 @@ class RAGPipeline:
             session_id=static_session_token,
         )
         if static_response:
+            self._store_cached_response(cache_key, static_response)
             return static_response
 
         history = self.history_manager.get_history(user_id)
-
-        uploaded_scope = dict(self._uploaded_context or {})
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
@@ -1749,7 +2063,7 @@ class RAGPipeline:
             elif matched_owner and not session_key:
                 session_key = matched_owner
 
-        session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
+        session_hint, memory_fragments, history_signals = self._analyse_session_history(
             history
         )
 
@@ -1799,7 +2113,7 @@ class RAGPipeline:
         policy_mode = False
         if not restrict_to_uploaded:
             policy_mode = self._is_policy_question(
-                query, doc_type, session_hint, history_policy_signal
+                query, doc_type, session_hint, history_signals
             )
         search_kwargs = {
             "top_k": 6,
@@ -1892,6 +2206,8 @@ class RAGPipeline:
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
+            self._store_cached_response(cache_key, result_payload)
+            return result_payload
 
         focus_items = self._select_focus_items(knowledge_items)
         enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
@@ -1932,3 +2248,5 @@ class RAGPipeline:
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }
+        self._store_cached_response(cache_key, result_payload)
+        return result_payload

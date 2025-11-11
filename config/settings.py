@@ -107,6 +107,21 @@ class Settings(BaseSettings):
         default=86400, env="REDIS_RESPONSE_TTL_SECONDS"
     )
 
+    neo4j_uri: str = Field(default="bolt://localhost:7687", env="NEO4J_URI")
+    neo4j_username: str = Field(default="neo4j", env="NEO4J_USERNAME")
+    neo4j_password: str = Field(default="neo4j", env="NEO4J_PASSWORD")
+
+    ollama_base_url: str = Field(
+        default="http://localhost:11434", env="OLLAMA_BASE_URL"
+    )
+    ollama_generate_model: str = Field(
+        default="llama3.2", env="OLLAMA_GENERATE_MODEL"
+    )
+    ollama_embedding_model: str = Field(
+        default="all-minilm", env="OLLAMA_EMBED_MODEL"
+    )
+    ollama_timeout: int = Field(default=120, env="OLLAMA_TIMEOUT")
+
     ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
     ses_secret_role_arn: Optional[str] = Field(
@@ -183,7 +198,7 @@ class Settings(BaseSettings):
     document_extraction_model: str = Field(
         default="llama3.2", env="DOCUMENT_EXTRACTION_MODEL"
     )
-    rag_model: str = Field(default="phi4:latest", env="RAG_LLM_MODEL")
+    rag_model: str = Field(default="qwen3:30b", env="RAG_LLM_MODEL")
     # ``BAAI/bge-large-en-v1.5`` provides state-of-the-art dense retrieval
     # performance for procurement terminology while remaining compatible with
     # Qdrant's HNSW indexes. The model outputs 1024 dimensional vectors which
