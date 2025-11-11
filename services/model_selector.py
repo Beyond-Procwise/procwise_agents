@@ -1430,7 +1430,15 @@ class RAGPipeline:
         else:
             if stripped.startswith("<section") and stripped.endswith("</section>"):
                 return stripped
-            cleaned = re.sub(r"<[^>]+>", "", stripped)
+
+            contains_html_tags = bool(
+                re.search(r"</?\s*[A-Za-z][A-Za-z0-9:-]*[^>]*>", stripped)
+            )
+            cleaned = (
+                re.sub(r"</?\s*[A-Za-z][A-Za-z0-9:-]*[^>]*>", "", stripped)
+                if contains_html_tags
+                else stripped
+            )
             body = self._plain_text_to_html(cleaned)
 
         return f"<section><h2>Response</h2>{body}</section>"
