@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -13,8 +14,300 @@ import numpy as np
 
 from .base_agent import AgentOutput, AgentStatus, BaseAgent
 from services.feedback_service import FeedbackSentiment, FeedbackService
+from services.rag_service import RAGService
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_ATOM_LIST_ITEMS = 6
+_BANNED_TOKENS: Tuple[str, ...] = (
+    "Thanks for flagging this",
+    "[redacted]",
+    "document_id",
+    "static_policy",
+)
+
+
+ATOM_EXTRACTION_SYSTEM = """Answer in a concise, semi-formal, human tone for procurement guidance.
+Only produce HTML-friendly building blocks as JSON atoms; the runtime renderer will craft the final markup.
+OUTPUT FORMAT: HTML scaffold with <section>, <h2>, <h3>, <p>, <ul>, <li>, and <table>.
+Sections must map to Summary, Scope & Applicability, Key Rules, Prohibited / Exclusions, Effective Dates & Ownership, and Next Steps when they have content.
+Avoid internal IDs, collection names, or placeholders. End with one short helpful follow-up suggestion.
+
+Example 1
+Question: "Can I expense rideshare trips for late-night client meetings?"
+Context:
+- Travel & Expense Policy section 4.1: Late-night transport after client meetings is claimable.
+- Exceptions note: Requires manager approval if exceeding £80 per trip.
+JSON:
+{
+  "summary": "You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.",
+  "scope": [
+    "Applies when the journey starts after a client meeting and public transport is unavailable.",
+    "Relevant to employees travelling on approved client business."
+  ],
+  "rules": [
+    "Claim rideshare fares after client meetings when public transport is unavailable.",
+    "Submit the meeting agenda or notes with the expense to evidence the business purpose."
+  ],
+  "exclusions": [
+    "Do not expense rides taken for personal errands before or after the meeting.",
+    "Avoid booking premium vehicle classes unless the standard tier is unavailable."
+  ],
+  "policies": [
+    ["Standard limit", "Up to £80", "Manager approval required beyond the threshold."],
+    ["Documentation", "On submission", "Include client name, meeting purpose, and time in the claim."],
+    ["Approvals", "Before claiming", "Secure sign-off if you expect higher costs."]
+  ],
+  "next_steps": [
+    "If you expect higher costs, request pre-approval before the meeting.",
+    "Attach the rideshare receipt showing pickup/drop-off times."
+  ],
+  "followup": "Let me know if you want the policy excerpt or a claim checklist."
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.</p>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies when the journey starts after a client meeting and public transport is unavailable.</li><li>Relevant to employees travelling on approved client business.</li></ul>
+  <h3>Key Rules</h3>
+  <ul><li>Claim rideshare fares after client meetings when public transport is unavailable.</li><li>Submit the meeting agenda or notes with the expense to evidence the business purpose.</li></ul>
+  <h3>Prohibited / Exclusions</h3>
+  <ul><li>Do not expense rides taken for personal errands before or after the meeting.</li><li>Avoid booking premium vehicle classes unless the standard tier is unavailable.</li></ul>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Standard limit</td><td>Up to £80</td><td>Manager approval required beyond the threshold.</td></tr><tr><td>Documentation</td><td>On submission</td><td>Include client name, meeting purpose, and time in the claim.</td></tr><tr><td>Approvals</td><td>Before claiming</td><td>Secure sign-off if you expect higher costs.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>If you expect higher costs, request pre-approval before the meeting.</li><li>Attach the rideshare receipt showing pickup/drop-off times.</li></ul>
+  <p><small>Let me know if you want the policy excerpt or a claim checklist.</small></p>
+</section>
+
+Example 2
+Question: "Are alcohol expenses reimbursable for client dinners?"
+Context:
+- Spend policy: Alcohol allowed only with VP approval.
+- Hospitality guidelines: Limit of two drinks per attendee.
+JSON:
+{
+  "summary": "Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.",
+  "scope": [
+    "Applies to hosted client dinners under the hospitality policy.",
+    "Requires advance VP approval before the event."
+  ],
+  "rules": [
+    "Include alcohol on the claim only if a VP has signed off in advance.",
+    "Keep receipts itemised to show drink counts per attendee."
+  ],
+  "exclusions": [
+    "Do not expense bar tabs without food or client presence.",
+    "Avoid claiming premium bottles unless the client specifically requests it and approval is documented."
+  ],
+  "policies": [
+    ["Hospitality limit", "Per event", "Two alcoholic drinks per attendee."],
+    ["Receipt standard", "On submission", "Itemised invoice showing alcohol separately."],
+    ["Approval", "Before dinner", "Retain VP pre-approval email with the claim."]
+  ],
+  "next_steps": [
+    "Flag any cultural sensitivities before booking venues.",
+    "Use the hospitality policy template for VP approvals."
+  ],
+  "followup": "Need the VP approval template or hospitality checklist?"
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.</p>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies to hosted client dinners under the hospitality policy.</li><li>Requires advance VP approval before the event.</li></ul>
+  <h3>Key Rules</h3>
+  <ul><li>Include alcohol on the claim only if a VP has signed off in advance.</li><li>Keep receipts itemised to show drink counts per attendee.</li></ul>
+  <h3>Prohibited / Exclusions</h3>
+  <ul><li>Do not expense bar tabs without food or client presence.</li><li>Avoid claiming premium bottles unless the client specifically requests it and approval is documented.</li></ul>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Hospitality limit</td><td>Per event</td><td>Two alcoholic drinks per attendee.</td></tr><tr><td>Receipt standard</td><td>On submission</td><td>Itemised invoice showing alcohol separately.</td></tr><tr><td>Approval</td><td>Before dinner</td><td>Retain VP pre-approval email with the claim.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>Flag any cultural sensitivities before booking venues.</li><li>Use the hospitality policy template for VP approvals.</li></ul>
+  <p><small>Need the VP approval template or hospitality checklist?</small></p>
+</section>
+
+Example 3
+Question: "How should I handle supplier onboarding delays?"
+Context:
+- Onboarding runbook: Suppliers must complete compliance docs before first PO.
+- Support note: Escalate if onboarding exceeds ten business days.
+JSON:
+{
+  "summary": "Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.",
+  "scope": [
+    "Applies to supplier onboarding before the first purchase order is issued.",
+    "Relevant for procurement and onboarding squads managing compliance checks."
+  ],
+  "rules": [
+    "Remind the supplier to submit compliance and banking forms through the portal.",
+    "Loop in the onboarding squad when legal review is pending."
+  ],
+  "exclusions": [
+    "Do not raise a purchase order until onboarding is fully approved.",
+    "Avoid bypassing the AML checks even for urgent projects."
+  ],
+  "policies": [
+    ["Compliance pack", "Before PO", "Includes AML, tax forms, and sustainability attestations."],
+    ["Escalation trigger", "Day 11", "Start an escalation if documents remain outstanding."],
+    ["Support channel", "During delays", "Use the onboarding squad queue in ProcWise for rapid triage."]
+  ],
+  "next_steps": [
+    "Schedule a check-in with the supplier if documents remain outstanding.",
+    "Prepare the escalation summary for leadership if needed."
+  ],
+  "followup": "Let me know if you want the escalation email template next."
+}
+HTML:
+<section>
+  <h2>Summary</h2>
+  <p>Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.</p>
+  <h3>Scope &amp; Applicability</h3>
+  <ul><li>Applies to supplier onboarding before the first purchase order is issued.</li><li>Relevant for procurement and onboarding squads managing compliance checks.</li></ul>
+  <h3>Key Rules</h3>
+  <ul><li>Remind the supplier to submit compliance and banking forms through the portal.</li><li>Loop in the onboarding squad when legal review is pending.</li></ul>
+  <h3>Prohibited / Exclusions</h3>
+  <ul><li>Do not raise a purchase order until onboarding is fully approved.</li><li>Avoid bypassing the AML checks even for urgent projects.</li></ul>
+  <h3>Effective Dates &amp; Ownership</h3>
+  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Compliance pack</td><td>Before PO</td><td>Includes AML, tax forms, and sustainability attestations.</td></tr><tr><td>Escalation trigger</td><td>Day 11</td><td>Start an escalation if documents remain outstanding.</td></tr><tr><td>Support channel</td><td>During delays</td><td>Use the onboarding squad queue in ProcWise for rapid triage.</td></tr></tbody></table>
+  <h3>Next Steps</h3>
+  <ul><li>Schedule a check-in with the supplier if documents remain outstanding.</li><li>Prepare the escalation summary for leadership if needed.</li></ul>
+  <p><small>Let me know if you want the escalation email template next.</small></p>
+</section>
+
+Always respond with valid JSON containing exactly the keys summary, scope, rules, exclusions, policies, next_steps, and followup.
+"""
+
+
+def compose_html_answer(
+    summary: str,
+    scope: Optional[List[str]] | None = None,
+    rules: Optional[List[str]] | None = None,
+    exclusions: Optional[List[str]] | None = None,
+    policies: Optional[List[Tuple[str, str, str]]] | None = None,
+    next_steps: Optional[List[str]] | None = None,
+    followup: Optional[str] | None = None,
+) -> str:
+    def _trim(items: Optional[Sequence[Any]]) -> List[str]:
+        if not items:
+            return []
+        result: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                result.append(text)
+            if len(result) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        return result
+
+    def bullets(items: Optional[List[str]]) -> str:
+        cleaned = _trim(items)
+        if not cleaned:
+            cleaned = ["No guidance captured yet."]
+        escaped = "".join(f"<li>{html.escape(entry)}</li>" for entry in cleaned)
+        return f"<ul>{escaped}</ul>"
+
+    def table(rows: Optional[List[Tuple[str, str, str]]]) -> str:
+        if not rows:
+            return ""
+        trimmed: List[Tuple[str, str, str]] = []
+        for entry in rows:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                name, effective, notes_value = entry[:3]
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                name, notes_value = entry
+                effective = "Not specified"
+            elif isinstance(entry, (list, tuple)) and len(entry) == 1:
+                name = entry[0]
+                effective = "Not specified"
+                notes_value = "No notes captured."
+            else:
+                name = getattr(entry, "name", "") or str(entry)
+                effective = getattr(entry, "effective", "")
+                notes_value = getattr(entry, "notes", "")
+            name_text = str(name).strip()
+            effective_text = str(effective).strip()
+            notes_text = str(notes_value).strip()
+            if not name_text and not effective_text and not notes_text:
+                continue
+            trimmed.append(
+                (
+                    name_text or "Reference",
+                    effective_text or "Not specified",
+                    notes_text or "No notes captured.",
+                )
+            )
+            if len(trimmed) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        if not trimmed:
+            return ""
+        head = (
+            "<thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead>"
+        )
+        body_rows = "".join(
+            f"<tr><td>{html.escape(name)}</td><td>{html.escape(effective)}</td><td>{html.escape(notes_val)}</td></tr>"
+            for name, effective, notes_val in trimmed
+        )
+        body = f"<tbody>{body_rows}</tbody>"
+        return (
+            "<table style='border-collapse:collapse;width:100%'>"
+            f"{head}{body}</table>"
+        )
+
+    summary_text = html.escape((summary or "No summary available.").strip() or "No summary available.")
+    scope_section = bullets(scope)
+    rules_section = bullets(rules)
+    exclusions_section = bullets(exclusions)
+    next_section = bullets(next_steps)
+    policies_table = table(policies)
+    followup_text = html.escape((followup or "Happy to explore more detail when you need it.").strip())
+
+    html_parts = [
+        "<section>",
+        "  <h2>Summary</h2>",
+        f"  <p>{summary_text}</p>",
+        "  <h3>Scope &amp; Applicability</h3>",
+        f"  {scope_section}",
+        "  <h3>Key Rules</h3>",
+        f"  {rules_section}",
+        "  <h3>Prohibited / Exclusions</h3>",
+        f"  {exclusions_section}",
+    ]
+
+    if policies_table:
+        html_parts.extend(
+            [
+                "  <h3>Effective Dates &amp; Ownership</h3>",
+                f"  {policies_table}",
+            ]
+        )
+
+    html_parts.extend(
+        [
+            "  <h3>Next Steps</h3>",
+            f"  {next_section}",
+            f"  <p><small>{followup_text}</small></p>",
+            "</section>",
+        ]
+    )
+
+    return "\n".join(html_parts)
+
+
+def sanitize_html(answer: str) -> str:
+    if not isinstance(answer, str):
+        return ""
+    cleaned = re.sub(r"(?is)<\s*(script|iframe)[^>]*>.*?<\s*/\s*\1\s*>", "", answer)
+    cleaned = re.sub(r"(?i)\s+on[a-z]+\s*=\s*\"[^\"]*\"", "", cleaned)
+    cleaned = re.sub(r"(?i)\s+on[a-z]+\s*=\s*'[^']*'", "", cleaned)
+    cleaned = re.sub(r"(?i)javascript:", "", cleaned)
+    for token in _BANNED_TOKENS:
+        cleaned = cleaned.replace(token, "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 @dataclass(frozen=True)
@@ -51,7 +344,13 @@ class ResponseStructure:
             "style": "comparative",
         },
         "policy_lookup": {
-            "sections": ["policy_summary", "key_requirements", "examples", "related_policies"],
+            "sections": [
+                "summary",
+                "allowed_conditions",
+                "restricted_conditions",
+                "compliance_notes",
+                "next_steps",
+            ],
             "style": "reference",
         },
         "exploratory": {
@@ -83,6 +382,11 @@ class RAGAgent(BaseAgent):
         self._session_topics: Dict[Tuple[str, str], int] = {}
         self.feedback_service = FeedbackService(agent_nick)
         self._last_interaction: Dict[str, Any] = {}
+        try:
+            self.rag_service = RAGService(agent_nick)
+        except Exception:
+            logger.exception("Failed to initialise RAGService for RAGAgent", exc_info=True)
+            self.rag_service = None
         self._ensure_index()
 
     # ------------------------------------------------------------------
@@ -152,9 +456,17 @@ class RAGAgent(BaseAgent):
                         )
 
                     if feedback_sentiment == FeedbackSentiment.POSITIVE:
+                        html_answer = self._build_html_answer(
+                            query=classification_query,
+                            raw_answer=acknowledgment_text or "Thank you for the feedback.",
+                            extracted_data={
+                                "main_points": [acknowledgment_text or "Appreciate the update."]
+                            },
+                            plan=None,
+                        )
                         data = {
                             "question": self._last_interaction.get("query", classification_query),
-                            "answer": acknowledgment_text,
+                            "answer": html_answer,
                             "topic": self._last_interaction.get("topic", "feedback_acknowledgment"),
                             "related_prompts": [],
                             "structured": False,
@@ -205,7 +517,7 @@ class RAGAgent(BaseAgent):
 
         self._session_topics[key] = topic_index
 
-        record_id = f"static-{topic_index}-{question_index}"
+        record_id = self._build_static_source_label(topic_entry, qa_entry)
         payload = {
             "record_id": record_id,
             "topic": topic_entry.topic,
@@ -215,8 +527,30 @@ class RAGAgent(BaseAgent):
         }
         docs = [SimpleNamespace(payload=payload)]
 
-        answer_scope = self._compose_answer_scope(topic_entry, question_index, depth_mode)
-        extracted = self._extract_answer_signals(answer_scope, record_id, depth_mode)
+        (
+            dynamic_docs,
+            primary_docs,
+            policy_docs,
+            dynamic_scope,
+        ) = self._fetch_combined_context(classification_query, session_id)
+        if dynamic_docs:
+            docs.extend(dynamic_docs)
+
+        source_labels = self._collect_source_labels(docs)
+
+        if dynamic_scope:
+            answer_scope = self._merge_context_texts(
+                qa_entry.answer, dynamic_scope, depth_mode
+            )
+        else:
+            answer_scope = self._compose_answer_scope(
+                topic_entry, question_index, depth_mode
+            )
+
+        source_hint = source_labels[0] if source_labels else record_id
+        extracted = self._extract_answer_signals(answer_scope, source_hint, depth_mode)
+        if source_labels:
+            extracted["source_ids"] = source_labels[:5]
         query_type = self._classify_query_type(classification_query)
         plan = self._plan_response_structure(classification_query, query_type, extracted)
 
@@ -227,6 +561,8 @@ class RAGAgent(BaseAgent):
                 topic_entry=topic_entry,
                 focus_answer=qa_entry.answer,
                 depth_mode=depth_mode,
+                policy_docs=policy_docs,
+                primary_docs=primary_docs,
             )
 
         structured_answer = self._generate_structured_response(
@@ -237,6 +573,11 @@ class RAGAgent(BaseAgent):
             depth_mode=depth_mode,
             policy_payload=policy_payload,
         )
+        if not primary_docs and not policy_docs:
+            fallback = self._compose_no_context_message(classification_query)
+            structured_answer = (
+                f"{fallback}\n\n{structured_answer}" if structured_answer else fallback
+            )
         if ack_prefix:
             structured_answer = (
                 f"{ack_prefix}\n\n{structured_answer}" if structured_answer else ack_prefix
@@ -244,10 +585,18 @@ class RAGAgent(BaseAgent):
         followups = self._generate_contextual_followups(
             classification_query, query_type, extracted, depth_mode
         )
+        html_answer = self._build_html_answer(
+            query=classification_query,
+            raw_answer=structured_answer,
+            extracted_data=extracted,
+            plan=plan,
+            docs=docs,
+            followups=followups,
+        )
 
         response = {
             "question": qa_entry.question,
-            "answer": structured_answer,
+            "answer": html_answer,
             "topic": topic_entry.topic,
             "related_prompts": followups if followups else related_prompts,
             "structured": query_type != "simple_lookup",
@@ -270,8 +619,8 @@ class RAGAgent(BaseAgent):
 
         agentic_plan = (
             "1. Match the query to the closest procurement topic.\n"
-            "2. Retrieve the exact answer from the static knowledge base.\n"
-            "3. Shape a structured response with contextual follow-ups."
+            "2. Pull context from procurement records and policy guidance via Qdrant.\n"
+            "3. Blend the findings into a structured, human-friendly summary."
         )
 
         context_snapshot = {
@@ -279,6 +628,8 @@ class RAGAgent(BaseAgent):
             "question_similarity": float(question_score),
             "session_topic": topic_entry.topic,
             "response_depth": depth_mode,
+            "procurement_hits": len(primary_docs),
+            "policy_hits": len(policy_docs),
         }
 
         if continuation_requested:
@@ -305,8 +656,8 @@ class RAGAgent(BaseAgent):
             "user_id": user_id,
             "session_id": session_id,
             "query": classification_query,
-            "response": structured_answer,
-            "doc_ids": [record_id],
+            "response": html_answer,
+            "doc_ids": source_labels if source_labels else [record_id],
             "topic": topic_entry.topic,
             "query_type": query_type,
             "topic_index": topic_index,
@@ -389,6 +740,202 @@ class RAGAgent(BaseAgent):
             )
 
         return tuple(topics)
+
+    def _build_static_source_label(
+        self, topic_entry: TopicRecord, qa_entry: QARecord
+    ) -> str:
+        topic = (topic_entry.topic or "ProcWise reference").strip()
+        question = (qa_entry.question or "").strip()
+        if question:
+            base = f"{topic} — {question}"
+        else:
+            base = topic
+        return f"{base} (Reference Note)"
+
+    def _fetch_combined_context(
+        self, query: str, session_id: Optional[str]
+    ) -> Tuple[List[SimpleNamespace], List[SimpleNamespace], List[SimpleNamespace], str]:
+        if not self.rag_service:
+            return [], [], [], ""
+
+        try:
+            collections = []
+            primary_collection = getattr(
+                self.rag_service, "primary_collection", None
+            )
+            policy_collection = getattr(
+                self.rag_service, "static_policy_collection", None
+            )
+            if primary_collection:
+                collections.append(primary_collection)
+            if policy_collection and policy_collection != primary_collection:
+                collections.append(policy_collection)
+
+            hits = self.rag_service.search(
+                query,
+                top_k=8,
+                session_id=session_id,
+                collections=collections or None,
+            )
+        except Exception:
+            logger.exception("RAG search failed inside RAGAgent", exc_info=True)
+            return [], [], [], ""
+
+        if not hits:
+            return [], [], [], ""
+
+        primary_docs: List[SimpleNamespace] = []
+        policy_docs: List[SimpleNamespace] = []
+        combined_segments: List[str] = []
+
+        for index, hit in enumerate(hits):
+            payload = dict(getattr(hit, "payload", {}) or {})
+            nested_payload = payload.get("payload")
+            if isinstance(nested_payload, dict):
+                payload = {**nested_payload, **payload}
+                payload.pop("payload", None)
+
+            collection = payload.get("collection_name")
+            if not isinstance(collection, str) or not collection.strip():
+                collection = primary_collection or "procwise_document_embeddings"
+
+            summary = self._extract_summary_from_payload(payload)
+            title = self._extract_title_from_payload(payload)
+            raw_document_type = payload.get("document_type") or payload.get("source_type")
+            document_type = self._coerce_metadata_to_string(raw_document_type)
+            source_label = self._build_source_label_from_details(
+                title, document_type, collection
+            )
+
+            sanitized_payload = {
+                "record_id": source_label,
+                "summary": summary,
+                "document_type": document_type,
+                "collection_name": collection,
+                "source_label": source_label,
+            }
+
+            for extra_key in (
+                "highlights",
+                "policy_references",
+                "sections",
+                "key_points",
+            ):
+                value = payload.get(extra_key)
+                if value:
+                    sanitized_payload[extra_key] = value
+
+            doc = SimpleNamespace(
+                payload=sanitized_payload,
+                score=float(getattr(hit, "combined_score", getattr(hit, "score", 0.0))),
+            )
+
+            if summary:
+                if collection == policy_collection:
+                    combined_segments.append(f"Policy insight: {summary}")
+                else:
+                    combined_segments.append(f"Procurement context: {summary}")
+
+            if collection == policy_collection:
+                policy_docs.append(doc)
+            else:
+                primary_docs.append(doc)
+
+        dynamic_docs = primary_docs + policy_docs
+        combined_scope = "\n\n".join(combined_segments).strip()
+        return dynamic_docs, primary_docs, policy_docs, combined_scope
+
+    def _extract_summary_from_payload(self, payload: Dict[str, Any]) -> str:
+        for key in ("text_summary", "summary", "content", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        highlights = payload.get("highlights")
+        if isinstance(highlights, (list, tuple)):
+            for item in highlights:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+        return ""
+
+    def _extract_title_from_payload(self, payload: Dict[str, Any]) -> str:
+        for key in ("title", "document_title", "document_name", "source_name"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _coerce_metadata_to_string(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item
+            if value:
+                return str(value[0])
+            return ""
+        if isinstance(value, dict):
+            for key in ("name", "label", "type", "value"):
+                item = value.get(key)
+                if isinstance(item, str) and item.strip():
+                    return item
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _build_source_label_from_details(
+        self, title: str, document_type: Optional[str], collection: str
+    ) -> str:
+        collection_lower = (collection or "").lower()
+        if "policy" in collection_lower:
+            collection_label = "Policy Library"
+        else:
+            collection_label = "Procurement Records"
+
+        doc_label = (document_type or "").strip()
+        if doc_label:
+            doc_label = doc_label.title()
+
+        base = title or doc_label or "Context"
+        base = re.sub(r"\s+", " ", base).strip()
+        if len(base) > 80:
+            base = base[:77].rstrip() + "…"
+        return f"{base} ({collection_label})"
+
+    def _collect_source_labels(self, docs: List[SimpleNamespace]) -> List[str]:
+        labels: List[str] = []
+        for doc in docs:
+            payload = getattr(doc, "payload", {}) or {}
+            label = payload.get("source_label") or payload.get("record_id")
+            if isinstance(label, str):
+                cleaned = label.strip()
+                if cleaned and cleaned not in labels:
+                    labels.append(cleaned)
+        return labels
+
+    def _merge_context_texts(
+        self, static_answer: str, dynamic_scope: str, depth_mode: str
+    ) -> str:
+        static_clean = (static_answer or "").strip()
+        dynamic_clean = (dynamic_scope or "").strip()
+        if not dynamic_clean:
+            return static_clean
+        if not static_clean:
+            return dynamic_clean
+        if depth_mode == "expanded":
+            return f"{dynamic_clean}\n\nAdditional reference detail: {static_clean}"
+        return f"{dynamic_clean}\n\nReference note: {static_clean}"
+
+    def _compose_no_context_message(self, query: str) -> str:
+        focus = self._derive_focus_from_query(query)
+        focus_text = focus or "this request"
+        return (
+            "I checked both our procurement records and policy library but couldn't "
+            f"find anything specific about {focus_text}. To keep things moving, please "
+            "log the details in ProcWise or reach out to the procurement operations "
+            "team so we can capture the right guidance."
+        )
 
     def _encode_texts(self, texts: List[str]) -> np.ndarray:
         embedder = self.agent_nick.embedding_model
@@ -628,6 +1175,9 @@ class RAGAgent(BaseAgent):
             "key_requirements": "Key Requirements",
             "examples": "Practical Examples",
             "related_policies": "Related Policies",
+            "allowed_conditions": "Allowed Conditions",
+            "restricted_conditions": "Restricted Conditions",
+            "compliance_notes": "Compliance Notes",
             "context": "Context",
             "findings": "Findings",
             "details": "Supporting Details",
@@ -662,7 +1212,7 @@ class RAGAgent(BaseAgent):
                     "examples": [],
                     "exceptions": [],
                 }
-            return self._render_policy_response(policy_payload, depth_mode)
+            return self._render_policy_response(policy_payload, depth_mode, query)
 
         opening = self._generate_opening_section(query, extracted_data, query_type)
         closing = self._generate_closing_section(query, extracted_data, query_type)
@@ -725,6 +1275,621 @@ class RAGAgent(BaseAgent):
             return opening if query_type != "simple_lookup" else section_bodies["direct_answer"]
 
         return "\n\n".join(formatted_sections)
+
+
+    def _build_html_answer(
+        self,
+        *,
+        query: str,
+        raw_answer: Optional[str],
+        extracted_data: Optional[Dict[str, Any]] = None,
+        plan: Optional[Dict[str, Any]] = None,
+        docs: Optional[Sequence[Any]] = None,
+        followups: Optional[Sequence[str]] = None,
+    ) -> str:
+        """Render the final answer using JSON atoms and a controlled HTML composer."""
+
+        extracted = extracted_data or {}
+        plan = plan or {}
+        raw_answer = raw_answer or ""
+        heuristics = self._build_heuristic_atoms(
+            query=query,
+            raw_answer=raw_answer,
+            extracted_data=extracted,
+            plan=plan,
+            followups=followups,
+        )
+
+        model_atoms: Dict[str, Any] = {}
+        if self._should_invoke_atom_model():
+            try:
+                model_atoms = self._request_atoms_via_llm(
+                    query=query,
+                    raw_answer=raw_answer,
+                    docs=list(docs or []),
+                    heuristics=heuristics,
+                )
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.exception("Failed to extract HTML atoms via LLM; using heuristics")
+                model_atoms = {}
+
+        merged_atoms = self._merge_atom_payloads(heuristics, model_atoms)
+        final_atoms = self._finalise_atoms(merged_atoms)
+
+        html_answer = compose_html_answer(
+            summary=final_atoms["summary"],
+            scope=final_atoms["scope"],
+            rules=final_atoms["rules"],
+            exclusions=final_atoms["exclusions"],
+            policies=final_atoms["policies"],
+            next_steps=final_atoms["next_steps"],
+            followup=final_atoms["followup"],
+        )
+        return sanitize_html(html_answer)
+
+    def _should_invoke_atom_model(self) -> bool:
+        disabled = getattr(self.agent_nick.settings, "disable_rag_atoms_llm", False)
+        return not bool(disabled)
+
+    def _build_heuristic_atoms(
+        self,
+        *,
+        query: str,
+        raw_answer: str,
+        extracted_data: Dict[str, Any],
+        plan: Dict[str, Any],
+        followups: Optional[Sequence[str]],
+    ) -> Dict[str, Any]:
+        stripped_answer = self._strip_markdown(raw_answer)
+        candidate_sentences = self._split_sentences(stripped_answer) if stripped_answer else []
+        main_points: List[str] = [
+            point
+            for point in extracted_data.get("main_points", [])
+            if isinstance(point, str) and point.strip()
+        ]
+        if not main_points and candidate_sentences:
+            main_points = candidate_sentences[:_MAX_ATOM_LIST_ITEMS]
+        if not main_points and stripped_answer:
+            main_points = [stripped_answer]
+
+        summary_text = (
+            candidate_sentences[0]
+            if candidate_sentences
+            else (main_points[0] if main_points else "No documented guidance yet.")
+        )
+
+        candidate_lines = self._extract_candidate_lines(raw_answer)
+        scope_markers = (
+            "applies",
+            "applicable",
+            "available to",
+            "covers",
+            "eligible",
+            "limited to",
+            "for all",
+            "for any",
+            "governs",
+            "responsible",
+            "subject to",
+        )
+        positive_markers = (
+            " can ",
+            " can.",
+            " allowed",
+            " allow",
+            " should ",
+            " recommended",
+            " may ",
+            " must ",
+        )
+        negative_markers = (
+            " cannot",
+            " can't",
+            " not allowed",
+            " forbidden",
+            " must not",
+            " avoid",
+            " prohibited",
+            " restriction",
+            " no longer",
+        )
+
+        scope_items: List[str] = []
+        can_items: List[str] = []
+        cannot_items: List[str] = []
+        for line in candidate_lines:
+            clean_line = self._normalise_line(line)
+            if not clean_line:
+                continue
+            lowered = clean_line.lower()
+            if any(marker in lowered for marker in scope_markers) or lowered.startswith(
+                ("employees", "suppliers", "vendors", "requesters", "approvers", "teams")
+            ):
+                scope_items.append(clean_line)
+            if any(marker in lowered for marker in positive_markers):
+                can_items.append(clean_line)
+            if any(marker in lowered for marker in negative_markers):
+                cannot_items.append(clean_line)
+
+        if not scope_items:
+            entities = [
+                str(entity).strip()
+                for entity in extracted_data.get("entities", [])
+                if str(entity).strip()
+            ]
+            focus = self._derive_focus_from_query(query)
+            if entities:
+                audience = ", ".join(entities[:2])
+                scope_items.append(
+                    f"Most relevant to {audience} when working on {focus or 'this topic'}."
+                )
+            else:
+                scope_items.append(
+                    f"Applies to procurement activity related to {focus or 'this topic'} unless the policy states otherwise."
+                )
+        scope_items = scope_items[:_MAX_ATOM_LIST_ITEMS]
+
+        if not can_items and main_points:
+            can_items = main_points[: min(len(main_points), 2)]
+        if not can_items:
+            can_items = [
+                "No explicit allowances surfaced in the retrieved material.",
+            ]
+
+        if not cannot_items and plan.get("type") == "policy_lookup":
+            cannot_items = [
+                "No prohibitions were highlighted, so double-check the policy before proceeding.",
+            ]
+        elif not cannot_items:
+            cannot_items = [
+                "No specific restrictions were called out in the references.",
+            ]
+
+        table_rows: List[Tuple[str, str]] = []
+        for idx, point in enumerate(main_points[: _MAX_ATOM_LIST_ITEMS], start=1):
+            condition, description = self._split_condition_description(point, idx)
+            table_rows.append((condition, description))
+        if not table_rows:
+            focus = self._derive_focus_from_query(query)
+            table_rows = [("Key Insight", f"No detailed records found for {focus or 'this topic'}.")]
+
+        notes: List[str] = []
+        note_candidates = candidate_sentences[1:4]
+        if not note_candidates and len(main_points) > 1:
+            note_candidates = main_points[1:3]
+        for text in note_candidates:
+            cleaned = text.strip()
+            if cleaned:
+                notes.append(cleaned)
+            if len(notes) >= _MAX_ATOM_LIST_ITEMS:
+                break
+        if not notes:
+            notes = [
+                "Capture any approvals or documentation before you proceed.",
+            ]
+
+        return {
+            "summary": summary_text,
+            "scope": scope_items,
+            "rules": can_items,
+            "exclusions": cannot_items,
+            "policies": table_rows,
+            "next_steps": notes,
+            "followup": self._format_followup_text(followups),
+        }
+
+    def _format_followup_text(self, followups: Optional[Sequence[str]]) -> str:
+        if followups:
+            first = None
+            for item in followups:
+                if isinstance(item, str) and item.strip():
+                    first = item.strip()
+                    break
+            if first:
+                cleaned = first.rstrip("?.!").strip()
+                if cleaned:
+                    return f"I can also cover {cleaned.lower()} if that would help next."
+        return "Happy to explore more detail whenever you need it."
+
+    def _request_atoms_via_llm(
+        self,
+        *,
+        query: str,
+        raw_answer: str,
+        docs: Sequence[Any],
+        heuristics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        context_snippets = self._collect_atom_context(raw_answer, docs)
+        payload = {
+            "question": query,
+            "context_snippets": context_snippets,
+            "heuristics": heuristics,
+        }
+        user_instruction = (
+            json.dumps(payload, ensure_ascii=False, indent=2)
+            + "\nReturn ONLY valid JSON with keys: summary, scope, rules, exclusions, policies, next_steps, followup."
+        )
+
+        model_name = self._resolve_atom_model_name()
+        response = self.call_ollama(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": ATOM_EXTRACTION_SYSTEM},
+                {"role": "user", "content": user_instruction},
+            ],
+            options={
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "num_ctx": 8192,
+                "num_predict": 1024,
+            },
+        )
+        raw_text = self._extract_llm_message(response)
+        return self._parse_atom_json(raw_text)
+
+    def _resolve_atom_model_name(self, fallback: str = "phi4:latest") -> str:
+        """Return the preferred LLM identifier for HTML atom extraction."""
+
+        # ``BaseAgent`` exposes ``get_agent_model`` in newer deployments. Older
+        # builds might not, so we defensively probe before invoking to avoid the
+        # AttributeError observed in production.
+        resolver = getattr(self, "get_agent_model", None)
+        if callable(resolver):
+            try:
+                model_name = resolver("rag_agent_html_atoms", fallback=fallback)
+            except TypeError:
+                model_name = resolver("rag_agent_html_atoms")  # type: ignore[misc]
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+
+        # Allow the agent nickname wrapper to supply overrides when available.
+        nick_resolver = getattr(self.agent_nick, "get_agent_model", None)
+        if callable(nick_resolver):
+            try:
+                model_name = nick_resolver("rag_agent_html_atoms", fallback=fallback)
+            except TypeError:
+                model_name = nick_resolver("rag_agent_html_atoms")  # type: ignore[misc]
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
+
+        configured = getattr(self.settings, "rag_model", None)
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+
+        return fallback
+
+    @staticmethod
+    def _extract_llm_message(response: Dict[str, Any]) -> str:
+        if not isinstance(response, dict):
+            return ""
+        message = response.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+        content = response.get("response")
+        if isinstance(content, str):
+            return content.strip()
+        return ""
+
+    def _collect_atom_context(self, raw_answer: str, docs: Sequence[Any]) -> List[str]:
+        snippets: List[str] = []
+        stripped = self._clean_prompt_text(self._strip_markdown(raw_answer or ""))
+        if stripped:
+            snippets.append(self._truncate_context(f"Answer scope: {stripped}"))
+        for doc in docs[:8]:
+            payload = getattr(doc, "payload", {}) or {}
+            summary = payload.get("summary") or payload.get("text_summary")
+            label = payload.get("source_label") or payload.get("record_id") or "Context"
+            snippet = f"{label}: {summary}" if summary else str(label)
+            cleaned = self._clean_prompt_text(snippet)
+            if cleaned:
+                snippets.append(self._truncate_context(cleaned))
+            if len(snippets) >= 8:
+                break
+        return snippets
+
+    def _truncate_context(self, text: str, limit: int = 600) -> str:
+        cleaned = text.strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 1].rstrip() + "…"
+
+    def _clean_prompt_text(self, text: str) -> str:
+        cleaned = (text or "").replace("static_policy", "policy library")
+        cleaned = re.sub(r"document_id\s*[:=]\s*\S+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"procwise_document_embeddings", "procurement knowledge base", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _parse_atom_json(self, text: str) -> Dict[str, Any]:
+        if not text:
+            return {}
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            cleaned = re.sub(r'\\(?!["\/bfnrtu])', "", candidate)
+            try:
+                parsed = json.loads(cleaned)
+            except Exception:
+                return {}
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
+
+    def _merge_atom_payloads(
+        self,
+        fallback: Dict[str, Any],
+        model_atoms: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(fallback)
+        for key in ("summary", "followup"):
+            value = model_atoms.get(key)
+            if isinstance(value, str) and value.strip():
+                merged[key] = value.strip()
+
+        list_mappings: Dict[str, Tuple[str, ...]] = {
+            "scope": ("scope", "applicability", "audience", "coverage"),
+            "rules": ("rules", "allowed"),
+            "exclusions": ("exclusions", "prohibited"),
+            "next_steps": ("next_steps", "notes"),
+        }
+
+        for target, candidates in list_mappings.items():
+            for candidate in candidates:
+                value = model_atoms.get(candidate)
+                if isinstance(value, (list, tuple)):
+                    cleaned: List[str] = []
+                    for item in value:
+                        text = str(item).strip()
+                        if text:
+                            cleaned.append(text)
+                        if len(cleaned) >= _MAX_ATOM_LIST_ITEMS:
+                            break
+                    if cleaned:
+                        merged[target] = cleaned
+                        break
+                elif isinstance(value, str) and value.strip():
+                    merged[target] = [value.strip()]
+                    break
+
+        policy_value = None
+        for key in ("policies", "policy_rows", "details"):
+            value = model_atoms.get(key)
+            if isinstance(value, (list, tuple)):
+                policy_value = value
+                break
+        if policy_value is not None:
+            rows: List[Tuple[str, str, str]] = []
+            for idx, entry in enumerate(policy_value, start=1):
+                name: str
+                effective: str
+                note_text: str
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 3:
+                        name = str(entry[0]).strip()
+                        effective = str(entry[1]).strip()
+                        note_text = str(entry[2]).strip()
+                    elif len(entry) == 2:
+                        name = str(entry[0]).strip()
+                        effective = ""
+                        note_text = str(entry[1]).strip()
+                    elif len(entry) == 1:
+                        name = str(entry[0]).strip()
+                        effective = ""
+                        note_text = ""
+                    else:
+                        continue
+                elif isinstance(entry, dict):
+                    name = str(
+                        entry.get("name")
+                        or entry.get("policy")
+                        or entry.get("title")
+                        or entry.get("condition")
+                        or f"Item {idx}"
+                    ).strip()
+                    effective = str(
+                        entry.get("effective")
+                        or entry.get("date")
+                        or entry.get("timeline")
+                        or entry.get("window")
+                        or ""
+                    ).strip()
+                    note_text = str(
+                        entry.get("notes")
+                        or entry.get("owner")
+                        or entry.get("description")
+                        or entry.get("value")
+                        or ""
+                    ).strip()
+                elif isinstance(entry, str) and entry.strip():
+                    name, description = self._split_condition_description(entry, idx)
+                    name = name.strip()
+                    note_text = description.strip()
+                    effective = ""
+                else:
+                    continue
+                rows.append((name, effective, note_text))
+                if len(rows) >= _MAX_ATOM_LIST_ITEMS:
+                    break
+            if rows:
+                merged["policies"] = rows
+        return merged
+
+    def _finalise_atoms(self, atoms: Dict[str, Any]) -> Dict[str, Any]:
+        summary = str(atoms.get("summary") or "").strip()
+        if not summary:
+            summary = "No documented guidance surfaced yet; consider checking with procurement operations."
+
+        def _ensure_named_list(primary: str, default: List[str], *aliases: str) -> List[str]:
+            candidates = (primary,) + aliases
+            for name in candidates:
+                value = atoms.get(name)
+                if isinstance(value, (list, tuple)):
+                    cleaned = [str(item).strip() for item in value if str(item).strip()]
+                    if cleaned:
+                        return cleaned[:_MAX_ATOM_LIST_ITEMS]
+                elif isinstance(value, str) and value.strip():
+                    return [value.strip()]
+            return default
+
+        scope = _ensure_named_list(
+            "scope",
+            [
+                "Applies across procurement activity unless a policy clause narrows the audience.",
+            ],
+            "applicability",
+            "audience",
+        )
+        rules = _ensure_named_list(
+            "rules",
+            ["No explicit allowances were identified in the retrieved records."],
+            "allowed",
+        )
+        exclusions = _ensure_named_list(
+            "exclusions",
+            ["No prohibitions were captured; double-check the policy for edge cases."],
+            "prohibited",
+        )
+        next_steps = _ensure_named_list(
+            "next_steps",
+            ["Raise a ticket if you need deeper analysis or updated approvals."],
+            "notes",
+        )
+
+        policies_value = atoms.get("policies") or atoms.get("details")
+        policies: List[Tuple[str, str, str]] = []
+        if isinstance(policies_value, (list, tuple)):
+            for idx, entry in enumerate(policies_value, start=1):
+                name: str
+                effective: str
+                note_text: str
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 3:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = str(entry[1]).strip()
+                        note_text = str(entry[2]).strip()
+                    elif len(entry) == 2:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = ""
+                        note_text = str(entry[1]).strip()
+                    elif len(entry) == 1:
+                        name = str(entry[0]).strip() or f"Item {idx}"
+                        effective = ""
+                        note_text = ""
+                    else:
+                        continue
+                elif isinstance(entry, dict):
+                    name = str(
+                        entry.get("name")
+                        or entry.get("policy")
+                        or entry.get("title")
+                        or entry.get("condition")
+                        or f"Item {idx}"
+                    ).strip()
+                    effective = str(
+                        entry.get("effective")
+                        or entry.get("date")
+                        or entry.get("timeline")
+                        or entry.get("window")
+                        or ""
+                    ).strip()
+                    note_text = str(
+                        entry.get("notes")
+                        or entry.get("owner")
+                        or entry.get("description")
+                        or entry.get("value")
+                        or ""
+                    ).strip()
+                elif isinstance(entry, str) and entry.strip():
+                    name, description = self._split_condition_description(entry, idx)
+                    effective = ""
+                    note_text = description.strip()
+                else:
+                    continue
+                policies.append((name, effective, note_text))
+                if len(policies) >= _MAX_ATOM_LIST_ITEMS:
+                    break
+        if not policies:
+            policies = [
+                (
+                    "Reference",
+                    "Not specified",
+                    "No effective date or ownership details were highlighted in the retrieved material.",
+                )
+            ]
+
+        followup = str(atoms.get("followup") or "").strip()
+        if not followup:
+            followup = "Let me know if you want me to gather additional procurement detail next."
+
+        def _strip_banned(text: str) -> str:
+            cleaned = text
+            for token in _BANNED_TOKENS:
+                cleaned = cleaned.replace(token, "")
+            return cleaned.strip()
+
+        summary = _strip_banned(summary)
+        scope = [_strip_banned(item) for item in scope]
+        rules = [_strip_banned(item) for item in rules]
+        exclusions = [_strip_banned(item) for item in exclusions]
+        next_steps = [_strip_banned(item) for item in next_steps]
+        policies = [
+            (
+                _strip_banned(name),
+                _strip_banned(effective) or "Not specified",
+                _strip_banned(note) or "No notes captured.",
+            )
+            for name, effective, note in policies
+        ]
+        followup = _strip_banned(followup)
+
+        return {
+            "summary": summary,
+            "scope": scope,
+            "rules": rules,
+            "exclusions": exclusions,
+            "policies": policies,
+            "next_steps": next_steps,
+            "followup": followup,
+        }
+
+    def _strip_markdown(self, text: str) -> str:
+        cleaned = text.replace("**", "")
+        cleaned = cleaned.replace("__", "")
+        cleaned = re.sub(r"`([^`]*)`", r"\\1", cleaned)
+        cleaned = re.sub(r"#+\\s*", "", cleaned)
+        cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\\1", cleaned)
+        return cleaned
+
+    def _extract_candidate_lines(self, text: str) -> List[str]:
+        if not text:
+            return []
+        lines = [segment.strip() for segment in text.splitlines() if segment.strip()]
+        return lines
+
+    def _normalise_line(self, text: str) -> str:
+        cleaned = re.sub(r"^[\-•*]+", "", text).strip()
+        cleaned = re.sub(r"^\d+\.\s*", "", cleaned)
+        cleaned = cleaned.replace("**", "")
+        cleaned = cleaned.replace("__", "")
+        return cleaned.strip()
+
+    def _split_condition_description(self, text: str, index: int) -> Tuple[str, str]:
+        cleaned = self._normalise_line(self._strip_markdown(text))
+        if ":" in cleaned:
+            condition, description = cleaned.split(":", 1)
+            return condition.strip() or f"Key Insight {index}", description.strip() or cleaned
+        if "-" in cleaned:
+            parts = cleaned.split("-", 1)
+            left, right = parts[0].strip(), parts[1].strip()
+            if left and right:
+                return left, right
+        return f"Key Insight {index}", cleaned or "Detail not provided."
 
     def _generate_opening_section(
         self, query: str, data: Dict[str, Any], query_type: str
@@ -805,8 +1970,6 @@ class RAGAgent(BaseAgent):
                 if supplier.get("metrics"):
                     for metric in supplier["metrics"]:
                         bullet_lines.append(f"  - {metric}")
-                if supplier.get("source_id"):
-                    bullet_lines.append(f"  - Source: {supplier['source_id']}")
                 primary_lines.extend(bullet_lines)
             sections.append("\n".join(primary_lines).strip())
 
@@ -837,9 +2000,6 @@ class RAGAgent(BaseAgent):
             summary_lines = ["Key figures that anchor the conversation:"]
             for key, value in financial_data["totals"].items():
                 summary_lines.append(f"- **{key}:** {value}")
-            source = data.get("source_ids", [None])[0]
-            if source:
-                summary_lines.append(f"- Source: {source}")
             sections.append("\n".join(summary_lines).strip())
 
         breakdown_rows = financial_data.get("breakdown") or []
@@ -945,96 +2105,181 @@ class RAGAgent(BaseAgent):
         topic_entry: TopicRecord,
         focus_answer: str,
         depth_mode: str,
+        policy_docs: Sequence[SimpleNamespace] = (),
+        primary_docs: Sequence[SimpleNamespace] = (),
     ) -> Dict[str, Any]:
         categories: Dict[str, List[str]] = defaultdict(list)
+        dynamic_presence: Set[str] = set()
+        doc_overview_candidates: List[str] = []
+
+        def _record(key: str, clause: str, *, dynamic: bool) -> None:
+            cleaned = self._clean_policy_clause(clause)
+            if not cleaned:
+                return
+            if not dynamic and dynamic_presence and key in dynamic_presence:
+                return
+            categories[key].append(cleaned)
+            if dynamic:
+                dynamic_presence.add(key)
+
+        def _ingest_text(block: str, *, dynamic: bool) -> None:
+            if not block:
+                return
+            sentences = self._split_sentences(block)
+            for sentence in sentences:
+                lowered = sentence.lower()
+                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep|require)\b", lowered):
+                    _record("requirements", sentence, dynamic=dynamic)
+                if re.search(
+                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined|never)\b",
+                    lowered,
+                ) or "non-claimable" in lowered:
+                    _record("restrictions", sentence, dynamic=dynamic)
+                if re.search(r"[£$€]\s*[\d,.]+", sentence) or re.search(
+                    r"\b(limit|cap|threshold|per person|per day|per month|ceiling)\b",
+                    lowered,
+                ):
+                    _record("spending_limits", sentence, dynamic=dynamic)
+                if re.search(
+                    r"approval|approve|authoris|manager|finance|sign-off|review",
+                    lowered,
+                ):
+                    _record("approval_process", sentence, dynamic=dynamic)
+                if re.search(r"for example|such as|e.g.|include", lowered):
+                    _record("examples", sentence, dynamic=dynamic)
+                if re.search(r"unless|exception|exemption|waiver|if you need an exception", lowered):
+                    _record("exceptions", sentence, dynamic=dynamic)
+                if re.search(
+                    r"workflow|process|document|retain|attach|audit|reconcile|submit|evidence|record",
+                    lowered,
+                ) or re.search(r"\b(po|purchase order|invoice|coding)\b", lowered):
+                    _record("operational_notes", sentence, dynamic=dynamic)
+
+        def _ingest_payload(payload: Dict[str, Any], *, dynamic: bool) -> None:
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                if dynamic:
+                    doc_overview_candidates.append(summary)
+                _ingest_text(summary, dynamic=dynamic)
+
+            for key in ("highlights", "sections", "key_points"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    _ingest_text(value, dynamic=dynamic)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, str):
+                            _ingest_text(item, dynamic=dynamic)
+                        elif isinstance(item, dict):
+                            for field in ("text", "content", "summary", "value"):
+                                text_value = item.get(field)
+                                if isinstance(text_value, str):
+                                    _ingest_text(text_value, dynamic=dynamic)
+
+        for doc in policy_docs or []:
+            payload = getattr(doc, "payload", {}) or {}
+            _ingest_payload(payload, dynamic=True)
+
+        for doc in primary_docs or []:
+            payload = getattr(doc, "payload", {}) or {}
+            _ingest_payload(payload, dynamic=True)
 
         for qa in topic_entry.qas:
             question_lower = qa.question.lower()
-            sentences = self._split_sentences(qa.answer)
-            for sentence in sentences:
-                clause = self._clean_policy_clause(sentence)
-                lowered = clause.lower()
-                if re.search(r"\b(must|shall|need to|ensure|submit|retain|provide|keep)\b", lowered):
-                    categories["requirements"].append(clause)
-                if re.search(
-                    r"\b(non-claimable|not allowed|cannot|can't|prohibit|forbidden|declined)\b",
-                    lowered,
-                ) or "non-claimable" in lowered:
-                    categories["restrictions"].append(clause)
-                if re.search(r"[£$€]\s*[\d,.]+", clause) or re.search(
-                    r"\b(limit|cap|threshold|per person|per day|per month)\b",
-                    lowered,
-                ):
-                    categories["spending_limits"].append(clause)
-                if re.search(r"approval|approve|authoris|manager|finance", lowered):
-                    categories["approval_process"].append(clause)
-                if re.search(r"for example|such as|e.g.|include", lowered):
-                    categories["examples"].append(clause)
-                if re.search(r"unless|exception|exemption|waiver", lowered):
-                    categories["exceptions"].append(clause)
+            answer_sentences = self._split_sentences(qa.answer)
 
-            if "exception" in question_lower or "waiver" in question_lower:
-                categories["exceptions"].extend(sentences)
-            if "example" in question_lower:
-                categories["examples"].extend(sentences)
-            if any(keyword in question_lower for keyword in ["limit", "cap", "threshold"]):
-                categories["spending_limits"].extend(sentences)
-            if "approval" in question_lower or "pre-approv" in question_lower:
-                categories["approval_process"].extend(sentences)
-            if any(keyword in question_lower for keyword in ["must", "how do i comply"]):
-                categories["requirements"].extend(sentences)
+            _ingest_text(qa.answer, dynamic=False)
 
-        overview_sentences = self._split_sentences(focus_answer)
-        overview = overview_sentences[0] if overview_sentences else focus_answer
+            if "exceptions" not in dynamic_presence and (
+                "exception" in question_lower or "waiver" in question_lower
+            ):
+                categories["exceptions"].extend(answer_sentences)
+            if "examples" not in dynamic_presence and "example" in question_lower:
+                categories["examples"].extend(answer_sentences)
+            if (
+                "spending_limits" not in dynamic_presence
+                and any(keyword in question_lower for keyword in ["limit", "cap", "threshold"])
+            ):
+                categories["spending_limits"].extend(answer_sentences)
+            if (
+                "approval_process" not in dynamic_presence
+                and ("approval" in question_lower or "pre-approv" in question_lower)
+            ):
+                categories["approval_process"].extend(answer_sentences)
+            if (
+                "requirements" not in dynamic_presence
+                and any(keyword in question_lower for keyword in ["must", "how do i comply"])
+            ):
+                categories["requirements"].extend(answer_sentences)
+
+        overview = ""
+        if doc_overview_candidates:
+            overview = doc_overview_candidates[0]
+        elif focus_answer:
+            sentences = self._split_sentences(focus_answer)
+            overview = sentences[0] if sentences else focus_answer
 
         payload = {
             "policy_name": policy_name,
-            "overview": self._ensure_sentence(self._clean_policy_clause(overview)),
+            "overview": self._ensure_sentence(self._clean_policy_clause(overview)) if overview else "",
             "requirements": self._unique_ordered(categories.get("requirements", [])),
             "restrictions": self._unique_ordered(categories.get("restrictions", [])),
             "spending_limits": self._unique_ordered(categories.get("spending_limits", [])),
             "approval_process": self._unique_ordered(categories.get("approval_process", [])),
             "examples": self._unique_ordered(categories.get("examples", [])),
             "exceptions": self._unique_ordered(categories.get("exceptions", [])),
+            "operational_notes": self._unique_ordered(categories.get("operational_notes", [])),
         }
 
         if depth_mode == "expanded":
-            # Allow more contextual statements when expanding.
-            for key in ["requirements", "restrictions", "spending_limits", "approval_process"]:
-                values = payload[key]
-                if not values and payload["overview"]:
+            for key in ["requirements", "restrictions", "spending_limits", "approval_process", "operational_notes"]:
+                values = payload.get(key, [])
+                if not values and payload.get("overview"):
                     values.append(payload["overview"])
                 payload[key] = values
 
         return payload
 
     def _render_policy_response(
-        self, payload: Dict[str, Any], depth_mode: str
+        self,
+        payload: Dict[str, Any],
+        depth_mode: str,
+        query: Optional[str] = None,
     ) -> str:
         policy_name = self._format_policy_title(payload.get("policy_name", "Policy Guidance"))
+        focus = self._derive_focus_from_query(query or policy_name)
+        focus_text = focus if focus and focus != "the topic" else "this request"
         overview = payload.get("overview", "")
         overview_text = self._ensure_sentence(self._clean_policy_clause(overview)) if overview else ""
 
-        lines: List[str] = [f"## {policy_name}"]
-        if overview_text:
-            lines.append(overview_text)
+        detail = overview_text or "I pulled the relevant guardrails straight from our policy library and procurement records."
+        summary_line = f"Here’s what {policy_name} says about {focus_text}: {detail}"
 
-        sections = [
-            ("What You Must Do", "requirements"),
-            ("What's Prohibited", "restrictions"),
-            ("Spending Limits", "spending_limits"),
-            ("Approval Requirements", "approval_process"),
-            ("Examples", "examples"),
-            ("Exceptions", "exceptions"),
-        ]
+        lines: List[str] = [self._ensure_sentence(summary_line)]
 
-        for title, key in sections:
-            bullets = self._policy_section_bullets(payload, key, depth_mode)
+        def _append_section(title: str, items: Sequence[str]) -> None:
+            bullets = [self._ensure_sentence(text) for text in self._unique_ordered(items)]
             if not bullets:
-                continue
+                return
             lines.append("")
             lines.append(title)
             lines.extend(f"- {bullet}" for bullet in bullets)
+
+        allowed = self._policy_section_bullets(payload, "requirements", depth_mode)
+        restricted = self._policy_section_bullets(payload, "restrictions", depth_mode)
+
+        notes_pool: List[str] = []
+        for key in ("spending_limits", "approval_process", "operational_notes"):
+            notes_pool.extend(self._policy_section_bullets(payload, key, depth_mode))
+        for key in ("examples", "exceptions"):
+            notes_pool.extend(self._policy_section_bullets(payload, key, depth_mode))
+
+        _append_section("✅ **Allowed Conditions / Requirements**", allowed)
+        _append_section("❌ **Prohibited / Restricted Conditions**", restricted)
+        _append_section("📎 **Important Notes / Compliance Obligations**", notes_pool)
+
+        next_steps = "Need help submitting an expense claim or checking approvals? Just ask and I’ll walk you through it."
+        _append_section("➡️ **Next Steps**", [next_steps])
 
         return "\n".join(lines)
 
@@ -1087,6 +2332,7 @@ class RAGAgent(BaseAgent):
             "approval_process": "Capture written approval in advance for any exception.",
             "examples": "Model your claim on the compliant scenarios described in the policy.",
             "exceptions": "Escalate unusual circumstances to Finance for documented exceptions.",
+            "operational_notes": "Keep documentation tidy—attach receipts, coding, and approvals in the workflow.",
         }
 
         bullets = [self._ensure_sentence(item) for item in self._unique_ordered(bullets)]
@@ -1155,6 +2401,8 @@ class RAGAgent(BaseAgent):
                 )
             else:
                 bullets.append(f"Exception: {clause}")
+        elif section == "operational_notes":
+            bullets.append(self._ensure_sentence(clause))
 
         return bullets
 
@@ -1279,9 +2527,6 @@ class RAGAgent(BaseAgent):
         response = (
             f"On {focus or 'this point'}, here's what the notes say: " + " ".join(sentences)
         )
-        source_ids = data.get("source_ids", [])
-        if source_ids:
-            response += f" (Source: {source_ids[0]})"
         return response
 
     def _extract_supplier_info(

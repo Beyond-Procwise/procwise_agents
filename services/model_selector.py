@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Set
 
 import ollama
 import pdfplumber
@@ -398,7 +398,7 @@ class RAGPipeline:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
 
         candidate = (configured_model or "").strip()
-        if candidate and "phi4" in candidate.lower():
+        if candidate and "qwen3" in candidate.lower():
             return candidate
         if candidate:
             logger.warning(
@@ -630,9 +630,12 @@ class RAGPipeline:
             )
         )
 
+        stripped_answer = answer_text.lstrip()
         structured = (
             bool(payload.get("structured"))
-            or answer_text.lstrip().startswith("##")
+            or stripped_answer.startswith("##")
+            or stripped_answer.startswith("<section")
+            or "<section" in stripped_answer
             or is_feedback_ack
         )
 
@@ -1043,6 +1046,32 @@ class RAGPipeline:
         index = int(digest[:8], 16) % len(options)
         return options[index]
 
+    def _conversation_context_line(
+        self, query: str, focus_items: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        redacted_query = self._redact_identifiers(query)
+        if not redacted_query:
+            return ""
+
+        focus_phrase = self._extract_focus_phrase(query)
+        if not focus_phrase and focus_items:
+            for item in focus_items:
+                candidate = (
+                    item.get("document")
+                    or item.get("source_label")
+                    or item.get("collection")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    focus_phrase = candidate
+                    break
+
+        focus_phrase = self._redact_identifiers(focus_phrase)
+        if focus_phrase:
+            descriptor = self._topic_descriptor(focus_phrase)
+            if descriptor:
+                return f"You asked about {descriptor}, so here's what I found"
+        return f"You asked: {redacted_query}. Here's what stood out"
+
     def _select_focus_items(
         self, items: List[Dict[str, Any]], limit: int = 4
     ) -> List[Dict[str, Any]]:
@@ -1123,6 +1152,7 @@ class RAGPipeline:
             if key and key in seen:
                 continue
             cleaned_entry = dict(entry)
+            cleaned_entry["_focus_score"] = float(entry.get("_ordering_score", 0.0))
             cleaned_entry.pop("_ordering_score", None)
             selected.append(cleaned_entry)
             if key:
@@ -1133,12 +1163,38 @@ class RAGPipeline:
         if len(selected) < min(limit, len(sortable)):
             for entry in sortable:
                 candidate = dict(entry)
+                candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
                 candidate.pop("_ordering_score", None)
                 if candidate in selected:
                     continue
                 selected.append(candidate)
                 if len(selected) >= limit:
                     break
+
+        primary_collection = getattr(self.rag, "primary_collection", "")
+        if primary_collection:
+            has_primary_focus = any(
+                item.get("collection") == primary_collection for item in selected
+            )
+            if not has_primary_focus:
+                primary_candidates: List[Dict[str, Any]] = []
+                for entry in sortable:
+                    if entry.get("collection") != primary_collection:
+                        continue
+                    candidate = dict(entry)
+                    candidate["_focus_score"] = float(entry.get("_ordering_score", 0.0))
+                    candidate.pop("_ordering_score", None)
+                    primary_candidates.append(candidate)
+                if primary_candidates:
+                    replacement = primary_candidates[0]
+                    if len(selected) < limit:
+                        selected.append(replacement)
+                    else:
+                        lowest_idx = min(
+                            range(len(selected)),
+                            key=lambda idx: selected[idx].get("_focus_score", 0.0),
+                        )
+                        selected[lowest_idx] = replacement
 
         def _original_index(value: Dict[str, Any]) -> int:
             for idx, item in enumerate(items):
@@ -1147,7 +1203,10 @@ class RAGPipeline:
             return len(items)
 
         selected.sort(key=_original_index)
-        return selected[:limit]
+        trimmed = selected[:limit]
+        for entry in trimmed:
+            entry.pop("_focus_score", None)
+        return trimmed
 
     def _format_primary_statement(self, item: Dict[str, Any]) -> str:
         snippet = self._extract_snippet(item)
@@ -1239,14 +1298,16 @@ class RAGPipeline:
 
     def _analyse_session_history(
         self, history: List[Dict[str, Any]]
-    ) -> tuple[str, List[str], bool]:
+    ) -> tuple[str, List[str], Dict[str, bool]]:
         if not history:
-            return "", [], False
+            return "", [], {"policy": False, "supplier": False}
 
         recent_entries = history[-3:]
         hint_parts: List[str] = []
         fragments: List[str] = []
-        policy_signal = False
+        signals = {"policy": False, "supplier": False}
+        policy_tokens = ("policy", "policies", "compliance", "compliant", "approval", "approvals")
+        supplier_tokens = ("supplier", "suppliers", "vendor", "vendors")
 
         for entry in reversed(recent_entries):
             question = str(entry.get("query", "")).strip()
@@ -1255,8 +1316,10 @@ class RAGPipeline:
                 if cleaned_question:
                     hint_parts.append(f"Earlier question: {cleaned_question}")
                     lowered_q = cleaned_question.lower()
-                    if any(token in lowered_q for token in ("policy", "supplier", "approval")):
-                        policy_signal = True
+                    if any(token in lowered_q for token in policy_tokens):
+                        signals["policy"] = True
+                    if any(token in lowered_q for token in supplier_tokens):
+                        signals["supplier"] = True
 
             answer = entry.get("answer")
             answer_text: str = ""
@@ -1275,18 +1338,20 @@ class RAGPipeline:
             if snippet:
                 fragments.append(snippet)
                 lowered_snippet = snippet.lower()
-                if any(token in lowered_snippet for token in ("policy", "supplier", "approval")):
-                    policy_signal = True
+                if any(token in lowered_snippet for token in policy_tokens):
+                    signals["policy"] = True
+                if any(token in lowered_snippet for token in supplier_tokens):
+                    signals["supplier"] = True
 
         session_hint = " ".join(hint_parts[:2])
-        return session_hint, fragments[:3], policy_signal
+        return session_hint, fragments[:3], signals
 
     def _is_policy_question(
         self,
         query: str,
         doc_type: Optional[str],
         session_hint: str,
-        history_policy_signal: bool,
+        history_signals: Optional[Dict[str, bool]],
     ) -> bool:
         tokens = [query or "", session_hint or ""]
         if doc_type:
@@ -1305,7 +1370,8 @@ class RAGPipeline:
         )
         if any(keyword in combined for keyword in keyword_triggers):
             return True
-        return history_policy_signal
+        history_flags = history_signals or {}
+        return bool(history_flags.get("policy"))
 
     def _supported_search_kwargs(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1623,8 +1689,14 @@ class RAGPipeline:
 
         paragraphs: List[str] = []
         opening_line = self._friendly_opening(query, acknowledgements, focus_items)
+        context_line = self._conversation_context_line(query, focus_items)
+        intro_sentences: List[str] = []
         if opening_line:
-            paragraphs.append(self._to_sentence(opening_line))
+            intro_sentences.append(self._to_sentence(opening_line))
+        if context_line:
+            intro_sentences.append(self._to_sentence(context_line))
+        if intro_sentences:
+            paragraphs.append(" ".join(intro_sentences))
 
         if (focus_items or ad_hoc_context) and summary_intro_template:
             intro_line = self._craft_summary_intro(
@@ -1930,7 +2002,7 @@ class RAGPipeline:
             elif matched_owner and not session_key:
                 session_key = matched_owner
 
-        session_hint, memory_fragments, history_policy_signal = self._analyse_session_history(
+        session_hint, memory_fragments, history_signals = self._analyse_session_history(
             history
         )
 
@@ -1980,7 +2052,7 @@ class RAGPipeline:
         policy_mode = False
         if not restrict_to_uploaded:
             policy_mode = self._is_policy_question(
-                query, doc_type, session_hint, history_policy_signal
+                query, doc_type, session_hint, history_signals
             )
         search_kwargs = {
             "top_k": 6,

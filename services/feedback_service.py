@@ -178,7 +178,7 @@ class FeedbackService:
                         ON proc.rag_feedback(sentiment, processed)
                         """
                     )
-                conn.commit()
+                conn.commit()  # Ensure changes persist before connection closes
         except Exception:  # pragma: no cover
             logger.exception("Failed to ensure RAG feedback table")
 
