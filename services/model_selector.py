@@ -1725,7 +1725,16 @@ class RAGPipeline:
             )
             body = self._plain_text_to_html(cleaned)
 
-        return f"<section><h2>Response</h2>{body}</section>"
+        return (
+            "<section class=\"llm-answer\">"
+            "<header class=\"llm-answer__header\">"
+            "<h2 class=\"llm-answer__title\">Answer</h2>"
+            "</header>"
+            "<article class=\"llm-answer__content\">"
+            f"{body}"
+            "</article>"
+            "</section>"
+        )
 
     def _build_structured_answer(
         self,
@@ -1882,13 +1891,33 @@ class RAGPipeline:
         else:
             base_options["temperature"] = min(0.7, temperature + 0.1)
         base_options.setdefault("top_p", 0.9)
+        chat_kwargs = {
+            "model": model,
+            "messages": messages,
+            "options": base_options,
+            "format": "json",
+        }
+
+        stream_enabled = bool(getattr(settings, "stream_llm_responses", False))
+        if stream_enabled:
+            try:
+                stream = ollama.chat(**{**chat_kwargs, "stream": True})
+                content_chunks: List[str] = []
+                for event in stream:
+                    fragment = (event or {}).get("message", {}).get("content")
+                    if fragment:
+                        content_chunks.append(fragment)
+                content = "".join(content_chunks)
+                if content:
+                    return json.loads(content)
+                logger.warning("Streaming response returned no content; retrying without streaming")
+            except json.JSONDecodeError as exc:
+                logger.error("Error parsing streamed JSON response: %s", exc)
+            except Exception as exc:
+                logger.error("Streaming LLM response failed: %s", exc)
+
         try:
-            response = ollama.chat(
-                model=model,
-                messages=messages,
-                options=base_options,
-                format="json",
-            )
+            response = ollama.chat(**chat_kwargs)
             content = response.get("message", {}).get("content", "")
             return json.loads(content)
         except json.JSONDecodeError as e:
