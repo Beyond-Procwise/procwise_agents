@@ -235,6 +235,9 @@ class Settings(BaseSettings):
     ollama_adapter: Optional[str] = Field(
         default=None, env="OLLAMA_ADAPTER"
     )
+    stream_llm_responses: bool = Field(
+        default=False, env="STREAM_LLM_RESPONSES"
+    )
 
     script_user: str = "AgentNick"
     audit_columns: List[str] = ['created_date', 'created_by', 'last_modified_by', 'last_modified_date']
