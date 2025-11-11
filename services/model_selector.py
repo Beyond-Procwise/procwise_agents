@@ -238,6 +238,44 @@ class ChatHistoryManager:
 
 class RAGPipeline:
     _BLOCKED_DOC_TYPE_TOKENS = ("learning", "workflow", "event", "log", "trace", "audit")
+    _HTML_TAG_ALLOWLIST: Set[str] = {
+        "a",
+        "article",
+        "b",
+        "blockquote",
+        "body",
+        "br",
+        "code",
+        "div",
+        "em",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "i",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+    }
     _IDENTIFIER_FIELD_KEYS = {
         "record_id",
         "source",
@@ -1917,14 +1955,19 @@ class RAGPipeline:
             if stripped.startswith("<section") and stripped.endswith("</section>"):
                 return stripped
 
-            contains_html_tags = bool(
-                re.search(r"</?\s*[A-Za-z][A-Za-z0-9:-]*[^>]*>", stripped)
-            )
-            cleaned = (
-                re.sub(r"</?\s*[A-Za-z][A-Za-z0-9:-]*[^>]*>", "", stripped)
-                if contains_html_tags
-                else stripped
-            )
+            tag_pattern = re.compile(r"</?\s*([A-Za-z][A-Za-z0-9:-]*)[^>]*>")
+            cleaned_parts: List[str] = []
+            last_index = 0
+
+            for match in tag_pattern.finditer(stripped):
+                cleaned_parts.append(stripped[last_index : match.start()])
+                tag_name = match.group(1).lower()
+                if tag_name not in self._HTML_TAG_ALLOWLIST:
+                    cleaned_parts.append(match.group(0))
+                last_index = match.end()
+
+            cleaned_parts.append(stripped[last_index:])
+            cleaned = "".join(cleaned_parts)
             body = self._plain_text_to_html(cleaned)
 
         return (
