@@ -202,6 +202,94 @@ class RAGPipeline:
             for key in expired_keys:
                 self._answer_cache.pop(key, None)
 
+    def _stringify_for_cache(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)) or value is None:
+            return str(value)
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return repr(value)
+
+    def _prepare_metadata_for_cache(self, metadata: Any) -> List[str]:
+        if not metadata:
+            return []
+        if isinstance(metadata, dict):
+            entries = [
+                f"{self._stringify_for_cache(key)}={self._stringify_for_cache(value)}"
+                for key, value in metadata.items()
+            ]
+            entries.sort()
+            return entries
+        if isinstance(metadata, (list, tuple, set)):
+            normalised = [self._stringify_for_cache(item) for item in metadata]
+            normalised.sort()
+            return normalised
+        return [self._stringify_for_cache(metadata)]
+
+    def _normalise_document_ids_for_cache(self, document_ids: Any) -> List[str]:
+        results: List[str] = []
+        for value in document_ids or []:
+            text = self._stringify_for_cache(value).strip()
+            if text:
+                results.append(text)
+        results.sort()
+        return results
+
+    def _build_upload_fingerprint(
+        self,
+        *,
+        candidate_keys: Sequence[str],
+        uploaded_scope: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        payload: Dict[str, Any] = {}
+        session_entries: List[Dict[str, Any]] = []
+        for key in candidate_keys:
+            record = self._session_uploads.get(key)
+            if not record:
+                continue
+            session_entries.append(
+                {
+                    "key": self._stringify_for_cache(key),
+                    "documents": self._normalise_document_ids_for_cache(
+                        record.get("document_ids")
+                    ),
+                    "metadata": self._prepare_metadata_for_cache(
+                        record.get("metadata")
+                    ),
+                    "registered_at": self._stringify_for_cache(
+                        record.get("registered_at")
+                    ),
+                }
+            )
+        if session_entries:
+            payload["session_uploads"] = session_entries
+
+        context = uploaded_scope or {}
+        if context:
+            payload["uploaded_context"] = {
+                "session": self._stringify_for_cache(context.get("session_id")),
+                "activated_at": self._stringify_for_cache(
+                    context.get("activated_at")
+                ),
+                "documents": self._normalise_document_ids_for_cache(
+                    context.get("document_ids")
+                ),
+                "metadata": self._prepare_metadata_for_cache(
+                    context.get("metadata")
+                ),
+            }
+
+        if not payload:
+            return None
+
+        try:
+            normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            normalised = repr(payload)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
     def _build_cache_key(
         self,
         query: str,
@@ -210,6 +298,8 @@ class RAGPipeline:
         model_name: Optional[str],
         doc_type: Optional[str],
         product_type: Optional[str],
+        *,
+        context_fingerprint: Optional[str] = None,
     ) -> str:
         payload = {
             "query": str(query or "").strip(),
@@ -218,6 +308,7 @@ class RAGPipeline:
             "model": str(model_name).strip() if model_name is not None else "",
             "doc_type": str(doc_type).strip() if doc_type is not None else "",
             "product_type": str(product_type).strip() if product_type is not None else "",
+            "uploads": str(context_fingerprint or "").strip(),
         }
         normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
@@ -1693,6 +1784,39 @@ class RAGPipeline:
             product_type,
         )
 
+        candidate_keys: List[str] = []
+        cleaned_session = (
+            session_id.strip()
+            if isinstance(session_id, str)
+            else str(session_id).strip()
+            if session_id is not None
+            else None
+        )
+        if cleaned_session:
+            candidate_keys.append(cleaned_session)
+        cleaned_user = user_id.strip() if isinstance(user_id, str) else str(user_id).strip()
+        if cleaned_user:
+            if cleaned_user not in candidate_keys:
+                candidate_keys.append(cleaned_user)
+
+        session_key: Optional[str] = None
+        session_record: Optional[Dict[str, Any]] = None
+        for candidate in candidate_keys:
+            record = self._session_uploads.get(candidate)
+            if record:
+                session_key = candidate
+                session_record = record
+                break
+
+        if session_key is None and candidate_keys:
+            session_key = candidate_keys[0]
+
+        uploaded_scope = dict(self._uploaded_context or {})
+        upload_fingerprint = self._build_upload_fingerprint(
+            candidate_keys=candidate_keys,
+            uploaded_scope=uploaded_scope,
+        )
+
         cache_key: Optional[str] = None
         cached_response: Optional[Dict[str, Any]] = None
         if not files:
@@ -1704,6 +1828,7 @@ class RAGPipeline:
                     model_name or llm_to_use,
                     doc_type,
                     product_type,
+                    context_fingerprint=upload_fingerprint,
                 )
             except Exception:
                 cache_key = None
@@ -1732,33 +1857,6 @@ class RAGPipeline:
                 nltk_feature_record.sentiment,
             )
 
-        candidate_keys: List[str] = []
-        cleaned_session = (
-            session_id.strip()
-            if isinstance(session_id, str)
-            else str(session_id).strip()
-            if session_id is not None
-            else None
-        )
-        if cleaned_session:
-            candidate_keys.append(cleaned_session)
-        cleaned_user = user_id.strip() if isinstance(user_id, str) else str(user_id).strip()
-        if cleaned_user:
-            if cleaned_user not in candidate_keys:
-                candidate_keys.append(cleaned_user)
-
-        session_key: Optional[str] = None
-        session_record: Optional[Dict[str, Any]] = None
-        for candidate in candidate_keys:
-            record = self._session_uploads.get(candidate)
-            if record:
-                session_key = candidate
-                session_record = record
-                break
-
-        if session_key is None and candidate_keys:
-            session_key = candidate_keys[0]
-
         static_session_token = (
             session_key
             or cleaned_session
@@ -1775,8 +1873,6 @@ class RAGPipeline:
             return static_response
 
         history = self.history_manager.get_history(user_id)
-
-        uploaded_scope = dict(self._uploaded_context or {})
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
