@@ -2430,6 +2430,7 @@ class RAGPipeline:
                 "I'm sorry, but I couldn't find that information in the available knowledge base.",
             )
             fallback = self._remove_placeholders(fallback)
+            html_fallback = self._normalise_answer_html(fallback)
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
             history_fingerprint = self._build_history_fingerprint(history)
@@ -2448,7 +2449,7 @@ class RAGPipeline:
                 except Exception:
                     pass
             follow_ups = self._build_followups(query, [])
-            return {
+            result_payload = {
                 "answer": html_fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
