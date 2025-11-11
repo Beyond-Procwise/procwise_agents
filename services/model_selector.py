@@ -1,10 +1,14 @@
 # ProcWise/services/model_selector.py
 
+import copy
 import hashlib
 import inspect
 import json
 import logging
 import re
+import html
+import threading
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -177,6 +181,127 @@ class RAGPipeline:
         self._nltk_processor = NLTKProcessor() if use_nltk else None
         if self._nltk_processor and not getattr(self._nltk_processor, "available", False):
             self._nltk_processor = None
+        self._cache_ttl = float(getattr(self.settings, "ask_cache_ttl_seconds", 90.0))
+        self._cache_max_entries = int(getattr(self.settings, "ask_cache_max_entries", 32))
+        self._answer_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_lock = threading.RLock()
+
+    def _cache_enabled(self) -> bool:
+        return self._cache_ttl > 0 and self._cache_max_entries > 0
+
+    def _purge_expired_cache(self, *, now: Optional[float] = None) -> None:
+        if not self._cache_enabled():
+            return
+        threshold = now if now is not None else time.monotonic()
+        with self._cache_lock:
+            expired_keys = [
+                key for key, (deadline, _)
+                in self._answer_cache.items()
+                if deadline <= threshold
+            ]
+            for key in expired_keys:
+                self._answer_cache.pop(key, None)
+
+    def _build_cache_key(
+        self,
+        query: str,
+        user_id: str,
+        session_id: Optional[str],
+        model_name: Optional[str],
+        doc_type: Optional[str],
+        product_type: Optional[str],
+    ) -> str:
+        payload = {
+            "query": str(query or "").strip(),
+            "user": str(user_id or "").strip(),
+            "session": str(session_id).strip() if session_id is not None else "",
+            "model": str(model_name).strip() if model_name is not None else "",
+            "doc_type": str(doc_type).strip() if doc_type is not None else "",
+            "product_type": str(product_type).strip() if product_type is not None else "",
+        }
+        normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _get_cached_response(self, cache_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not cache_key or not self._cache_enabled():
+            return None
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._answer_cache.get(cache_key)
+            if not entry:
+                return None
+            deadline, value = entry
+            if deadline <= now:
+                self._answer_cache.pop(cache_key, None)
+                return None
+            return copy.deepcopy(value)
+
+    def _store_cached_response(self, cache_key: Optional[str], value: Dict[str, Any]) -> None:
+        if not cache_key or not self._cache_enabled():
+            return
+        snapshot = copy.deepcopy(value)
+        expires_at = time.monotonic() + max(self._cache_ttl, 0.0)
+        with self._cache_lock:
+            self._purge_expired_cache(now=time.monotonic())
+            if len(self._answer_cache) >= self._cache_max_entries:
+                oldest_key: Optional[str] = None
+                oldest_deadline: Optional[float] = None
+                for key, (deadline, _) in self._answer_cache.items():
+                    if oldest_deadline is None or deadline < oldest_deadline:
+                        oldest_key = key
+                        oldest_deadline = deadline
+                if oldest_key is not None:
+                    self._answer_cache.pop(oldest_key, None)
+            self._answer_cache[cache_key] = (expires_at, snapshot)
+
+    def _render_html_answer(self, answer_text: str) -> str:
+        stripped = (answer_text or "").strip()
+        if not stripped:
+            return "<p></p>"
+
+        html_parts: List[str] = []
+        list_buffer: List[str] = []
+        list_type: Optional[str] = None
+
+        def flush_list() -> None:
+            nonlocal list_buffer, list_type
+            if not list_buffer:
+                return
+            tag = "ol" if list_type == "ol" else "ul"
+            html_parts.append(f"<{tag}>")
+            for item in list_buffer:
+                html_parts.append(f"<li>{html.escape(item)}</li>")
+            html_parts.append(f"</{tag}>")
+            list_buffer = []
+            list_type = None
+
+        for raw_line in stripped.splitlines():
+            line = raw_line.strip()
+            if not line:
+                flush_list()
+                continue
+            bullet_match = re.match(r"^[-*]\s+(.*)", line)
+            number_match = re.match(r"^(\d+)[\).]\s+(.*)", line)
+            if bullet_match:
+                if list_type not in (None, "ul"):
+                    flush_list()
+                list_type = "ul"
+                list_buffer.append(bullet_match.group(1).strip())
+                continue
+            if number_match:
+                if list_type not in (None, "ol"):
+                    flush_list()
+                list_type = "ol"
+                list_buffer.append(number_match.group(2).strip())
+                continue
+            flush_list()
+            html_parts.append(f"<p>{html.escape(line)}</p>")
+
+        flush_list()
+
+        if not html_parts:
+            return f"<p>{html.escape(stripped)}</p>"
+        return "".join(html_parts)
 
     def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
@@ -438,6 +563,8 @@ class RAGPipeline:
         history.append({"query": query, "answer": formatted_answer})
         self.history_manager.save_history(user_id, history)
 
+        html_answer = self._render_html_answer(formatted_answer)
+
         retrieved = {
             "source": "static_procurement_qa",
             "topic": payload.get("topic"),
@@ -446,7 +573,8 @@ class RAGPipeline:
         }
 
         return {
-            "answer": formatted_answer,
+            "answer": html_answer,
+            "answer_plaintext": formatted_answer,
             "follow_ups": follow_ups,
             "retrieved_documents": [retrieved],
         }
@@ -1565,6 +1693,24 @@ class RAGPipeline:
             product_type,
         )
 
+        cache_key: Optional[str] = None
+        cached_response: Optional[Dict[str, Any]] = None
+        if not files:
+            try:
+                cache_key = self._build_cache_key(
+                    query,
+                    user_id,
+                    session_id,
+                    model_name or llm_to_use,
+                    doc_type,
+                    product_type,
+                )
+            except Exception:
+                cache_key = None
+            cached_response = self._get_cached_response(cache_key)
+            if cached_response:
+                return cached_response
+
         raw_nltk_features: Optional[Dict[str, Any]] = None
         if self._nltk_processor:
             nltk_feature_record = self._nltk_processor.preprocess(query)
@@ -1625,6 +1771,7 @@ class RAGPipeline:
             session_id=static_session_token,
         )
         if static_response:
+            self._store_cached_response(cache_key, static_response)
             return static_response
 
         history = self.history_manager.get_history(user_id)
@@ -1824,11 +1971,15 @@ class RAGPipeline:
             history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
             follow_ups = self._build_followups(query, [])
-            return {
-                "answer": fallback,
+            html_answer = self._render_html_answer(fallback)
+            result_payload = {
+                "answer": html_answer,
+                "answer_plaintext": fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
             }
+            self._store_cached_response(cache_key, result_payload)
+            return result_payload
 
         focus_items = self._select_focus_items(knowledge_items)
         enumerated_items: List[Dict[str, Any]] = [dict(item) for item in focus_items]
@@ -1863,8 +2014,12 @@ class RAGPipeline:
         history.append({"query": self._redact_identifiers(query), "answer": answer})
         self.history_manager.save_history(user_id, history)
 
-        return {
-            "answer": answer,
+        html_answer = self._render_html_answer(answer)
+        result_payload = {
+            "answer": html_answer,
+            "answer_plaintext": answer,
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,
         }
+        self._store_cached_response(cache_key, result_payload)
+        return result_payload
