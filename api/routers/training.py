@@ -61,6 +61,10 @@ class TrainingDispatchResponse(BaseModel):
         default=None,
         description="Summary of the RAG qwen3-30b instruction example generation run",
     )
+    instruction_fine_tuning: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Summary of the QLoRA fine-tuning pipeline execution",
+    )
 
 
 def _get_training_endpoint(request: Request) -> ModelTrainingEndpoint:
@@ -106,6 +110,7 @@ def trigger_training_dispatch(
     workflow_context = result.get("workflow_context", [])
     phi4_fine_tuning = result.get("phi4_fine_tuning")
     rag_qwen30b_finetuning = result.get("rag_qwen30b_finetuning")
+    instruction_fine_tuning = result.get("instruction_fine_tuning")
     summaries = [
         TrainingJobSummary(
             job_id=job.get("job_id"),
@@ -123,4 +128,5 @@ def trigger_training_dispatch(
         workflow_context=workflow_context,
         phi4_fine_tuning=phi4_fine_tuning,
         rag_qwen30b_finetuning=rag_qwen30b_finetuning,
+        instruction_fine_tuning=instruction_fine_tuning,
     )

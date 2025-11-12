@@ -38,3 +38,9 @@ requests
 loguru
 rapidfuzz
 retrying
+accelerate
+bitsandbytes
+datasets
+peft
+trl
+unsloth
