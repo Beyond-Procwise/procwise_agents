@@ -34,6 +34,11 @@ from repositories import (
     workflow_round_response_repo,
     workflow_lifecycle_repo,
 )
+
+try:  # pragma: no cover - optional settings dependency
+    from config.settings import settings as app_settings
+except Exception:  # pragma: no cover - fallback when settings unavailable
+    app_settings = None
 from repositories.supplier_interaction_repo import SupplierInteractionRow
 from repositories.supplier_response_repo import SupplierResponseRow
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
@@ -2462,6 +2467,21 @@ def run_email_watcher_for_workflow(
         "completed" if result.get("complete") else "pending"
     )
     status = "processed" if watcher_status == "completed" else watcher_status
+
+    workflow_status: Optional[str] = None
+    try:
+        lifecycle_row = workflow_lifecycle_repo.get_lifecycle(workflow_key)
+    except Exception:
+        logger.debug(
+            "Failed to load workflow lifecycle before returning watcher result for %s",
+            workflow_key,
+            exc_info=True,
+        )
+    else:
+        if lifecycle_row:
+            workflow_status = lifecycle_row.get("watcher_status") or lifecycle_row.get(
+                "negotiation_status"
+            )
 
     response_payload = {
         "status": status,
