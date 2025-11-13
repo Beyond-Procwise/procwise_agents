@@ -191,6 +191,7 @@ class RAGQwen30b:
                     query_vector=q_vec,
                     limit=top_k,
                     vector_name=named_vector,
+                    with_vectors=True,
                 )
             except Exception:
                 logger.exception("Qdrant search failed for collection %s; continuing", coll)
