@@ -284,7 +284,8 @@ def test_pipeline_answer_returns_documents(monkeypatch):
     assert "[doc" not in result["answer"]
     assert "[redacted" not in result["answer"].lower()
     assert result["answer"].startswith("<section")
-    assert "<h2>Response</h2>" in result["answer"]
+    assert "<article class=\"llm-answer__content\">" in result["answer"]
+    assert "<h2 class=\"llm-answer__title\">Answer</h2>" not in result["answer"]
     assert "s" in result["answer"]
     assert "\n-" not in result["answer"]
     assert len(result["follow_ups"]) == 3
@@ -345,9 +346,10 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
 
     answer_html = result["answer"]
     assert answer_html.startswith("<section")
-    assert "<h2>Response</h2>" in answer_html
+    assert "<article class=\"llm-answer__content\">" in answer_html
+    assert "<h2 class=\"llm-answer__title\">Answer</h2>" not in answer_html
     assert (
-        "I'm sorry, but I couldn't find that information in the available knowledge base."
+        "I&#x27;m sorry, but I couldn&#x27;t find that information in the available knowledge base."
         in answer_html
     )
     assert result["retrieved_documents"] == []
@@ -418,14 +420,16 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
     answer_html = result["answer"]
     answer_plain = result["answer_plaintext"]
 
-    assert answer.startswith("<section")
+    assert answer_html.startswith("<section")
     assert (
         'For your question "How does this compare with the same period last year?",'
-        in answer
+        in answer_html
     )
-    assert "Sure" not in answer
-    assert "14% higher" in answer
-    assert any(closing in answer for closing in RAGPipeline._STATIC_CLOSINGS)
+    assert "Sure" not in answer_html
+    assert "14% higher" in answer_html
+    assert any(
+        closing in answer_html for closing in RAGPipeline._STATIC_CLOSINGS
+    )
     assert result["follow_ups"] == [
         "Show me the savings trend over the past 6 months.",
         "How much is still in the savings pipeline?",

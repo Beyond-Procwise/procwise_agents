@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import re
-import html
 import threading
 import time
 from datetime import datetime
@@ -23,6 +22,7 @@ from config.settings import settings
 from qdrant_client import models
 from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
+from services.redis_client import get_redis_client
 from .rag_service import RAGService
 from .nltk_pipeline import NLTKProcessor
 from utils.gpu import configure_gpu, load_cross_encoder
@@ -41,37 +41,198 @@ configure_gpu()
 
 
 class ChatHistoryManager:
-    """Manages chat history using an AWS S3 bucket."""
+    """Manages chat history in S3 with a Redis-backed ephemeral cache."""
 
-    def __init__(self, s3_client, bucket_name):
+    _CACHE_KEY_PREFIX = "chat_history_cache:data:"
+    _CACHE_INDEX_KEY = "chat_history_cache:index"
+
+    def __init__(
+        self,
+        s3_client,
+        bucket_name,
+        *,
+        cache_ttl: float = 0.0,
+        max_cache_entries: int = 0,
+        redis_client=None,
+    ):
         self.s3_client = s3_client
         self.bucket_name = bucket_name
         self.prefix = 'chat_history/'
+        self._cache_ttl = max(0.0, float(cache_ttl))
+        self._max_cache_entries = max(0, int(max_cache_entries))
+        self._cache_lock = threading.RLock()
+        self._redis = redis_client or get_redis_client()
+        self._cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+
+    def _cache_enabled(self) -> bool:
+        return self._cache_ttl > 0 and self._max_cache_entries > 0
+
+    def _use_redis(self) -> bool:
+        return self._redis is not None and self._cache_enabled()
+
+    def _redis_cache_key(self, key: str) -> str:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return f"{self._CACHE_KEY_PREFIX}{digest}"
+
+    def _evict_cache_entry(self, key: str) -> None:
+        if not key or not self._cache_enabled():
+            return
+        if self._use_redis():
+            redis_key = self._redis_cache_key(key)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.delete(redis_key)
+                pipe.zrem(self._CACHE_INDEX_KEY, redis_key)
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to evict chat history cache entry from Redis")
+        else:
+            with self._cache_lock:
+                self._cache.pop(key, None)
+
+    def _evict_redis_excess(self) -> None:
+        if not self._use_redis():
+            return
+        try:
+            current_size = self._redis.zcard(self._CACHE_INDEX_KEY) or 0
+            if current_size <= self._max_cache_entries:
+                return
+            excess = int(current_size - self._max_cache_entries)
+            if excess <= 0:
+                return
+            stale_keys = self._redis.zrange(self._CACHE_INDEX_KEY, 0, excess - 1) or []
+            if not stale_keys:
+                return
+            pipe = self._redis.pipeline()
+            pipe.delete(*stale_keys)
+            pipe.zrem(self._CACHE_INDEX_KEY, *stale_keys)
+            pipe.execute()
+        except Exception:
+            logger.exception("Failed to evict excess chat history cache entries from Redis")
+
+    def _get_cached(self, key: str) -> Optional[List[Dict[str, Any]]]:
+        if not self._cache_enabled() or not key:
+            return None
+        if self._use_redis():
+            redis_key = self._redis_cache_key(key)
+            try:
+                raw = self._redis.get(redis_key)
+            except Exception:
+                logger.exception("Failed to read chat history cache from Redis")
+                return None
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                try:
+                    raw = raw.decode("utf-8")
+                except Exception:
+                    self._evict_cache_entry(key)
+                    return None
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                self._evict_cache_entry(key)
+                return None
+            if not isinstance(payload, list):
+                return []
+            ttl_seconds = max(int(self._cache_ttl), 1)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.expire(redis_key, ttl_seconds)
+                pipe.zadd(self._CACHE_INDEX_KEY, {redis_key: time.time()})
+                pipe.expire(self._CACHE_INDEX_KEY, max(ttl_seconds * 2, ttl_seconds + 60))
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to refresh chat history cache TTL in Redis")
+            return copy.deepcopy(payload)
+
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if not cached:
+                return None
+            deadline, payload = cached
+            if deadline <= now:
+                self._cache.pop(key, None)
+                return None
+            return copy.deepcopy(payload)
+
+    def _store_cache(self, key: str, value: List[Dict[str, Any]]) -> None:
+        if not self._cache_enabled() or not key:
+            return
+        if self._use_redis():
+            try:
+                payload = json.dumps(value)
+            except Exception:
+                logger.exception("Failed to serialise chat history for Redis cache")
+                return
+            redis_key = self._redis_cache_key(key)
+            ttl_seconds = max(int(self._cache_ttl), 1)
+            try:
+                pipe = self._redis.pipeline()
+                pipe.set(redis_key, payload, ex=ttl_seconds)
+                pipe.zadd(self._CACHE_INDEX_KEY, {redis_key: time.time()})
+                pipe.expire(self._CACHE_INDEX_KEY, max(ttl_seconds * 2, ttl_seconds + 60))
+                pipe.execute()
+            except Exception:
+                logger.exception("Failed to write chat history cache entry to Redis")
+                return
+            self._evict_redis_excess()
+            return
+
+        deadline = time.monotonic() + self._cache_ttl
+        snapshot = copy.deepcopy(value)
+        with self._cache_lock:
+            self._cache[key] = (deadline, snapshot)
+            if len(self._cache) > self._max_cache_entries:
+                # Drop the stalest entry to keep the cache bounded.
+                oldest_key = min(self._cache.items(), key=lambda item: item[1][0])[0]
+                if oldest_key != key:
+                    self._cache.pop(oldest_key, None)
 
     def get_history(self, user_id: str) -> List[Dict[str, Any]]:
         key = f"{self.prefix}{user_id}.json"
+        cached = self._get_cached(key)
+        if cached is not None:
+            return cached
+
         try:
             obj = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
-            history: List[Dict[str, Any]] = json.loads(obj['Body'].read().decode('utf-8'))
-            # Ensure answers are JSON-serialisable. Non-string primitives are cast to strings
-            # while structured data (dicts/lists) is preserved for downstream consumers.
-            for item in history:
-                ans = item.get("answer")
-                if ans is not None and not isinstance(ans, (str, list, dict)):
-                    item["answer"] = str(ans)
-            return history
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
+                history: List[Dict[str, Any]] = []
+                self._store_cache(key, history)
                 return []
             logger.error(f"S3 get_object error for key {key}: {e}")
             raise
 
+        history = json.loads(obj['Body'].read().decode('utf-8'))
+        if not isinstance(history, list):
+            history = []
+        # Ensure answers are JSON-serialisable. Non-string primitives are cast to strings
+        # while structured data (dicts/lists) is preserved for downstream consumers.
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            ans = item.get("answer")
+            if ans is not None and not isinstance(ans, (str, list, dict)):
+                item["answer"] = str(ans)
+
+        self._store_cache(key, history)
+        return history
+
     def save_history(self, user_id: str, history: List):
         key = f"{self.prefix}{user_id}.json"
         try:
-            self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=json.dumps(history, indent=2))
+            payload = json.dumps(history, indent=2)
+            self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=payload)
         except Exception as e:
             logger.error(f"S3 put_object error for key {key}: {e}")
+        else:
+            if history:
+                self._store_cache(key, list(history))
+            else:
+                self._evict_cache_entry(key)
 
 
 class RAGPipeline:
@@ -185,7 +346,14 @@ class RAGPipeline:
     ):
         self.agent_nick = agent_nick
         self.settings = agent_nick.settings
-        self.history_manager = ChatHistoryManager(agent_nick.s3_client, agent_nick.settings.s3_bucket_name)
+        history_cache_ttl = getattr(self.settings, "chat_history_cache_ttl", 15.0)
+        history_cache_size = getattr(self.settings, "chat_history_cache_max_entries", 256)
+        self.history_manager = ChatHistoryManager(
+            agent_nick.s3_client,
+            agent_nick.settings.s3_bucket_name,
+            cache_ttl=float(history_cache_ttl),
+            max_cache_entries=int(history_cache_size),
+        )
         default_rag_model = getattr(self.settings, "rag_model", None)
         fallback_default = default_rag_model or getattr(
             self.settings, "extraction_model", settings.extraction_model
@@ -329,6 +497,37 @@ class RAGPipeline:
             normalised = repr(payload)
         return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
+    def _build_history_fingerprint(
+        self, history: Sequence[Dict[str, Any]]
+    ) -> Optional[str]:
+        if not history:
+            return None
+        window: Sequence[Dict[str, Any]] = history[-5:]
+        payload = {
+            "length": len(history),
+            "tail": [],
+        }
+        for item in window:
+            try:
+                query = item.get("query")
+            except AttributeError:
+                query = None
+            try:
+                answer = item.get("answer")
+            except AttributeError:
+                answer = None
+            payload["tail"].append(
+                {
+                    "query": self._stringify_for_cache(query)[:256],
+                    "answer": self._stringify_for_cache(answer)[:256],
+                }
+            )
+        try:
+            serialised = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            serialised = repr(payload)
+        return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
+
     def _build_cache_key(
         self,
         query: str,
@@ -339,6 +538,7 @@ class RAGPipeline:
         product_type: Optional[str],
         *,
         context_fingerprint: Optional[str] = None,
+        history_fingerprint: Optional[str] = None,
     ) -> str:
         payload = {
             "query": str(query or "").strip(),
@@ -348,6 +548,7 @@ class RAGPipeline:
             "doc_type": str(doc_type).strip() if doc_type is not None else "",
             "product_type": str(product_type).strip() if product_type is not None else "",
             "uploads": str(context_fingerprint or "").strip(),
+            "history": str(history_fingerprint or "").strip(),
         }
         normalised = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
@@ -385,53 +586,7 @@ class RAGPipeline:
             self._answer_cache[cache_key] = (expires_at, snapshot)
 
     def _render_html_answer(self, answer_text: str) -> str:
-        stripped = (answer_text or "").strip()
-        if not stripped:
-            return "<p></p>"
-
-        html_parts: List[str] = []
-        list_buffer: List[str] = []
-        list_type: Optional[str] = None
-
-        def flush_list() -> None:
-            nonlocal list_buffer, list_type
-            if not list_buffer:
-                return
-            tag = "ol" if list_type == "ol" else "ul"
-            html_parts.append(f"<{tag}>")
-            for item in list_buffer:
-                html_parts.append(f"<li>{html.escape(item)}</li>")
-            html_parts.append(f"</{tag}>")
-            list_buffer = []
-            list_type = None
-
-        for raw_line in stripped.splitlines():
-            line = raw_line.strip()
-            if not line:
-                flush_list()
-                continue
-            bullet_match = re.match(r"^[-*]\s+(.*)", line)
-            number_match = re.match(r"^(\d+)[\).]\s+(.*)", line)
-            if bullet_match:
-                if list_type not in (None, "ul"):
-                    flush_list()
-                list_type = "ul"
-                list_buffer.append(bullet_match.group(1).strip())
-                continue
-            if number_match:
-                if list_type not in (None, "ol"):
-                    flush_list()
-                list_type = "ol"
-                list_buffer.append(number_match.group(2).strip())
-                continue
-            flush_list()
-            html_parts.append(f"<p>{html.escape(line)}</p>")
-
-        flush_list()
-
-        if not html_parts:
-            return f"<p>{html.escape(stripped)}</p>"
-        return "".join(html_parts)
+        return self._normalise_answer_html(answer_text)
 
     def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
@@ -1656,7 +1811,7 @@ class RAGPipeline:
 
         lines.append("Draft summary derived from retrieval:\n" + draft_answer)
         lines.append(
-            "Transform the draft into a natural response (ideally one or two concise paragraphs). Start with a brief acknowledgement or collegial lead-in, deliver the direct answer, weave in the most relevant knowledge details, introduce short bullet or numbered lists when clarifying multiple points, point out any gaps or next steps, and keep the tone warm, human, and unscripted."
+            "Transform the draft into a natural response (ideally one or two concise paragraphs). Start with a brief acknowledgement or collegial lead-in, deliver the direct answer, weave in the most relevant knowledge details, introduce short bullet or numbered lists when clarifying multiple points, point out any gaps or next steps, and keep the tone warm, conversational, and unscripted—sound like a trusted teammate rather than a script."
         )
         return "\n\n".join(lines)
 
@@ -1707,16 +1862,28 @@ class RAGPipeline:
 
     def _plain_text_to_html(self, text: str) -> str:
         if not text:
-            return "<p>No answer available.</p>"
+            return (
+                '<section class="llm-answer__segment">'
+                "<p>No answer available.</p>"
+                "</section>"
+            )
 
         normalised = text.replace("\r\n", "\n").replace("\r", "\n")
         html_parts: List[str] = []
         current_list: List[str] = []
 
+        def append_segment(inner_html: str) -> None:
+            html_parts.append(
+                '<section class="llm-answer__segment">' + inner_html + "</section>"
+            )
+
         def flush_list() -> None:
             nonlocal current_list
             if current_list:
-                html_parts.append("<ul>" + "".join(f"<li>{item}</li>" for item in current_list) + "</ul>")
+                list_items = "".join(f"<li>{item}</li>" for item in current_list)
+                append_segment(
+                    '<ul class="llm-answer__pointers">' + list_items + "</ul>"
+                )
                 current_list = []
 
         bullet_pattern = re.compile(r"^(?:[-*\u2022]|\d+[\.)])\s+")
@@ -1731,11 +1898,14 @@ class RAGPipeline:
                 current_list.append(escape(content))
                 continue
             flush_list()
-            html_parts.append(f"<p>{escape(line)}</p>")
+            append_segment(f"<p>{escape(line)}</p>")
 
         flush_list()
 
-        return "".join(html_parts) or "<p>No answer available.</p>"
+        if not html_parts:
+            append_segment("<p>No answer available.</p>")
+
+        return "".join(html_parts)
 
     def _normalise_answer_html(self, answer: Any) -> str:
         if isinstance(answer, (list, dict)):
@@ -1768,7 +1938,13 @@ class RAGPipeline:
             cleaned = "".join(cleaned_parts)
             body = self._plain_text_to_html(cleaned)
 
-        return f"<section><h2>Response</h2>{body}</section>"
+        return (
+            '<section class="llm-answer">'
+            '<article class="llm-answer__content">'
+            f"{body}"
+            "</article>"
+            "</section>"
+        )
 
     def _build_structured_answer(
         self,
@@ -1925,13 +2101,33 @@ class RAGPipeline:
         else:
             base_options["temperature"] = min(0.7, temperature + 0.1)
         base_options.setdefault("top_p", 0.9)
+        chat_kwargs = {
+            "model": model,
+            "messages": messages,
+            "options": base_options,
+            "format": "json",
+        }
+
+        stream_enabled = bool(getattr(settings, "stream_llm_responses", False))
+        if stream_enabled:
+            try:
+                stream = ollama.chat(**{**chat_kwargs, "stream": True})
+                content_chunks: List[str] = []
+                for event in stream:
+                    fragment = (event or {}).get("message", {}).get("content")
+                    if fragment:
+                        content_chunks.append(fragment)
+                content = "".join(content_chunks)
+                if content:
+                    return json.loads(content)
+                logger.warning("Streaming response returned no content; retrying without streaming")
+            except json.JSONDecodeError as exc:
+                logger.error("Error parsing streamed JSON response: %s", exc)
+            except Exception as exc:
+                logger.error("Streaming LLM response failed: %s", exc)
+
         try:
-            response = ollama.chat(
-                model=model,
-                messages=messages,
-                options=base_options,
-                format="json",
-            )
+            response = ollama.chat(**chat_kwargs)
             content = response.get("message", {}).get("content", "")
             return json.loads(content)
         except json.JSONDecodeError as e:
@@ -1959,6 +2155,9 @@ class RAGPipeline:
             doc_type,
             product_type,
         )
+
+        history = self.history_manager.get_history(user_id)
+        history_fingerprint = self._build_history_fingerprint(history)
 
         candidate_keys: List[str] = []
         cleaned_session = (
@@ -2005,6 +2204,7 @@ class RAGPipeline:
                     doc_type,
                     product_type,
                     context_fingerprint=upload_fingerprint,
+                    history_fingerprint=history_fingerprint,
                 )
             except Exception:
                 cache_key = None
@@ -2048,7 +2248,6 @@ class RAGPipeline:
             self._store_cached_response(cache_key, static_response)
             return static_response
 
-        history = self.history_manager.get_history(user_id)
         uploaded_documents: List[str] = []
         try:
             uploaded_documents = [
@@ -2240,11 +2439,25 @@ class RAGPipeline:
             )
             fallback = self._remove_placeholders(fallback)
             html_fallback = self._normalise_answer_html(fallback)
-            history = self.history_manager.get_history(user_id)
-            history.append({"query": self._redact_identifiers(query), "answer": html_fallback})
+            history.append({"query": self._redact_identifiers(query), "answer": fallback})
             self.history_manager.save_history(user_id, history)
+            history_fingerprint = self._build_history_fingerprint(history)
+            if cache_key:
+                try:
+                    cache_key = self._build_cache_key(
+                        query,
+                        user_id,
+                        session_id,
+                        model_name or llm_to_use,
+                        doc_type,
+                        product_type,
+                        context_fingerprint=upload_fingerprint,
+                        history_fingerprint=history_fingerprint,
+                    )
+                except Exception:
+                    pass
             follow_ups = self._build_followups(query, [])
-            return {
+            result_payload = {
                 "answer": html_fallback,
                 "follow_ups": follow_ups,
                 "retrieved_documents": [],
@@ -2285,6 +2498,21 @@ class RAGPipeline:
         html_answer = self._normalise_answer_html(answer)
         history.append({"query": self._redact_identifiers(query), "answer": html_answer})
         self.history_manager.save_history(user_id, history)
+        history_fingerprint = self._build_history_fingerprint(history)
+        if cache_key:
+            try:
+                cache_key = self._build_cache_key(
+                    query,
+                    user_id,
+                    session_id,
+                    model_name or llm_to_use,
+                    doc_type,
+                    product_type,
+                    context_fingerprint=upload_fingerprint,
+                    history_fingerprint=history_fingerprint,
+                )
+            except Exception:
+                pass
 
         return {
             "answer": html_answer,
