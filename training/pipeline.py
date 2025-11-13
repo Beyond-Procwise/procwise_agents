@@ -104,7 +104,7 @@ class TrainConfig:
     )
     bf16: bool = True
     packing: bool = True
-    use_unsloth: bool = False
+    use_unsloth: bool = True
     chat_template: Optional[str] = None
     seed: Optional[int] = None
 
