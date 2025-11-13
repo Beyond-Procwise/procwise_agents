@@ -32,6 +32,7 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
         return [np.zeros(3) for _ in chunks]
 
     def fake_upsert(collection_name, points, wait):
+        captured["collection"] = collection_name
         captured["points"] = points
 
     nick = SimpleNamespace(
@@ -46,6 +47,7 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
 
     agent._vectorize_document("hello world", "1", ["Invoice"], ["Hardware"], "doc.pdf")
 
+    assert captured["collection"] == "test_invoice"
     payload = captured["points"][0].payload
     assert payload["document_type"] == "invoice"
     assert payload["product_type"] == "hardware"
@@ -103,7 +105,9 @@ def test_contract_docs_are_persisted_and_vectorized(monkeypatch):
             ocr_text="",
         ),
     )
-    monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Contract")
+    monkeypatch.setattr(
+        agent, "_classify_doc_type", lambda text, **kwargs: "Contract"
+    )
     monkeypatch.setattr(agent, "_classify_product_type", lambda t: "it hardware")
     monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "C123")
     monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: captured.setdefault("persist", True))
@@ -162,7 +166,9 @@ def test_raw_payload_merges_into_persistence(monkeypatch):
             ocr_text="",
         ),
     )
-    monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Invoice")
+    monkeypatch.setattr(
+        agent, "_classify_doc_type", lambda text, **kwargs: "Invoice"
+    )
     monkeypatch.setattr(agent, "_classify_product_type", lambda t: "hardware")
     monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "")
     monkeypatch.setattr(agent, "_vectorize_document", lambda *args, **kwargs: None)
@@ -282,7 +288,9 @@ def test_traceability_includes_validation_review_flag(monkeypatch):
         routing_log=[{"page": 1, "route": "digital"}],
     )
     monkeypatch.setattr(agent, "_extract_text", lambda *args, **kwargs: bundle)
-    monkeypatch.setattr(agent, "_classify_doc_type", lambda t: "Invoice")
+    monkeypatch.setattr(
+        agent, "_classify_doc_type", lambda text, **kwargs: "Invoice"
+    )
     monkeypatch.setattr(agent, "_classify_product_type", lambda t: "hardware")
     monkeypatch.setattr(agent, "_extract_unique_id", lambda t, dt: "INV-2")
     monkeypatch.setattr(agent, "_persist_to_postgres", lambda *args, **kwargs: None)
@@ -849,6 +857,17 @@ def test_classify_doc_type_keyword_scoring(monkeypatch):
         agent._classify_doc_type("PO number PO-2 to purchase goods")
         == "Purchase_Order"
     )
+
+
+def test_classify_doc_type_prefers_llamaparse_metadata():
+    """Metadata produced by LlamaParse should take precedence over heuristics."""
+
+    nick = SimpleNamespace(settings=SimpleNamespace(extraction_model="m"))
+    agent = DataExtractionAgent(nick)
+    bundle = DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
+    bundle.llamaparse_metadata = {"document_type": "Tax Invoice"}
+
+    assert agent._classify_doc_type("ambiguous", text_bundle=bundle) == "Invoice"
 
 
 def test_classify_doc_type_llm_fallback(monkeypatch):

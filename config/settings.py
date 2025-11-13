@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     static_policy_auto_ingest: bool = Field(
         default=True, env="STATIC_POLICY_AUTO_INGEST"
     )
+    llamaparse_api_key: Optional[str] = Field(default=None, env="LLAMAPARSE_API_KEY")
+    llamaparse_base_url: Optional[str] = Field(default=None, env="LLAMAPARSE_BASE_URL")
     context_training_data_dir: str = Field(
         default=os.path.join(PROJECT_ROOT, "resources", "training", "conversations"),
         env="CONTEXT_TRAINING_DATA_DIR",

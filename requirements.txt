@@ -44,3 +44,4 @@ datasets
 peft
 trl
 unsloth
+llama-parse==0.6.79
