@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email import message_from_bytes
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from agents.base_agent import BaseAgent, AgentContext, AgentOutput, AgentStatus
 from services.email_dispatch_chain_store import pending_dispatch_count
@@ -22,10 +22,10 @@ from repositories import (
 )
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
-from services.email_watcher import run_email_watcher_for_workflow
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.negotiation_agent import NegotiationAgent
+    from services.email_watcher import run_email_watcher_for_workflow  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,8 @@ class SupplierInteractionAgent(BaseAgent):
         self.device = configure_gpu()
         os.environ.setdefault("PROCWISE_DEVICE", self.device)
         self._email_watcher = None
+        self._watcher_runner: Optional[Callable[..., Dict[str, Any]]] = None
+        self._watcher_runner_retry_at = 0.0
         self._negotiation_agent = None
         self._response_coordinator = SupplierResponseWorkflow()
         self._dispatch_schema_ready = False
@@ -631,6 +633,26 @@ class SupplierInteractionAgent(BaseAgent):
             "unique_ids": [row.unique_id for row in rows if row.unique_id],
         }
 
+    def _get_email_watcher_runner(self) -> Optional[Callable[..., Dict[str, Any]]]:
+        if self._watcher_runner is not None:
+            return self._watcher_runner
+
+        if time.monotonic() < self._watcher_runner_retry_at:
+            return None
+
+        try:
+            from services.email_watcher import run_email_watcher_for_workflow
+        except Exception:
+            self._watcher_runner_retry_at = time.monotonic() + 30.0
+            logger.debug(
+                "Email watcher runner unavailable; supplier agent will skip triggers",
+                exc_info=True,
+            )
+            return None
+        else:
+            self._watcher_runner = run_email_watcher_for_workflow
+            return self._watcher_runner
+
     def _trigger_email_watcher(self, workflow_id: Optional[str]) -> None:
         workflow_key = self._coerce_text(workflow_id)
         if not workflow_key:
@@ -640,8 +662,13 @@ class SupplierInteractionAgent(BaseAgent):
         if now - last_run < self.WATCHER_COOLDOWN_SECONDS:
             return
         self._watcher_last_run[workflow_key] = now
+
+        runner = self._get_email_watcher_runner()
+        if runner is None:
+            return
+
         try:
-            run_email_watcher_for_workflow(
+            runner(
                 workflow_id=workflow_key,
                 run_id=None,
                 wait_seconds_after_last_dispatch=0,
