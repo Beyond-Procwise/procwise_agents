@@ -18,12 +18,7 @@ from services.document_extractor import LayoutAwareParser
 from services.semantic_chunker import SemanticChunker
 from services.semantic_cache import SemanticCacheManager
 
-DISALLOWED_METADATA_KEYS: set[str] = {
-    "effective_date",
-    "supplier",
-    "doc_version",
-    "round_id",
-}
+DISALLOWED_METADATA_KEYS: set[str] = set()
 
 logger = logging.getLogger(__name__)
 

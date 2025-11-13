@@ -15,7 +15,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Set
 
 from html import escape
 import ollama
-import pdfplumber
+
+try:  # pragma: no cover - optional PDF utility
+    import pdfplumber  # type: ignore
+except Exception:  # pragma: no cover - gracefully degrade without pdfplumber
+    pdfplumber = None  # type: ignore
 from botocore.exceptions import ClientError
 from sentence_transformers import CrossEncoder
 from config.settings import settings
@@ -38,6 +42,8 @@ _CITATION_GUIDELINES_PATH = (
 logger = logging.getLogger(__name__)
 
 configure_gpu()
+
+PDFPLUMBER_AVAILABLE = pdfplumber is not None
 
 
 class ChatHistoryManager:
@@ -872,7 +878,13 @@ class RAGPipeline:
         results: List[Dict[str, str]] = []
         for content_bytes, filename in files:
             try:
-                if filename.lower().endswith('.pdf'):
+                if filename.lower().endswith(".pdf"):
+                    if not PDFPLUMBER_AVAILABLE:
+                        logger.info(
+                            "pdfplumber is not available; skipping PDF text extraction for %s",
+                            filename,
+                        )
+                        continue
                     with pdfplumber.open(BytesIO(content_bytes)) as pdf:
                         text = "\n".join(
                             page.extract_text() for page in pdf.pages if page.extract_text()

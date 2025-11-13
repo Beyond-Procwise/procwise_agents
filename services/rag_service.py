@@ -2,6 +2,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,8 +15,10 @@ from types import SimpleNamespace
 import hashlib
 
 import numpy as np
-import faiss
-from rank_bm25 import BM25Okapi
+try:  # pragma: no cover - optional sparse retriever dependency
+    from rank_bm25 import BM25Okapi  # type: ignore
+except Exception:  # pragma: no cover - gracefully degrade when unavailable
+    BM25Okapi = None  # type: ignore
 from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from utils.gpu import configure_gpu, load_cross_encoder
@@ -23,12 +26,12 @@ from services.semantic_cache import SemanticCacheManager
 from services.document_extractor import LayoutAwareParser
 from services.semantic_chunker import SemanticChunker, SemanticChunk
 
-DISALLOWED_METADATA_KEYS: Set[str] = {
-    "effective_date",
-    "supplier",
-    "doc_version",
-    "round_id",
-}
+try:  # pragma: no cover - FAISS optional dependency
+    import faiss  # type: ignore
+except Exception:  # pragma: no cover - gracefully degrade when unavailable
+    faiss = None  # type: ignore
+
+DISALLOWED_METADATA_KEYS: Set[str] = set()
 
 _TRAINING_ROOT = (
     Path(__file__).resolve().parent.parent
@@ -74,7 +77,11 @@ class RAGService:
             "learning",
         )
         # Local FAISS and BM25 indexes to complement Qdrant
+        self._faiss_available = faiss is not None
+        self._faiss_warned = False
         self._faiss_index = None
+        self._bm25_available = BM25Okapi is not None
+        self._bm25_warned = False
         self._doc_vectors: List[np.ndarray] = []
         self._documents: List[Dict] = []  # payloads with content
         self._bm25 = None
@@ -102,11 +109,22 @@ class RAGService:
         self._prefetch_limit = max(
             int(getattr(self.settings, "rag_prefetch_limit", 48) or 1), 1
         )
+        ratio = float(getattr(self.settings, "rag_prefetch_ratio", 2.2) or 2.0)
+        self._prefetch_ratio = max(1.2, ratio)
+        self._prefetch_cap = max(
+            int(getattr(self.settings, "rag_prefetch_cap", 32) or 1), 8
+        )
         self._reranker_batch_size = max(
             int(getattr(self.settings, "rag_reranker_batch_size", 32) or 1), 1
         )
         self._reranker_max_chars = max(
             int(getattr(self.settings, "rag_reranker_max_chars", 1400) or 256), 256
+        )
+        self._reranker_limit = max(
+            int(getattr(self.settings, "rag_reranker_limit", 12) or 1), 1
+        )
+        self._reranker_score_floor = float(
+            getattr(self.settings, "rag_reranker_score_floor", 0.35) or 0.0
         )
         self._rerank_cache_size = max(
             int(getattr(self.settings, "rag_reranker_cache_size", 384) or 0), 0
@@ -588,6 +606,22 @@ class RAGService:
                     return params
             return params
 
+        def _wrap_hits(raw_hits: Optional[Sequence[Any]]) -> List[SimpleNamespace]:
+            wrapped: List[SimpleNamespace] = []
+            for hit in raw_hits or []:
+                payload = dict(getattr(hit, "payload", {}) or {})
+                payload.setdefault("collection_name", collection_name)
+                wrapped.append(
+                    SimpleNamespace(
+                        id=str(getattr(hit, "id", payload.get("record_id"))),
+                        payload=payload,
+                        score=float(getattr(hit, "score", 0.0)),
+                    )
+                )
+            return wrapped
+
+        need_exact_retry = False
+        raw_hits: Optional[Sequence[Any]] = None
         try:
             raw_hits = self.client.search(
                 **search_kwargs,
@@ -599,49 +633,41 @@ class RAGService:
             logger.warning(
                 "Qdrant search failed for collection %s", collection_name, exc_info=True
             )
-            return []
+            need_exact_retry = True
         except Exception:
             logger.warning(
                 "Qdrant search failed for collection %s", collection_name, exc_info=True
             )
+            need_exact_retry = True
+        else:
+            return _wrap_hits(raw_hits)
+
+        if not need_exact_retry:
             return []
 
-        if not raw_hits:
-            try:
-                raw_hits = self.client.search(
-                    **search_kwargs,
-                    search_params=_copy_params(self._qdrant_exact_search_params),
-                )
-            except UnexpectedResponse as exc:
-                if getattr(exc, "status_code", None) == 404:
-                    return []
-                logger.warning(
-                    "Exact Qdrant search failed for collection %s",
-                    collection_name,
-                    exc_info=True,
-                )
-                return []
-            except Exception:
-                logger.warning(
-                    "Exact Qdrant search failed for collection %s",
-                    collection_name,
-                    exc_info=True,
-                )
-                return []
-
-        wrapped: List[SimpleNamespace] = []
-        for hit in raw_hits or []:
-            payload = dict(getattr(hit, "payload", {}) or {})
-            payload.setdefault("collection_name", collection_name)
-            wrapped.append(
-                SimpleNamespace(
-                    id=str(getattr(hit, "id", payload.get("record_id"))),
-                    payload=payload,
-                    score=float(getattr(hit, "score", 0.0)),
-                )
+        try:
+            raw_hits = self.client.search(
+                **search_kwargs,
+                search_params=_copy_params(self._qdrant_exact_search_params),
             )
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return []
+            logger.warning(
+                "Exact Qdrant search failed for collection %s",
+                collection_name,
+                exc_info=True,
+            )
+            return []
+        except Exception:
+            logger.warning(
+                "Exact Qdrant search failed for collection %s",
+                collection_name,
+                exc_info=True,
+            )
+            return []
 
-        return wrapped
+        return _wrap_hits(raw_hits)
 
     def _search_collections_parallel(
         self,
@@ -1012,15 +1038,27 @@ class RAGService:
                 self._bm25_corpus.append([])
 
         if new_vectors:
-            dim = len(new_vectors[0])
-            if self._faiss_index is None:
-                index = faiss.IndexFlatIP(dim)
-                index = self._maybe_init_gpu_index(index)
-                self._faiss_index = index
-            stacked = np.vstack(new_vectors)
-            self._faiss_index.add(stacked)
-            if self._bm25_corpus:
+            if self._bm25_corpus and self._bm25_available:
                 self._bm25 = BM25Okapi(self._bm25_corpus)
+            elif self._bm25_corpus and not self._bm25_warned and not self._bm25_available:
+                logger.info(
+                    "rank_bm25 is not installed; skipping sparse BM25 index for RAGService."
+                )
+                self._bm25_warned = True
+
+            if self._faiss_available:
+                dim = len(new_vectors[0])
+                if self._faiss_index is None:
+                    index = faiss.IndexFlatIP(dim)
+                    index = self._maybe_init_gpu_index(index)
+                    self._faiss_index = index
+                stacked = np.vstack(new_vectors)
+                self._faiss_index.add(stacked)
+            elif not self._faiss_warned:
+                logger.warning(
+                    "FAISS is not installed; falling back to CPU index for local dense retrieval."
+                )
+                self._faiss_warned = True
 
         collection_name = (
             resolved_collection
@@ -1181,8 +1219,17 @@ class RAGService:
             if direct_cache is not None:
                 return direct_cache
 
-        prefetch_limit = max(self._prefetch_limit, top_k)
-        prefetch = min(prefetch_limit, max(32, top_k * 6))
+        effective_top_k = max(1, int(top_k or 1))
+        prefetch_ceiling = max(
+            effective_top_k,
+            min(self._prefetch_limit, self._prefetch_cap),
+        )
+        ratio_target = max(
+            effective_top_k,
+            int(math.ceil(effective_top_k * self._prefetch_ratio)),
+        )
+        prefetch = min(ratio_target, prefetch_ceiling)
+        prefetch = max(effective_top_k, prefetch)
         weights = {"dense": 1.0, "sparse": 0.75, "qdrant": 1.0, "cache": 0.6}
 
         def _register_candidate(
@@ -1244,10 +1291,20 @@ class RAGService:
                 cached_entries, _register_candidate, weights["cache"]
             )
 
-        if self._faiss_index is not None and self._doc_vectors:
+        if self._doc_vectors:
             matrix, _ = _ensure_query_vectors()
-            scores, ids = self._faiss_index.search(matrix, prefetch)
-            for rank, (score, idx) in enumerate(zip(scores[0], ids[0]), 1):
+            dense_candidates: List[Tuple[float, int]] = []
+            if self._faiss_index is not None:
+                scores, ids = self._faiss_index.search(matrix, prefetch)
+                dense_candidates = list(zip(scores[0], ids[0]))
+            else:
+                doc_matrix = np.vstack(self._doc_vectors)
+                query_vec = matrix[0]
+                sims = doc_matrix @ query_vec
+                order = np.argsort(sims)[::-1][:prefetch]
+                dense_candidates = [(float(sims[idx]), int(idx)) for idx in order]
+
+            for rank, (score, idx) in enumerate(dense_candidates, 1):
                 if idx < 0 or idx >= len(self._documents):
                     continue
                 doc = self._documents[idx]
@@ -1403,25 +1460,36 @@ class RAGService:
         if not hits:
             return []
 
-        pair_query = search_text if search_text else rewritten_query
-        pairs = []
-        for h in hits:
-            payload = getattr(h, "payload", {}) or {}
-            doc_text = self._prepare_reranker_text(payload)
-            pairs.append((pair_query, doc_text))
+        rerank_scores: Dict[int, float] = {}
+        rerank_span = min(len(hits), self._reranker_limit)
+        confident_targets: List[Tuple[int, SimpleNamespace]] = [
+            (idx, hits[idx])
+            for idx in range(rerank_span)
+            if float(getattr(hits[idx], "aggregated", 0.0)) >= self._reranker_score_floor
+        ]
+        rerank_targets = confident_targets or [
+            (idx, hits[idx]) for idx in range(rerank_span)
+        ]
 
-        try:
-            scores = self._batched_reranker_predict(pairs)
-        except Exception:  # pragma: no cover - defensive logging only
-            logger.warning(
-                "Cross-encoder reranking failed; falling back to aggregated scores",
-                exc_info=True,
-            )
-            scores = [0.0 for _ in pairs]
+        if rerank_targets:
+            pair_query = search_text if search_text else rewritten_query
+            pairs: List[Tuple[str, str]] = []
+            for _, candidate in rerank_targets:
+                payload = getattr(candidate, "payload", {}) or {}
+                doc_text = self._prepare_reranker_text(payload)
+                pairs.append((pair_query, doc_text))
 
-        if len(scores) < len(hits):
-            deficit = len(hits) - len(scores)
-            scores.extend([scores[-1] if scores else 0.0] * deficit)
+            try:
+                target_scores = self._batched_reranker_predict(pairs)
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.warning(
+                    "Cross-encoder reranking failed; using aggregated scores for fallback",
+                    exc_info=True,
+                )
+                target_scores = [0.0 for _ in pairs]
+
+            for (idx, _), score in zip(rerank_targets, target_scores):
+                rerank_scores[idx] = float(score)
 
         def _matches_focus_payload(payload: Dict[str, Any]) -> bool:
             if not focus_document_types:
@@ -1489,9 +1557,9 @@ class RAGService:
         scored_hits: List[Tuple[SimpleNamespace, float, float]] = []
         rerank_weight = 1.35
         context_weight = 0.65
-        for hit, score in zip(hits, scores):
-            base_score = float(score)
+        for idx, hit in enumerate(hits):
             aggregated_score = float(getattr(hit, "aggregated", 0.0))
+            base_score = float(rerank_scores.get(idx, aggregated_score))
             combined = (
                 base_score * rerank_weight
                 + aggregated_score * context_weight
@@ -1938,6 +2006,9 @@ class RAGService:
         workflow robust we detect this condition and gracefully fall back to
         the CPU index while logging the reason.
         """
+
+        if faiss is None:
+            return index
 
         if getattr(self.agent_nick, "device", "cpu") != "cuda":
             return index

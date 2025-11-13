@@ -1,4 +1,3 @@
-import html
 import json
 import logging
 import re
@@ -28,158 +27,23 @@ _BANNED_TOKENS: Tuple[str, ...] = (
 )
 
 
-ATOM_EXTRACTION_SYSTEM = """Answer in a concise, semi-formal, human tone for procurement guidance.
-Only produce HTML-friendly building blocks as JSON atoms; the runtime renderer will craft the final markup.
-OUTPUT FORMAT: HTML scaffold with <section>, <h2>, <h3>, <p>, <ul>, <li>, and <table>.
-Sections must map to Summary, Scope & Applicability, Key Rules, Prohibited / Exclusions, Effective Dates & Ownership, and Next Steps when they have content.
-Avoid internal IDs, collection names, or placeholders. End with one short helpful follow-up suggestion.
-
-Example 1
-Question: "Can I expense rideshare trips for late-night client meetings?"
-Context:
-- Travel & Expense Policy section 4.1: Late-night transport after client meetings is claimable.
-- Exceptions note: Requires manager approval if exceeding £80 per trip.
-JSON:
+ATOM_EXTRACTION_SYSTEM = """Return concise procurement guidance as JSON with exactly these keys: summary, scope, rules, exclusions, policies, next_steps, followup.
+- summary: one or two short sentences that answer the question directly.
+- scope, rules, exclusions, next_steps: arrays of up to two short strings (≤22 words) each; omit empty entries.
+- policies: array of up to two [label, timing, note] triples; keep each value short and human readable.
+- followup: single actionable sentence describing the most logical next artefact or question; no pleasantries or rhetorical questions.
+Never emit HTML, markdown, bullet markers, or chit-chat. Stick to plain JSON.
+Example:
 {
-  "summary": "You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.",
-  "scope": [
-    "Applies when the journey starts after a client meeting and public transport is unavailable.",
-    "Relevant to employees travelling on approved client business."
-  ],
-  "rules": [
-    "Claim rideshare fares after client meetings when public transport is unavailable.",
-    "Submit the meeting agenda or notes with the expense to evidence the business purpose."
-  ],
-  "exclusions": [
-    "Do not expense rides taken for personal errands before or after the meeting.",
-    "Avoid booking premium vehicle classes unless the standard tier is unavailable."
-  ],
-  "policies": [
-    ["Standard limit", "Up to £80", "Manager approval required beyond the threshold."],
-    ["Documentation", "On submission", "Include client name, meeting purpose, and time in the claim."],
-    ["Approvals", "Before claiming", "Secure sign-off if you expect higher costs."]
-  ],
-  "next_steps": [
-    "If you expect higher costs, request pre-approval before the meeting.",
-    "Attach the rideshare receipt showing pickup/drop-off times."
-  ],
-  "followup": "Let me know if you want the policy excerpt or a claim checklist."
+  "summary": "Late-night rideshare fares linked to client meetings are reimbursable when you document the meeting and stay within the £80 limit.",
+  "scope": ["Applies after client meetings when public transport is unavailable."],
+  "rules": ["Submit the agenda or notes with the claim to evidence business purpose."],
+  "exclusions": ["Do not expense personal detours or premium vehicle classes."],
+  "policies": [["Standard limit", "Up to £80", "Manager approval required if you exceed the limit."]],
+  "next_steps": ["Attach the receipt showing pickup and drop-off times before claiming."],
+  "followup": "Share the hospitality policy if you also need alcohol guidance."
 }
-HTML:
-<section>
-  <h2>Summary</h2>
-  <p>You can expense late-night rideshare trips tied to client meetings when you document the meeting and stay within the policy limit.</p>
-  <h3>Scope &amp; Applicability</h3>
-  <ul><li>Applies when the journey starts after a client meeting and public transport is unavailable.</li><li>Relevant to employees travelling on approved client business.</li></ul>
-  <h3>Key Rules</h3>
-  <ul><li>Claim rideshare fares after client meetings when public transport is unavailable.</li><li>Submit the meeting agenda or notes with the expense to evidence the business purpose.</li></ul>
-  <h3>Prohibited / Exclusions</h3>
-  <ul><li>Do not expense rides taken for personal errands before or after the meeting.</li><li>Avoid booking premium vehicle classes unless the standard tier is unavailable.</li></ul>
-  <h3>Effective Dates &amp; Ownership</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Standard limit</td><td>Up to £80</td><td>Manager approval required beyond the threshold.</td></tr><tr><td>Documentation</td><td>On submission</td><td>Include client name, meeting purpose, and time in the claim.</td></tr><tr><td>Approvals</td><td>Before claiming</td><td>Secure sign-off if you expect higher costs.</td></tr></tbody></table>
-  <h3>Next Steps</h3>
-  <ul><li>If you expect higher costs, request pre-approval before the meeting.</li><li>Attach the rideshare receipt showing pickup/drop-off times.</li></ul>
-  <p><small>Let me know if you want the policy excerpt or a claim checklist.</small></p>
-</section>
-
-Example 2
-Question: "Are alcohol expenses reimbursable for client dinners?"
-Context:
-- Spend policy: Alcohol allowed only with VP approval.
-- Hospitality guidelines: Limit of two drinks per attendee.
-JSON:
-{
-  "summary": "Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.",
-  "scope": [
-    "Applies to hosted client dinners under the hospitality policy.",
-    "Requires advance VP approval before the event."
-  ],
-  "rules": [
-    "Include alcohol on the claim only if a VP has signed off in advance.",
-    "Keep receipts itemised to show drink counts per attendee."
-  ],
-  "exclusions": [
-    "Do not expense bar tabs without food or client presence.",
-    "Avoid claiming premium bottles unless the client specifically requests it and approval is documented."
-  ],
-  "policies": [
-    ["Hospitality limit", "Per event", "Two alcoholic drinks per attendee."],
-    ["Receipt standard", "On submission", "Itemised invoice showing alcohol separately."],
-    ["Approval", "Before dinner", "Retain VP pre-approval email with the claim."]
-  ],
-  "next_steps": [
-    "Flag any cultural sensitivities before booking venues.",
-    "Use the hospitality policy template for VP approvals."
-  ],
-  "followup": "Need the VP approval template or hospitality checklist?"
-}
-HTML:
-<section>
-  <h2>Summary</h2>
-  <p>Alcohol can be reimbursed for client dinners when pre-approved and within hospitality limits.</p>
-  <h3>Scope &amp; Applicability</h3>
-  <ul><li>Applies to hosted client dinners under the hospitality policy.</li><li>Requires advance VP approval before the event.</li></ul>
-  <h3>Key Rules</h3>
-  <ul><li>Include alcohol on the claim only if a VP has signed off in advance.</li><li>Keep receipts itemised to show drink counts per attendee.</li></ul>
-  <h3>Prohibited / Exclusions</h3>
-  <ul><li>Do not expense bar tabs without food or client presence.</li><li>Avoid claiming premium bottles unless the client specifically requests it and approval is documented.</li></ul>
-  <h3>Effective Dates &amp; Ownership</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Hospitality limit</td><td>Per event</td><td>Two alcoholic drinks per attendee.</td></tr><tr><td>Receipt standard</td><td>On submission</td><td>Itemised invoice showing alcohol separately.</td></tr><tr><td>Approval</td><td>Before dinner</td><td>Retain VP pre-approval email with the claim.</td></tr></tbody></table>
-  <h3>Next Steps</h3>
-  <ul><li>Flag any cultural sensitivities before booking venues.</li><li>Use the hospitality policy template for VP approvals.</li></ul>
-  <p><small>Need the VP approval template or hospitality checklist?</small></p>
-</section>
-
-Example 3
-Question: "How should I handle supplier onboarding delays?"
-Context:
-- Onboarding runbook: Suppliers must complete compliance docs before first PO.
-- Support note: Escalate if onboarding exceeds ten business days.
-JSON:
-{
-  "summary": "Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.",
-  "scope": [
-    "Applies to supplier onboarding before the first purchase order is issued.",
-    "Relevant for procurement and onboarding squads managing compliance checks."
-  ],
-  "rules": [
-    "Remind the supplier to submit compliance and banking forms through the portal.",
-    "Loop in the onboarding squad when legal review is pending."
-  ],
-  "exclusions": [
-    "Do not raise a purchase order until onboarding is fully approved.",
-    "Avoid bypassing the AML checks even for urgent projects."
-  ],
-  "policies": [
-    ["Compliance pack", "Before PO", "Includes AML, tax forms, and sustainability attestations."],
-    ["Escalation trigger", "Day 11", "Start an escalation if documents remain outstanding."],
-    ["Support channel", "During delays", "Use the onboarding squad queue in ProcWise for rapid triage."]
-  ],
-  "next_steps": [
-    "Schedule a check-in with the supplier if documents remain outstanding.",
-    "Prepare the escalation summary for leadership if needed."
-  ],
-  "followup": "Let me know if you want the escalation email template next."
-}
-HTML:
-<section>
-  <h2>Summary</h2>
-  <p>Push onboarding forward by chasing outstanding compliance items and escalate if the supplier stalls past ten business days.</p>
-  <h3>Scope &amp; Applicability</h3>
-  <ul><li>Applies to supplier onboarding before the first purchase order is issued.</li><li>Relevant for procurement and onboarding squads managing compliance checks.</li></ul>
-  <h3>Key Rules</h3>
-  <ul><li>Remind the supplier to submit compliance and banking forms through the portal.</li><li>Loop in the onboarding squad when legal review is pending.</li></ul>
-  <h3>Prohibited / Exclusions</h3>
-  <ul><li>Do not raise a purchase order until onboarding is fully approved.</li><li>Avoid bypassing the AML checks even for urgent projects.</li></ul>
-  <h3>Effective Dates &amp; Ownership</h3>
-  <table style='border-collapse:collapse;width:100%'><thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead><tbody><tr><td>Compliance pack</td><td>Before PO</td><td>Includes AML, tax forms, and sustainability attestations.</td></tr><tr><td>Escalation trigger</td><td>Day 11</td><td>Start an escalation if documents remain outstanding.</td></tr><tr><td>Support channel</td><td>During delays</td><td>Use the onboarding squad queue in ProcWise for rapid triage.</td></tr></tbody></table>
-  <h3>Next Steps</h3>
-  <ul><li>Schedule a check-in with the supplier if documents remain outstanding.</li><li>Prepare the escalation summary for leadership if needed.</li></ul>
-  <p><small>Let me know if you want the escalation email template next.</small></p>
-</section>
-
-Always respond with valid JSON containing exactly the keys summary, scope, rules, exclusions, policies, next_steps, and followup.
-"""
+Always respond with valid JSON containing exactly the keys summary, scope, rules, exclusions, policies, next_steps, and followup."""
 
 
 def compose_html_answer(
@@ -191,6 +55,8 @@ def compose_html_answer(
     next_steps: Optional[List[str]] | None = None,
     followup: Optional[str] | None = None,
 ) -> str:
+    summary_text = (summary or "No summary available.").strip() or "No summary available."
+
     def _trim(items: Optional[Sequence[Any]]) -> List[str]:
         if not items:
             return []
@@ -203,98 +69,70 @@ def compose_html_answer(
                 break
         return result
 
-    def bullets(items: Optional[List[str]]) -> str:
-        cleaned = _trim(items)
-        if not cleaned:
-            cleaned = ["No guidance captured yet."]
-        escaped = "".join(f"<li>{html.escape(entry)}</li>" for entry in cleaned)
-        return f"<ul>{escaped}</ul>"
+    def _opening(text: str) -> str:
+        cleaned = text.strip()
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned) if cleaned else []
+        snippet = " ".join(sentences[:2]).strip() or cleaned or "Here is the latest documented guidance for this request."
+        snippet = snippet.rstrip(" .") + "."
+        if snippet.lower().startswith(("hi", "hello", "hey")):
+            return snippet
+        return f"Hi—{snippet}"
 
-    def table(rows: Optional[List[Tuple[str, str, str]]]) -> str:
-        if not rows:
-            return ""
-        trimmed: List[Tuple[str, str, str]] = []
-        for entry in rows:
-            if isinstance(entry, (list, tuple)) and len(entry) >= 3:
-                name, effective, notes_value = entry[:3]
-            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
-                name, notes_value = entry
-                effective = "Not specified"
-            elif isinstance(entry, (list, tuple)) and len(entry) == 1:
-                name = entry[0]
-                effective = "Not specified"
-                notes_value = "No notes captured."
-            else:
-                name = getattr(entry, "name", "") or str(entry)
-                effective = getattr(entry, "effective", "")
-                notes_value = getattr(entry, "notes", "")
-            name_text = str(name).strip()
-            effective_text = str(effective).strip()
-            notes_text = str(notes_value).strip()
-            if not name_text and not effective_text and not notes_text:
-                continue
-            trimmed.append(
-                (
-                    name_text or "Reference",
-                    effective_text or "Not specified",
-                    notes_text or "No notes captured.",
-                )
-            )
-            if len(trimmed) >= _MAX_ATOM_LIST_ITEMS:
+    def _collect_points() -> List[str]:
+        points: List[str] = []
+        sources = [_trim(scope), _trim(rules), _trim(exclusions), _trim(next_steps)]
+        for source in sources:
+            for entry in source:
+                if entry not in points:
+                    points.append(entry)
+                if len(points) >= 3:
+                    break
+            if len(points) >= 3:
                 break
-        if not trimmed:
-            return ""
-        head = (
-            "<thead><tr><th>Item</th><th>Effective</th><th>Owner / Notes</th></tr></thead>"
-        )
-        body_rows = "".join(
-            f"<tr><td>{html.escape(name)}</td><td>{html.escape(effective)}</td><td>{html.escape(notes_val)}</td></tr>"
-            for name, effective, notes_val in trimmed
-        )
-        body = f"<tbody>{body_rows}</tbody>"
-        return (
-            "<table style='border-collapse:collapse;width:100%'>"
-            f"{head}{body}</table>"
-        )
+        fallback = summary_text
+        while len(points) < 3:
+            candidate = fallback or "No additional guidance captured yet."
+            if candidate not in points:
+                points.append(candidate)
+            else:
+                points.append("No additional guidance captured yet.")
+            fallback = None
+        return points[:3]
 
-    summary_text = html.escape((summary or "No summary available.").strip() or "No summary available.")
-    scope_section = bullets(scope)
-    rules_section = bullets(rules)
-    exclusions_section = bullets(exclusions)
-    next_section = bullets(next_steps)
-    policies_table = table(policies)
-    followup_text = html.escape((followup or "Happy to explore more detail when you need it.").strip())
+    def _note_lines() -> List[str]:
+        lines: List[str] = []
+        trimmed_next = _trim(next_steps)
+        if trimmed_next:
+            joined = "; ".join(trimmed_next[:2])
+            lines.append(f"Next steps: {joined}.")
+        if policies:
+            first = policies[0]
+            if isinstance(first, (list, tuple)) and first:
+                label = str(first[0]).strip()
+                timing = str(first[1]).strip() if len(first) > 1 else ""
+                remark = str(first[2]).strip() if len(first) > 2 else ""
+                descriptor = ": ".join(bit for bit in [label, remark] if bit).strip(": ")
+                if descriptor:
+                    timing_note = f" (effective {timing})" if timing else ""
+                    lines.append(f"{descriptor}{timing_note}.")
+        follow_line = (followup or "Share another detail when you need deeper context.").strip()
+        if follow_line and follow_line[-1] not in ".!?":
+            follow_line = f"{follow_line}."
+        if follow_line:
+            lines.append(follow_line)
+        return lines or ["Share another detail when you need deeper context."]
 
-    html_parts = [
-        "<section>",
-        "  <h2>Summary</h2>",
-        f"  <p>{summary_text}</p>",
-        "  <h3>Scope &amp; Applicability</h3>",
-        f"  {scope_section}",
-        "  <h3>Key Rules</h3>",
-        f"  {rules_section}",
-        "  <h3>Prohibited / Exclusions</h3>",
-        f"  {exclusions_section}",
-    ]
+    opening_line = _opening(summary_text)
+    key_points = _collect_points()
+    note_lines = _note_lines()
 
-    if policies_table:
-        html_parts.extend(
-            [
-                "  <h3>Effective Dates &amp; Ownership</h3>",
-                f"  {policies_table}",
-            ]
-        )
-
-    html_parts.extend(
-        [
-            "  <h3>Next Steps</h3>",
-            f"  {next_section}",
-            f"  <p><small>{followup_text}</small></p>",
-            "</section>",
-        ]
-    )
-
-    return "\n".join(html_parts)
+    lines: List[str] = [opening_line, "", "Key Details"]
+    for idx, point in enumerate(key_points, start=1):
+        lines.append(f"- Point {idx} – {point}")
+    lines.append("")
+    lines.append("Additional Notes")
+    lines.extend(note_lines)
+    return "\n".join(line for line in lines if line).strip()
 
 
 def sanitize_html(answer: str) -> str:
@@ -1488,8 +1326,8 @@ class RAGAgent(BaseAgent):
             if first:
                 cleaned = first.rstrip("?.!").strip()
                 if cleaned:
-                    return f"I can also cover {cleaned.lower()} if that would help next."
-        return "Happy to explore more detail whenever you need it."
+                    return f"Share {cleaned.lower()} next if you want deeper coverage."
+        return "Share another detail when you want a deeper dive."
 
     def _request_atoms_via_llm(
         self,
