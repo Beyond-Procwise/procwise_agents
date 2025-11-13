@@ -12,9 +12,6 @@ from services.model_selector import RAGPipeline
 def _wrap(body: str) -> str:
     return (
         "<section class=\"llm-answer\">"
-        "<header class=\"llm-answer__header\">"
-        "<h2 class=\"llm-answer__title\">Answer</h2>"
-        "</header>"
         "<article class=\"llm-answer__content\">"
         f"{body}"
         "</article>"
@@ -31,7 +28,9 @@ def test_normalise_answer_html_preserves_angle_brackets():
 
     result = pipeline._normalise_answer_html("Cost A < Cost B")
 
-    assert result == _wrap("<p>Cost A &lt; Cost B</p>")
+    assert result == _wrap(
+        '<section class="llm-answer__segment"><p>Cost A &lt; Cost B</p></section>'
+    )
 
 
 def test_normalise_answer_html_strips_basic_tags():
@@ -39,7 +38,9 @@ def test_normalise_answer_html_strips_basic_tags():
 
     result = pipeline._normalise_answer_html("<strong>Winner:</strong> Supplier < 2")
 
-    assert result == _wrap("<p>Winner: Supplier &lt; 2</p>")
+    assert result == _wrap(
+        '<section class="llm-answer__segment"><p>Winner: Supplier &lt; 2</p></section>'
+    )
     assert not re.search(r"<strong>.*</strong>", result)
 
 
