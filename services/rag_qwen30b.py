@@ -4,7 +4,7 @@ import re
 import time
 import unicodedata
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 import ollama
@@ -25,6 +25,7 @@ RERANK_BATCH = int(os.getenv("RERANK_BATCH", "16"))
 RERANK_FP16 = bool(int(os.getenv("RERANK_FP16", "1")))
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-30b-procwise")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST")
+RAG_EMBED_BATCH = int(os.getenv("RAG_EMBED_BATCH", "16"))
 
 # Hallucination refusal exact sentence
 REFUSAL_SENTENCE = "I don't have enough information in the provided documents."
@@ -117,6 +118,7 @@ class RAGQwen30b:
             "capped_count": 0,
             "packed_chars": 0,
         }
+        self._embed_batch_size = max(int(RAG_EMBED_BATCH), 1)
 
     # -------------------- Retrieval & rerank --------------------------------
     def retrieve_and_rerank(self, query: str, top_k: int = RAG_TOP_K, rerank_top_n: int = RAG_RERANK_TOP_N, vector_name: str = "text", collections: Optional[List[str]] = None) -> List[Chunk]:
@@ -197,6 +199,60 @@ class RAGQwen30b:
         self.telemetry["reranked_count"] = len(dense_sorted)
         return dense_sorted[: rerank_top_n]
 
+    # -------------------- Embedding helpers ---------------------------------
+    def _encode_batch(self, texts: Sequence[str]) -> List[Optional[np.ndarray]]:
+        """Encode ``texts`` in a single call when possible.
+
+        This avoids issuing many sequential embedding requests which can add
+        significant latency when the embedder is backed by a remote service or
+        large local model. The helper is defensive so the pipeline gracefully
+        degrades to returning ``None`` placeholders if batch encoding fails.
+        """
+
+        if not texts:
+            return []
+
+        cleaned_texts = [t if isinstance(t, str) else "" for t in texts]
+        try:
+            embeddings = self.embedder.encode(
+                cleaned_texts,
+                normalize_embeddings=True,
+                batch_size=self._embed_batch_size,
+            )
+        except TypeError:
+            embeddings = self.embedder.encode(cleaned_texts, normalize_embeddings=True)
+        except Exception:
+            logger.exception("Batch embedding failed; returning empty vectors")
+            return [None for _ in cleaned_texts]
+
+        if embeddings is None:
+            return [None for _ in cleaned_texts]
+
+        if isinstance(embeddings, np.ndarray):
+            if embeddings.ndim == 1 and len(cleaned_texts) == 1:
+                return [np.asarray(embeddings, dtype=np.float32)]
+            if embeddings.ndim == 2 and embeddings.shape[0] == len(cleaned_texts):
+                return [np.asarray(row, dtype=np.float32) for row in embeddings]
+
+        result: List[Optional[np.ndarray]] = []
+        try:
+            for emb in embeddings:
+                if emb is None:
+                    result.append(None)
+                else:
+                    result.append(np.asarray(emb, dtype=np.float32))
+        except Exception:
+            logger.exception("Failed to normalise embedding outputs; using None placeholders")
+            return [None for _ in cleaned_texts]
+
+        if len(result) != len(cleaned_texts):
+            if len(result) < len(cleaned_texts):
+                result.extend([None] * (len(cleaned_texts) - len(result)))
+            else:
+                result = result[: len(cleaned_texts)]
+
+        return result
+
     # -------------------- Deduplication ------------------------------------
     def hash_dedupe(self, candidates: List[Chunk]) -> List[Chunk]:
         seen_hashes: Set[str] = set()
@@ -214,16 +270,25 @@ class RAGQwen30b:
         1) Within-doc dedupe (fast): compare embeddings or compute temporarily
         2) Cross-doc dedupe among top `cross_doc_top` candidates
         """
-        # Precompute embeddings where missing
-        for c in candidates:
-            if c.get("vector") is None:
-                try:
-                    emb = self.embedder.encode(c.get("content", ""), normalize_embeddings=True)
-                    c["vector"] = np.asarray(emb, dtype=np.float32)
-                except Exception:
-                    c["vector"] = None
+        # Precompute embeddings where missing using batch encoding to avoid per-chunk latency
+        missing_indices: List[int] = []
+        missing_texts: List[str] = []
+        for idx, chunk in enumerate(candidates):
+            vector = chunk.get("vector")
+            if vector is None:
+                missing_indices.append(idx)
+                missing_texts.append(chunk.get("content", ""))
             else:
-                c["vector"] = np.asarray(c["vector"], dtype=np.float32) if c.get("vector") is not None else None
+                try:
+                    chunk["vector"] = np.asarray(vector, dtype=np.float32)
+                except Exception:
+                    missing_indices.append(idx)
+                    missing_texts.append(chunk.get("content", ""))
+
+        if missing_indices:
+            embeddings = self._encode_batch(missing_texts)
+            for pos, emb in zip(missing_indices, embeddings):
+                candidates[pos]["vector"] = emb
 
         # Within-doc dedupe: keep highest rerank_score per similar group
         by_doc: Dict[Any, List[Chunk]] = {}
@@ -360,13 +425,7 @@ class RAGQwen30b:
         selected: List[Dict[str, Any]] = []
         remaining = sent_objs.copy()
         # Precompute sentence embeddings for similarity in MMR (use embedder)
-        sent_embs = []
-        for s in sentences:
-            try:
-                emb = self.embedder.encode(s, normalize_embeddings=True)
-                sent_embs.append(np.asarray(emb, dtype=np.float32))
-            except Exception:
-                sent_embs.append(None)
+        sent_embs = self._encode_batch(sentences)
         # sort remaining by score desc
         remaining.sort(key=lambda x: x["score"], reverse=True)
         total_chars = 0
