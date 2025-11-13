@@ -5,8 +5,10 @@ import asyncio
 import imaplib
 import json
 import logging
+import os
 import random
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,7 +19,7 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from agents.base_agent import AgentContext, AgentOutput
 from agents.negotiation_agent import NegotiationAgent
