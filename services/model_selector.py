@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import re
-import html
 import threading
 import time
 from datetime import datetime
@@ -587,53 +586,7 @@ class RAGPipeline:
             self._answer_cache[cache_key] = (expires_at, snapshot)
 
     def _render_html_answer(self, answer_text: str) -> str:
-        stripped = (answer_text or "").strip()
-        if not stripped:
-            return "<p></p>"
-
-        html_parts: List[str] = []
-        list_buffer: List[str] = []
-        list_type: Optional[str] = None
-
-        def flush_list() -> None:
-            nonlocal list_buffer, list_type
-            if not list_buffer:
-                return
-            tag = "ol" if list_type == "ol" else "ul"
-            html_parts.append(f"<{tag}>")
-            for item in list_buffer:
-                html_parts.append(f"<li>{html.escape(item)}</li>")
-            html_parts.append(f"</{tag}>")
-            list_buffer = []
-            list_type = None
-
-        for raw_line in stripped.splitlines():
-            line = raw_line.strip()
-            if not line:
-                flush_list()
-                continue
-            bullet_match = re.match(r"^[-*]\s+(.*)", line)
-            number_match = re.match(r"^(\d+)[\).]\s+(.*)", line)
-            if bullet_match:
-                if list_type not in (None, "ul"):
-                    flush_list()
-                list_type = "ul"
-                list_buffer.append(bullet_match.group(1).strip())
-                continue
-            if number_match:
-                if list_type not in (None, "ol"):
-                    flush_list()
-                list_type = "ol"
-                list_buffer.append(number_match.group(2).strip())
-                continue
-            flush_list()
-            html_parts.append(f"<p>{html.escape(line)}</p>")
-
-        flush_list()
-
-        if not html_parts:
-            return f"<p>{html.escape(stripped)}</p>"
-        return "".join(html_parts)
+        return self._normalise_answer_html(answer_text)
 
     def _ensure_phi4_default(self, configured_model: Optional[str]) -> str:
         """Guarantee Joshi relies on phi4 (or a fine-tuned variant)."""
@@ -1858,7 +1811,7 @@ class RAGPipeline:
 
         lines.append("Draft summary derived from retrieval:\n" + draft_answer)
         lines.append(
-            "Transform the draft into a natural response (ideally one or two concise paragraphs). Start with a brief acknowledgement or collegial lead-in, deliver the direct answer, weave in the most relevant knowledge details, introduce short bullet or numbered lists when clarifying multiple points, point out any gaps or next steps, and keep the tone warm, human, and unscripted."
+            "Transform the draft into a natural response (ideally one or two concise paragraphs). Start with a brief acknowledgement or collegial lead-in, deliver the direct answer, weave in the most relevant knowledge details, introduce short bullet or numbered lists when clarifying multiple points, point out any gaps or next steps, and keep the tone warm, conversational, and unscripted—sound like a trusted teammate rather than a script."
         )
         return "\n\n".join(lines)
 
@@ -1909,16 +1862,28 @@ class RAGPipeline:
 
     def _plain_text_to_html(self, text: str) -> str:
         if not text:
-            return "<p>No answer available.</p>"
+            return (
+                '<section class="llm-answer__segment">'
+                "<p>No answer available.</p>"
+                "</section>"
+            )
 
         normalised = text.replace("\r\n", "\n").replace("\r", "\n")
         html_parts: List[str] = []
         current_list: List[str] = []
 
+        def append_segment(inner_html: str) -> None:
+            html_parts.append(
+                '<section class="llm-answer__segment">' + inner_html + "</section>"
+            )
+
         def flush_list() -> None:
             nonlocal current_list
             if current_list:
-                html_parts.append("<ul>" + "".join(f"<li>{item}</li>" for item in current_list) + "</ul>")
+                list_items = "".join(f"<li>{item}</li>" for item in current_list)
+                append_segment(
+                    '<ul class="llm-answer__pointers">' + list_items + "</ul>"
+                )
                 current_list = []
 
         bullet_pattern = re.compile(r"^(?:[-*\u2022]|\d+[\.)])\s+")
@@ -1933,11 +1898,14 @@ class RAGPipeline:
                 current_list.append(escape(content))
                 continue
             flush_list()
-            html_parts.append(f"<p>{escape(line)}</p>")
+            append_segment(f"<p>{escape(line)}</p>")
 
         flush_list()
 
-        return "".join(html_parts) or "<p>No answer available.</p>"
+        if not html_parts:
+            append_segment("<p>No answer available.</p>")
+
+        return "".join(html_parts)
 
     def _normalise_answer_html(self, answer: Any) -> str:
         if isinstance(answer, (list, dict)):
@@ -1971,11 +1939,8 @@ class RAGPipeline:
             body = self._plain_text_to_html(cleaned)
 
         return (
-            "<section class=\"llm-answer\">"
-            "<header class=\"llm-answer__header\">"
-            "<h2 class=\"llm-answer__title\">Answer</h2>"
-            "</header>"
-            "<article class=\"llm-answer__content\">"
+            '<section class="llm-answer">'
+            '<article class="llm-answer__content">'
             f"{body}"
             "</article>"
             "</section>"
