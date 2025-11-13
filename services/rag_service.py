@@ -94,6 +94,15 @@ class RAGService:
         self._layout_parser = LayoutAwareParser()
         self._chunker = SemanticChunker(settings=self.settings)
         self._payload_index_cache: Dict[str, Set[str]] = {}
+        self._prefetch_limit = max(
+            int(getattr(self.settings, "rag_prefetch_limit", 48) or 1), 1
+        )
+        self._reranker_batch_size = max(
+            int(getattr(self.settings, "rag_reranker_batch_size", 32) or 1), 1
+        )
+        self._reranker_max_chars = max(
+            int(getattr(self.settings, "rag_reranker_max_chars", 1400) or 256), 256
+        )
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -522,6 +531,89 @@ class RAGService:
 
         return fields
 
+    def _prepare_reranker_text(self, payload: Dict[str, Any]) -> str:
+        """Extract a concise text snippet for cross-encoder reranking."""
+
+        if not isinstance(payload, dict):
+            return ""
+
+        parts: List[str] = []
+
+        highlights = payload.get("highlights")
+        if isinstance(highlights, str) and highlights.strip():
+            parts.append(highlights.strip())
+        elif isinstance(highlights, (list, tuple, set)):
+            highlight_bits = [
+                str(item).strip()
+                for item in highlights
+                if isinstance(item, (str, int, float)) and str(item).strip()
+            ]
+            if highlight_bits:
+                parts.append(" ".join(highlight_bits))
+
+        text_keys = (
+            "text_summary",
+            "summary",
+            "chunk_text",
+            "content",
+            "text",
+            "description",
+        )
+        for key in text_keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                break
+            if isinstance(value, (list, tuple)):
+                merged = " ".join(
+                    str(item).strip()
+                    for item in value
+                    if isinstance(item, (str, int, float)) and str(item).strip()
+                ).strip()
+                if merged:
+                    parts.append(merged)
+                    break
+
+        if not parts:
+            fallback_bits: List[str] = []
+            for key in ("title", "document_type", "source_type", "record_id"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    fallback_bits.append(value.strip())
+            if fallback_bits:
+                parts.append(" - ".join(fallback_bits))
+
+        combined = " ".join(parts).strip()
+        if not combined:
+            return ""
+
+        max_chars = self._reranker_max_chars
+        if len(combined) <= max_chars:
+            return combined
+
+        truncated = combined[:max_chars].rsplit(" ", 1)[0].strip()
+        if not truncated:
+            truncated = combined[:max_chars].strip()
+        return truncated + "…"
+
+    def _batched_reranker_predict(self, pairs: Sequence[Tuple[str, str]]) -> List[float]:
+        """Score ``pairs`` using the cross-encoder in small batches."""
+
+        if not pairs:
+            return []
+
+        batch_size = max(self._reranker_batch_size, 1)
+        scores: List[float] = []
+        for start in range(0, len(pairs), batch_size):
+            chunk = list(pairs[start : start + batch_size])
+            if not chunk:
+                continue
+            chunk_scores = self._reranker.predict(chunk)
+            if hasattr(chunk_scores, "tolist"):
+                chunk_scores = chunk_scores.tolist()
+            scores.extend(float(score) for score in chunk_scores)
+        return scores
+
     def _ensure_filter_indexes(
         self, collection_name: Optional[str], query_filter: Optional[models.Filter]
     ) -> None:
@@ -856,7 +948,8 @@ class RAGService:
             if direct_cache is not None:
                 return direct_cache
 
-        prefetch = max(50, top_k * 8)
+        prefetch_limit = max(self._prefetch_limit, top_k)
+        prefetch = min(prefetch_limit, max(32, top_k * 6))
         weights = {"dense": 1.0, "sparse": 0.75, "qdrant": 1.0, "cache": 0.6}
 
         def _register_candidate(
@@ -1145,19 +1238,25 @@ class RAGService:
         if not hits:
             return []
 
-        pairs = [
-            (
-                rewritten_query,
-                h.payload.get(
-                    "text_summary",
-                    h.payload.get("content", h.payload.get("summary", "")),
-                ),
+        pair_query = search_text if search_text else rewritten_query
+        pairs = []
+        for h in hits:
+            payload = getattr(h, "payload", {}) or {}
+            doc_text = self._prepare_reranker_text(payload)
+            pairs.append((pair_query, doc_text))
+
+        try:
+            scores = self._batched_reranker_predict(pairs)
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.warning(
+                "Cross-encoder reranking failed; falling back to aggregated scores",
+                exc_info=True,
             )
-            for h in hits
-        ]
-        scores = self._reranker.predict(pairs)
-        if hasattr(scores, "tolist"):
-            scores = scores.tolist()
+            scores = [0.0 for _ in pairs]
+
+        if len(scores) < len(hits):
+            deficit = len(hits) - len(scores)
+            scores.extend([scores[-1] if scores else 0.0] * deficit)
 
         def _matches_focus_payload(payload: Dict[str, Any]) -> bool:
             if not focus_document_types:

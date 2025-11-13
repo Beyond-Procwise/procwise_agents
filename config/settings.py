@@ -306,6 +306,21 @@ class Settings(BaseSettings):
     reranker_model: str = Field(
         default="BAAI/bge-reranker-large", env="RERANKER_MODEL"
     )
+    rag_prefetch_limit: int = Field(
+        default=48,
+        env="RAG_PREFETCH_LIMIT",
+        description="Upper bound for candidate documents fetched per query during RAG search.",
+    )
+    rag_reranker_batch_size: int = Field(
+        default=32,
+        env="RAG_RERANKER_BATCH_SIZE",
+        description="Maximum number of document-query pairs scored per reranker batch.",
+    )
+    rag_reranker_max_chars: int = Field(
+        default=1400,
+        env="RAG_RERANKER_MAX_CHARS",
+        description="Character limit applied to candidate passages before reranking to keep inference responsive.",
+    )
     procurement_knowledge_path: Optional[str] = Field(
         default=None, env="PROCUREMENT_KNOWLEDGE_PATH"
     )
