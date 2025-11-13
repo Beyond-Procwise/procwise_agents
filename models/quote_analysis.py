@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
-    from email_thread import EmailThread
+    from services.email_thread import EmailThread
 
 
 _CURRENCY_SYMBOLS: Dict[str, str] = {
@@ -373,4 +373,3 @@ def build_scorecard(
         risk_posture=_score_risk(snapshot),
         sustainability_alignment=_score_sustainability(snapshot),
     )
-

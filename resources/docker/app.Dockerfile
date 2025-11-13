@@ -14,4 +14,4 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY . /app
 
-CMD ["python", "end_to_end_demo.py"]
+CMD ["python", "scripts/end_to_end_demo.py"]

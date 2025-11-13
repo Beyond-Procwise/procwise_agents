@@ -5335,10 +5335,6 @@ class DataExtractionAgent(BaseAgent):
             base = "procwise_document_embeddings"
         base = re.sub(r"[^A-Za-z0-9_-]", "_", base.strip()) or "procwise_document_embeddings"
 
-        normalized_type = _normalize_label(doc_type)
-        doc_specific = {"invoice", "purchase_order", "quote", "contract"}
-        if normalized_type in doc_specific:
-            return f"{base}_{normalized_type}"
         return base
 
     def _ensure_qdrant_collection(self, doc_type: Any = None) -> str:

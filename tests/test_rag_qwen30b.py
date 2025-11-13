@@ -6,7 +6,12 @@ import math
 from types import SimpleNamespace
 import numpy as np
 
-from services.rag_qwen30b import RAGQwen30b, COMPRESS_PER_CHUNK_CHARS, SEMANTIC_DEDUPE_THRESHOLD
+from services.rag_qwen30b import (
+    RAGQwen30b,
+    COMPRESS_PER_CHUNK_CHARS,
+    RAG_CONTEXT_MAX_CHARS,
+    SEMANTIC_DEDUPE_THRESHOLD,
+)
 
 
 class DummyEmbed:
@@ -135,3 +140,21 @@ def test_financial_query_broadens_retrieval(monkeypatch):
     # Check that at least one call used an increased limit (>=30)
     limits = [call.get('limit') for call in dq.search_calls]
     assert any((l or 0) >= 30 for l in limits), f"Expected at least one call with limit >= 30, got {limits}"
+
+
+def test_pack_context_enforces_doc_diversity():
+    rag = make_rag()
+    chunks = []
+    for i in range(6):
+        chunks.append(
+            {
+                "doc_id": f"doc{i % 4}",
+                "content": f"Important sentence from doc {i % 4}.",
+                "compressed_text": f"Important sentence from doc {i % 4}.",
+                "payload": {},
+            }
+        )
+    ctx, used = rag.pack_context(chunks, max_chars=RAG_CONTEXT_MAX_CHARS, ensure_min_docs=3)
+    included = {c.get("doc_id") for c in used if c.get("doc_id")}
+    assert len(included) >= 3, f"Expected at least 3 docs, got {included}"
+    assert ctx, "Context should not be empty when chunks are available"

@@ -16,13 +16,16 @@ be orchestrated from automation or executed manually when needed.
 from __future__ import annotations
 from unsloth import FastLanguageModel  # type: ignore
 import argparse
+import importlib
 import json
 import logging
 import shlex
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
+import statistics
 
 import psycopg2
 try:  # pragma: no cover - datasets is optional until training runs
@@ -33,6 +36,9 @@ except ModuleNotFoundError:  # pragma: no cover - import guard for --help invoca
 
 from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
                           PreTrainedTokenizerBase)
+
+if TYPE_CHECKING:  # pragma: no cover - optional import for typing only
+    from services.rag_qwen30b import RAGQwen30b
 
 
 try:  # pragma: no cover - optional import guard
@@ -131,6 +137,51 @@ class GGUFConfig:
 
 
 @dataclass
+class EvaluationQuery:
+    """Single evaluation prompt specification."""
+
+    query: str
+    ensure_min_docs: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RAGEvaluationConfig:
+    """Configuration for validating RAG behaviour using a set of queries."""
+
+    queries_path: Path
+    output_path: Path
+    collections: Sequence[str]
+    ensure_min_docs: int = 3
+    baseline_report: Optional[Path] = None
+    max_queries: Optional[int] = None
+
+
+@dataclass
+class RAGEvaluationResult:
+    """Result of a RAG evaluation run."""
+
+    output_path: Path
+    aggregate: Dict[str, Any]
+    query_metrics: List[Dict[str, Any]]
+    comparison: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ModelfileConfig:
+    """Configuration for rendering an Ollama Modelfile pointing at new weights."""
+
+    template_path: Path
+    output_path: Path
+    model_name: str = "qwen3-30b-procwise"
+    context_window: int = 8192
+    temperature: float = 0.2
+    top_p: float = 0.9
+    repeat_penalty: float = 1.05
+    extra_parameters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class PipelineRunConfig:
     """Configuration for the complete fine-tuning workflow."""
 
@@ -138,6 +189,8 @@ class PipelineRunConfig:
     train: TrainConfig
     merge: Optional[MergeConfig] = None
     gguf: Optional[GGUFConfig] = None
+    evaluation: Optional[RAGEvaluationConfig] = None
+    modelfile: Optional[ModelfileConfig] = None
     min_records: int = 1
 
 
@@ -150,11 +203,40 @@ class PipelineResult:
     merged_model_dir: Optional[Path] = None
     gguf_model_path: Optional[Path] = None
     quantized_model_path: Optional[Path] = None
+    modelfile_path: Optional[Path] = None
+    evaluation_report: Optional[Path] = None
+    evaluation_metrics: Optional[Dict[str, Any]] = None
 
 
 def _configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s")
+
+
+def _parse_extra_parameters(param_args: Optional[Sequence[str]]) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    for raw in param_args or []:
+        if "=" not in raw:
+            raise ValueError(f"Parameter '{raw}' must be in KEY=VALUE format")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("Parameter key cannot be empty")
+        params[key] = value.strip()
+    return params
+
+
+def _load_callable(dotted: str) -> Callable[[], Any]:
+    """Import a zero-argument factory from a dotted path (module:function)."""
+
+    if ":" not in dotted:
+        raise ValueError("Callable path must be in module.submodule:factory format")
+    module_name, attr_name = dotted.split(":", 1)
+    module = importlib.import_module(module_name)
+    factory = getattr(module, attr_name)
+    if not callable(factory):
+        raise TypeError(f"{dotted} is not callable")
+    return factory
 
 
 def export_training_data(config: ExportConfig) -> ExportResult:
@@ -257,6 +339,213 @@ def _split_target_modules(modules: Sequence[str]) -> List[str]:
         if isinstance(module, str):
             items.extend(part.strip() for part in module.split(",") if part.strip())
     return items
+
+
+def load_evaluation_queries(path: Path) -> List[EvaluationQuery]:
+    """Load evaluation prompts from a JSON or JSONL file."""
+    if not path.exists():
+        raise FileNotFoundError(f"Evaluation queries file not found: {path}")
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError("Evaluation queries file is empty")
+
+    records: List[Any] = []
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict) and "queries" in payload:
+            queries = payload["queries"]
+            if isinstance(queries, list):
+                records = queries
+        else:
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        # Fall back to JSONL parsing
+        records = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+
+    queries: List[EvaluationQuery] = []
+    for record in records:
+        query_text = ""
+        ensure_docs: Optional[int] = None
+        metadata: Dict[str, Any] = {}
+        if isinstance(record, str):
+            query_text = record.strip()
+        elif isinstance(record, dict):
+            query_text = str(record.get("query") or record.get("prompt") or "").strip()
+            ensure_docs = record.get("ensure_min_docs")
+            metadata = {
+                k: v
+                for k, v in record.items()
+                if k not in {"query", "prompt", "ensure_min_docs"}
+            }
+        if not query_text:
+            continue
+        queries.append(EvaluationQuery(query=query_text, ensure_min_docs=ensure_docs, metadata=metadata))
+
+    if not queries:
+        raise ValueError(f"No valid queries found in {path}")
+    return queries
+
+
+def _safe_numeric(values: Iterable[Any]) -> List[float]:
+    cleaned: List[float] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            cleaned.append(float(value))
+            continue
+        try:
+            cleaned.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+def _mean(values: Iterable[Any]) -> float:
+    nums = _safe_numeric(values)
+    return float(statistics.mean(nums)) if nums else 0.0
+
+
+def _median(values: Iterable[Any]) -> float:
+    nums = _safe_numeric(values)
+    return float(statistics.median(nums)) if nums else 0.0
+
+
+def _ratio(rows: Iterable[Mapping[str, Any]], predicate: Callable[[Mapping[str, Any]], bool]) -> float:
+    rows = list(rows)
+    if not rows:
+        return 0.0
+    hits = sum(1 for row in rows if predicate(row))
+    return hits / len(rows)
+
+
+def _load_baseline_metrics(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        LOGGER.warning("Unable to parse baseline report at %s", path)
+        return None
+    aggregate = data.get("aggregate")
+    return aggregate if isinstance(aggregate, dict) else None
+
+
+def evaluate_rag_model(
+    rag_factory: Callable[[], "RAGQwen30b"],
+    cfg: RAGEvaluationConfig,
+) -> RAGEvaluationResult:
+    """Run the RAG pipeline over a benchmark set and persist metrics."""
+
+    queries = load_evaluation_queries(cfg.queries_path)
+    if cfg.max_queries:
+        queries = queries[: cfg.max_queries]
+    rag = rag_factory()
+    query_metrics: List[Dict[str, Any]] = []
+    for query in queries:
+        ensure_docs = query.ensure_min_docs or cfg.ensure_min_docs
+        response = rag.answer(
+            query.query,
+            ensure_min_docs=ensure_docs,
+            collections=list(cfg.collections),
+        )
+        diagnostics = dict(response.get("diagnostics") or {})
+        diagnostics["query"] = query.query
+        diagnostics["sources"] = response.get("sources", [])
+        diagnostics["answer_preview"] = (response.get("answer") or "")[:512]
+        diagnostics["doc_diversity"] = len(set(diagnostics["sources"]))
+        diagnostics["multi_doc"] = diagnostics["doc_diversity"] >= max(ensure_docs or 3, 3)
+        answer_text = (response.get("answer") or "").strip()
+        diagnostics["refused"] = answer_text.startswith("I don't have enough information")
+        diagnostics["metadata"] = query.metadata
+        query_metrics.append(diagnostics)
+
+    aggregate = {
+        "queries_evaluated": len(query_metrics),
+        "avg_dense_candidates": _mean(row.get("dense") for row in query_metrics),
+        "avg_reranked": _mean(row.get("after_rerank") for row in query_metrics),
+        "avg_deduped": _mean(row.get("after_dedupe") for row in query_metrics),
+        "avg_capped": _mean(row.get("after_cap") for row in query_metrics),
+        "median_packed_chars": _median(row.get("packed_chars") for row in query_metrics),
+        "avg_latency_seconds": _mean(row.get("elapsed_seconds") for row in query_metrics),
+        "doc_diversity_avg": _mean(row.get("doc_diversity") for row in query_metrics),
+        "multi_doc_rate": _ratio(query_metrics, lambda row: bool(row.get("multi_doc"))),
+        "refusal_rate": _ratio(query_metrics, lambda row: bool(row.get("refused"))),
+    }
+
+    baseline = _load_baseline_metrics(cfg.baseline_report)
+    comparison: Optional[Dict[str, Dict[str, float]]] = None
+    if baseline:
+        comparison = {}
+        for key, current in aggregate.items():
+            baseline_value = baseline.get(key)
+            if baseline_value is None:
+                continue
+            comparison[key] = {
+                "current": current,
+                "baseline": float(baseline_value),
+                "delta": current - float(baseline_value),
+            }
+
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_payload = {
+        "aggregate": aggregate,
+        "queries": query_metrics,
+        "comparison": comparison,
+        "collections": list(cfg.collections),
+    }
+    cfg.output_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    LOGGER.info(
+        "RAG evaluation complete: %d queries, multi-doc rate %.2f, refusal rate %.2f",
+        aggregate["queries_evaluated"],
+        aggregate["multi_doc_rate"],
+        aggregate["refusal_rate"],
+    )
+    return RAGEvaluationResult(
+        output_path=cfg.output_path,
+        aggregate=aggregate,
+        query_metrics=query_metrics,
+        comparison=comparison,
+    )
+
+
+def _format_extra_parameters(params: Mapping[str, Any]) -> str:
+    if not params:
+        return ""
+    lines = []
+    for key, value in params.items():
+        lines.append(f"PARAMETER {key} {value}")
+    return "\n".join(lines)
+
+
+def write_modelfile(cfg: ModelfileConfig, weights_path: Path) -> Path:
+    """Render a Modelfile from the provided template."""
+
+    if not cfg.template_path.exists():
+        raise FileNotFoundError(f"Template not found at {cfg.template_path}")
+    template = cfg.template_path.read_text(encoding="utf-8")
+    rendered = template.format(
+        MODEL_PATH=weights_path.as_posix(),
+        MODEL_NAME=cfg.model_name,
+        CONTEXT_WINDOW=cfg.context_window,
+        TEMPERATURE=cfg.temperature,
+        TOP_P=cfg.top_p,
+        REPEAT_PENALTY=cfg.repeat_penalty,
+        EXTRA_PARAMETERS=_format_extra_parameters(cfg.extra_parameters),
+    )
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.output_path.write_text(rendered, encoding="utf-8")
+    LOGGER.info("Wrote Modelfile to %s pointing at %s", cfg.output_path, weights_path)
+    return cfg.output_path
 
 
 def train_model(cfg: TrainConfig) -> Path:
@@ -405,7 +694,10 @@ def convert_to_gguf(cfg: GGUFConfig) -> Path:
     return cfg.gguf_output
 
 
-def run_full_pipeline(config: PipelineRunConfig) -> PipelineResult:
+def run_full_pipeline(
+    config: PipelineRunConfig,
+    rag_factory: Optional[Callable[[], "RAGQwen30b"]] = None,
+) -> PipelineResult:
     """Execute the export → train → merge → convert workflow."""
 
     export_result = export_training_data(config.export)
@@ -444,12 +736,32 @@ def run_full_pipeline(config: PipelineRunConfig) -> PipelineResult:
         else:
             gguf_path = gguf_result
 
+    modelfile_path: Optional[Path] = None
+    weights_for_inference = quantized_path or gguf_path or merged_dir
+    if config.modelfile is not None:
+        if weights_for_inference is None:
+            raise ValueError("Modelfile rendering requested but no model weights are available")
+        modelfile_path = write_modelfile(config.modelfile, weights_for_inference)
+
+    evaluation_report: Optional[Path] = None
+    evaluation_metrics: Optional[Dict[str, Any]] = None
+    if config.evaluation is not None:
+        if rag_factory is None:
+            LOGGER.warning("Evaluation config supplied without rag_factory; skipping RAG validation stage.")
+        else:
+            eval_result = evaluate_rag_model(rag_factory, config.evaluation)
+            evaluation_report = eval_result.output_path
+            evaluation_metrics = eval_result.aggregate
+
     return PipelineResult(
         export=export_result,
         adapter_dir=adapter_dir,
         merged_model_dir=merged_dir,
         gguf_model_path=gguf_path,
         quantized_model_path=quantized_path,
+        modelfile_path=modelfile_path,
+        evaluation_report=evaluation_report,
+        evaluation_metrics=evaluation_metrics,
     )
 
 
@@ -518,6 +830,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     gguf_parser.add_argument("--quantize", help="Quantization preset, e.g. Q4_K_M")
     gguf_parser.add_argument("--quantized-output", type=Path, help="Output path for quantized GGUF weights")
 
+    modelfile_parser = subparsers.add_parser("render-modelfile", help="Render an Ollama Modelfile from a template")
+    modelfile_parser.add_argument("--template", required=True, type=Path, help="Path to Modelfile template")
+    modelfile_parser.add_argument("--output", required=True, type=Path, help="Destination Modelfile path")
+    modelfile_parser.add_argument("--weights", required=True, type=Path, help="Model weights to reference (GGUF or HF)")
+    modelfile_parser.add_argument("--model-name", default="qwen3-30b-procwise", help="Name to register with Ollama")
+    modelfile_parser.add_argument("--context-window", type=int, default=8192)
+    modelfile_parser.add_argument("--temperature", type=float, default=0.2)
+    modelfile_parser.add_argument("--top-p", type=float, default=0.9)
+    modelfile_parser.add_argument("--repeat-penalty", type=float, default=1.05)
+    modelfile_parser.add_argument(
+        "--parameter",
+        action="append",
+        help="Additional PARAMETER lines in KEY=VALUE form (repeatable)",
+    )
+
+    eval_parser = subparsers.add_parser("rag-eval", help="Evaluate the RAG pipeline across multiple collections")
+    eval_parser.add_argument("--queries", required=True, type=Path, help="JSON/JSONL file containing evaluation prompts")
+    eval_parser.add_argument("--collections", required=True, nargs="+", help="Qdrant collections to evaluate against")
+    eval_parser.add_argument("--output", required=True, type=Path, help="Where to store the evaluation report JSON")
+    eval_parser.add_argument("--baseline", type=Path, help="Optional previous report JSON for comparison")
+    eval_parser.add_argument("--max-queries", type=int, help="Optional cap on number of queries to run")
+    eval_parser.add_argument("--ensure-min-docs", type=int, default=3, help="Minimum distinct doc_ids to enforce")
+    eval_parser.add_argument(
+        "--rag-factory",
+        required=True,
+        help="Dotted path to a zero-arg callable returning services.rag_qwen30b.RAGQwen30b",
+    )
+
     return parser
 
 
@@ -584,6 +924,32 @@ def main(argv: Optional[Sequence[str]] = None) -> Path | ExportResult:
             quantized_output=args.quantized_output,
         )
         return convert_to_gguf(cfg)
+
+    if args.command == "render-modelfile":
+        params = _parse_extra_parameters(args.parameter)
+        cfg = ModelfileConfig(
+            template_path=args.template,
+            output_path=args.output,
+            model_name=args.model_name,
+            context_window=args.context_window,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repeat_penalty=args.repeat_penalty,
+            extra_parameters=params,
+        )
+        return write_modelfile(cfg, args.weights)
+
+    if args.command == "rag-eval":
+        rag_factory = _load_callable(args.rag_factory)
+        cfg = RAGEvaluationConfig(
+            queries_path=args.queries,
+            output_path=args.output,
+            collections=args.collections,
+            ensure_min_docs=args.ensure_min_docs,
+            baseline_report=args.baseline,
+            max_queries=args.max_queries,
+        )
+        return evaluate_rag_model(rag_factory, cfg).output_path
 
     raise ValueError(f"Unknown command {args.command}")
 

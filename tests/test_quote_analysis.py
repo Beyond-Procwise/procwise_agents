@@ -6,7 +6,7 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(Path(__file__).resolve().parent, "..")))
 
-from email_thread import EmailThread
+from services.email_thread import EmailThread
 from models.quote_analysis import (
     SupplierScorecard,
     build_analytics_context,
