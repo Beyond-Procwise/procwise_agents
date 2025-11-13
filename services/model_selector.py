@@ -2178,7 +2178,63 @@ class RAGPipeline:
         cleaned = re.sub(r" ?\n ?", "\n", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         cleaned = self._strip_metadata_terms(cleaned)
-        return cleaned
+        return self._apply_structured_formatting(cleaned)
+
+    def _apply_structured_formatting(self, text: str) -> str:
+        """Normalise whitespace and add paragraph/list spacing for readability."""
+
+        if not isinstance(text, str):
+            return ""
+
+        normalised = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalised:
+            return ""
+
+        normalised = re.sub(r"\n{3,}", "\n\n", normalised)
+
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", normalised)
+        paragraphs: List[str] = []
+
+        intro_count = 3 if len(sentences) > 3 else len(sentences)
+        if len(sentences) > intro_count:
+            lead = " ".join(sentences[:intro_count]).strip()
+            if lead:
+                paragraphs.append(lead)
+            remainder_sentences = sentences[intro_count:]
+        else:
+            remainder_sentences = []
+            lead = " ".join(sentences).strip()
+            if lead:
+                paragraphs.append(lead)
+
+        if remainder_sentences:
+            remainder = " ".join(remainder_sentences).strip()
+            if remainder:
+                remainder = re.sub(r"(:)\s*([1-9]\d*[\.)])", r"\1\n\n\2", remainder)
+                remainder = re.sub(
+                    r"(?<!\n)([1-9]\d*[\.)])\s+",
+                    lambda match: f"\n\n{match.group(1)} ",
+                    remainder,
+                )
+                remainder = re.sub(
+                    r"(?<!\n)([-*•])\s+",
+                    lambda match: f"\n\n{match.group(1)} ",
+                    remainder,
+                )
+                remainder = re.sub(r"\n{3,}", "\n\n", remainder)
+                for block in remainder.split("\n\n"):
+                    stripped = block.strip()
+                    if stripped:
+                        paragraphs.append(stripped)
+
+        formatted = "\n\n".join(paragraphs)
+        formatted = re.sub(
+            r"(\d+[\.)][^\n]*\.)\s+(?=(?:If|Next|This|That|They|We|You)\b)",
+            r"\1\n\n",
+            formatted,
+        )
+        formatted = re.sub(r"\n{3,}", "\n\n", formatted)
+        return formatted.strip()
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
         """Calls :func:`ollama.chat` once to get answer and follow-ups."""
@@ -2624,7 +2680,7 @@ class RAGPipeline:
             except Exception:
                 pass
 
-        return {
+        result_payload = {
             "answer": html_answer,
             "follow_ups": follow_ups,
             "retrieved_documents": retrieved_documents_payloads,

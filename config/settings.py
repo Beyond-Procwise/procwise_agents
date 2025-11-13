@@ -321,6 +321,21 @@ class Settings(BaseSettings):
         env="RAG_RERANKER_MAX_CHARS",
         description="Character limit applied to candidate passages before reranking to keep inference responsive.",
     )
+    rag_reranker_cache_size: int = Field(
+        default=384,
+        env="RAG_RERANKER_CACHE_SIZE",
+        description="Number of cross-encoder scores memoised to skip redundant reranking calls.",
+    )
+    rag_qdrant_search_ef: int = Field(
+        default=160,
+        env="RAG_QDRANT_SEARCH_EF",
+        description="HNSW exploration factor for vector lookups; lower values speed up retrieval while trading slight recall.",
+    )
+    rag_qdrant_search_workers: int = Field(
+        default=4,
+        env="RAG_QDRANT_SEARCH_WORKERS",
+        description="Maximum number of Qdrant collections queried in parallel during retrieval.",
+    )
     procurement_knowledge_path: Optional[str] = Field(
         default=None, env="PROCUREMENT_KNOWLEDGE_PATH"
     )
