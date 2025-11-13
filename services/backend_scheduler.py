@@ -3,7 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
-from services.email_watcher_service import EmailWatcherService
+from services.email_watcher import EmailWatcherService
 
 from services.model_training_endpoint import ModelTrainingEndpoint
 from utils.gpu import configure_gpu

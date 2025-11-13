@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from services.email_watcher_service import run_email_watcher_for_workflow
+from services.email_watcher import run_email_watcher_for_workflow
 
 logger = logging.getLogger(__name__)
 

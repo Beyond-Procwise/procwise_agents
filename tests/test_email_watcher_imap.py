@@ -47,7 +47,7 @@ def _sample_row(
 
 
 def test_watcher_skips_without_credentials(monkeypatch):
-    from services import email_watcher_service
+    from services import email_watcher as email_watcher_service
 
     monkeypatch.setattr(email_watcher_service, "app_settings", None)
     monkeypatch.setattr(email_watcher_service, "_load_dispatch_rows", lambda workflow_id: [_sample_row()])
@@ -64,7 +64,7 @@ def test_watcher_skips_without_credentials(monkeypatch):
 
 
 def test_watcher_waits_until_dispatch_complete(monkeypatch):
-    from services import email_watcher_service
+    from services import email_watcher as email_watcher_service
 
     monkeypatch.setattr(
         email_watcher_service,
@@ -116,7 +116,7 @@ def test_watcher_waits_until_dispatch_complete(monkeypatch):
 
 
 def test_watcher_waits_when_message_id_missing(monkeypatch):
-    from services import email_watcher_service
+    from services import email_watcher as email_watcher_service
 
     env_values = {
         "IMAP_HOST": "imap.test",
@@ -157,7 +157,7 @@ def test_watcher_waits_when_message_id_missing(monkeypatch):
 
 
 def test_watcher_waits_without_expected_dispatches(monkeypatch):
-    from services import email_watcher_service
+    from services import email_watcher as email_watcher_service
 
     env_values = {
         "IMAP_HOST": "imap.test",
@@ -198,7 +198,7 @@ def test_watcher_waits_without_expected_dispatches(monkeypatch):
 
 
 def test_run_email_watcher_uses_agent_registry(monkeypatch):
-    from services import email_watcher_service
+    from services import email_watcher as email_watcher_service
 
     env_values = {
         "IMAP_HOST": "imap.test",

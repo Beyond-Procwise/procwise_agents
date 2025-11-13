@@ -23,8 +23,8 @@ from repositories import (
     workflow_lifecycle_repo,
 )
 from repositories.workflow_email_tracking_repo import WorkflowDispatchRow
-from services import email_watcher_v2
-from services.email_watcher_v2 import EmailResponse, EmailWatcherV2, _parse_email
+from services import email_watcher as email_watcher_v2
+from services.email_watcher import EmailResponse, EmailWatcherV2, _parse_email
 from services import supplier_response_coordinator
 from utils.email_tracking import (
     embed_unique_id_in_email_body,

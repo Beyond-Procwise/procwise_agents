@@ -4,7 +4,7 @@ import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import services.email_watcher_service as email_watcher_service
+import services.email_watcher as email_watcher_service
 from repositories import workflow_lifecycle_repo
 
 

@@ -22,7 +22,7 @@ from repositories import (
 )
 from repositories.supplier_response_repo import SupplierResponseRow
 from utils.gpu import configure_gpu
-from services.watcher_utils import run_email_watcher_for_workflow
+from services.email_watcher import run_email_watcher_for_workflow
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from agents.negotiation_agent import NegotiationAgent

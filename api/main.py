@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from orchestration.orchestrator import Orchestrator
 from services.model_selector import RAGPipeline
 from services.model_training_endpoint import ModelTrainingEndpoint
-from services.email_watcher_service import run_email_watcher_for_workflow
+from services.email_watcher import run_email_watcher_for_workflow
 from agents.base_agent import AgentNick
 from agents.registry import AgentRegistry
 from agents.data_extraction_agent import DataExtractionAgent

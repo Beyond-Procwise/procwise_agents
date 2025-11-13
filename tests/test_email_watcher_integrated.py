@@ -18,7 +18,7 @@ from repositories.workflow_email_tracking_repo import (
     reset_workflow as reset_tracking,
 )
 import services.db as db
-from services.email_watcher_v2 import (
+from services.email_watcher import (
     ContinuousEmailWatcher,
     EmailResponse,
     embed_unique_id_in_email_body,

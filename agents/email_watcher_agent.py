@@ -21,7 +21,7 @@ from services.imap_supplier_response_watcher import (
     DispatchRecord,
     SupplierResponseRecord,
 )
-from services.email_watcher_v2 import EmailResponse, _parse_email
+from services.email_watcher import EmailResponse, _parse_email
 from utils.email_markers import (
     extract_marker_token,
     extract_rfq_id,

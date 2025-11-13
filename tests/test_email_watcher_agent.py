@@ -13,7 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from agents.base_agent import AgentContext, AgentStatus
 from agents.email_watcher_agent import EmailWatcherAgent
 from services.imap_supplier_response_watcher import DatabaseBackend
-from services.email_watcher_v2 import EmailResponse
+from services.email_watcher import EmailResponse
 from utils.email_tracking import embed_unique_id_in_email_body, generate_unique_email_id
 
 

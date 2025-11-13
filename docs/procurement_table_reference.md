@@ -19,7 +19,7 @@ sources.
    `category_level_2` through `category_level_5`.
 5. **Invoices ➜ Invoice Line Items**: `proc.invoice_line_items_agent`
    joins on `invoice_id` to provide detailed invoice lines.
-6. **Supplier Responses ➜ Tracking**: `services.email_watcher_v2.EmailWatcherV2`
+6. **Supplier Responses ➜ Tracking**: `services.email_watcher.EmailWatcherV2`
    polls the configured IMAP mailbox, matches replies by workflow/unique ID
    using `proc.workflow_email_tracking`, and persists structured responses to
    `proc.supplier_response` for downstream agents.
