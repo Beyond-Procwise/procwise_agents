@@ -198,9 +198,9 @@ class RAGQwen30b:
             for h in hits or []:
                 # tag collection name into payload so downstream code can prioritise
                 try:
-                    if getattr(h, 'payload', None) is not None:
-                        h.payload = dict(getattr(h, 'payload') or {})
-                        h.payload.setdefault('collection_name', coll)
+                    if getattr(h, "payload", None) is not None:
+                        h.payload = dict(getattr(h, "payload") or {})
+                        h.payload.setdefault("collection_name", coll)
                 except Exception:
                     pass
             all_hits.extend(hits or [])
@@ -209,13 +209,16 @@ class RAGQwen30b:
         for h in all_hits or []:
             payload = getattr(h, "payload", {}) if h is not None else {}
             content = payload.get("content") or payload.get("text") or payload.get("summary") or ""
+            vector = getattr(h, "vector", None)
+            if vector is None:
+                vector = payload.get("embedding")
             chunk = {
                 "id": getattr(h, "id", None) or payload.get("record_id") or None,
                 "doc_id": payload.get("record_id") or payload.get("doc_id") or payload.get("document_id") or payload.get("documentid") or payload.get("filename") or payload.get("file_name") or None,
                 "content": content,
                 "payload": payload,
                 "score": getattr(h, "score", None) or 0.0,
-                "vector": payload.get("embedding") if isinstance(payload.get("embedding"), (list, tuple, np.ndarray)) else None,
+                "vector": vector if isinstance(vector, (list, tuple, np.ndarray)) else None,
             }
             dense.append(chunk)
         self.telemetry["dense_count"] = len(dense)
