@@ -45,6 +45,11 @@ except Exception:
     camelot = None
 _easyocr_reader = None
 
+try:
+    from llama_parse import LlamaParse
+except Exception:
+    LlamaParse = None  # type: ignore[misc]
+
 from qdrant_client import models
 from sentence_transformers import util
 import torch
@@ -126,6 +131,8 @@ class DocumentTextBundle:
     raw_text: str = ""
     ocr_text: str = ""
     routing_log: List[Dict[str, Any]] = field(default_factory=list)
+    llamaparse_text: str = ""
+    llamaparse_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -721,6 +728,7 @@ class DataExtractionAgent(BaseAgent):
         self._document_extractor_lock = threading.Lock()
         self._layout_parser = LayoutAwareParser()
         self._semantic_chunker = SemanticChunker(settings=self.settings)
+        self._llamaparse_parser = self._create_llamaparse_parser()
 
     @staticmethod
     def _json_default(value: Any) -> Any:
@@ -823,6 +831,37 @@ class DataExtractionAgent(BaseAgent):
             fallback,
         )
         return fallback
+
+    def _create_llamaparse_parser(self) -> Optional["LlamaParse"]:
+        """Initialise an optional LlamaParse client when credentials are available."""
+
+        api_key = getattr(self.settings, "llamaparse_api_key", None) or os.getenv("LLAMAPARSE_API_KEY")
+        if not api_key:
+            return None
+        if LlamaParse is None:
+            logger.warning("llama-parse package not installed; skipping LlamaParse integration.")
+            return None
+
+        extra_kwargs: Dict[str, Any] = {}
+        base_url = getattr(self.settings, "llamaparse_base_url", None) or os.getenv("LLAMAPARSE_BASE_URL")
+        if isinstance(base_url, str) and base_url.strip():
+            extra_kwargs["base_url"] = base_url.strip()
+
+        try:
+            parser = LlamaParse(
+                api_key=api_key,
+                result_type="markdown",
+                split_by_page=True,
+                show_progress=False,
+                verbose=False,
+                **extra_kwargs,
+            )
+        except Exception:
+            logger.exception("Failed to initialise LlamaParse parser; continuing without it.")
+            return None
+
+        logger.info("LlamaParse parser initialised for enhanced document understanding.")
+        return parser
 
     def _get_document_extractor(self) -> DocumentExtractor:
         extractor = self._document_extractor
@@ -1571,7 +1610,12 @@ class DataExtractionAgent(BaseAgent):
         )
         text_bundle = self._extract_text(file_bytes, object_key, force_ocr=force_ocr)
         text = text_bundle.full_text
-        doc_type = self._classify_doc_type(text)
+        doc_type = self._classify_doc_type(
+            text,
+            file_bytes=file_bytes,
+            file_name=object_key,
+            text_bundle=text_bundle,
+        )
         product_type = self._classify_product_type(text)
         unique_id = self._extract_unique_id(text, doc_type)
         vendor_name = self._infer_vendor_name(text, object_key)
@@ -2041,8 +2085,8 @@ class DataExtractionAgent(BaseAgent):
             )
             return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
         if ext == ".pdf":
-            return self._extract_pdf_text_bundle(file_bytes, force_ocr=force_ocr)
-        if ext in {".doc", ".docx"}:
+            bundle = self._extract_pdf_text_bundle(file_bytes, force_ocr=force_ocr)
+        elif ext in {".doc", ".docx"}:
             text = self._extract_text_from_docx(file_bytes)
             page_result = PageExtractionResult(
                 page_number=1,
@@ -2050,14 +2094,14 @@ class DataExtractionAgent(BaseAgent):
                 digital_text=text,
                 char_count=len(text or ""),
             )
-            return DocumentTextBundle(
+            bundle = DocumentTextBundle(
                 full_text=text,
                 page_results=[page_result],
                 raw_text=text,
                 ocr_text="",
                 routing_log=[{"page": 1, "route": "digital", "digital_chars": len(text)}],
             )
-        if ext in {".png", ".jpg", ".jpeg"}:
+        elif ext in {".png", ".jpg", ".jpeg"}:
             text = self._extract_text_from_image(file_bytes)
             page_result = PageExtractionResult(
                 page_number=1,
@@ -2065,15 +2109,122 @@ class DataExtractionAgent(BaseAgent):
                 ocr_text=text,
                 char_count=len(text or ""),
             )
-            return DocumentTextBundle(
+            bundle = DocumentTextBundle(
                 full_text=text,
                 page_results=[page_result],
                 raw_text="",
                 ocr_text=text,
                 routing_log=[{"page": 1, "route": "ocr", "ocr_chars": len(text)}],
             )
-        logger.warning("Unsupported document type '%s' for %s", ext, object_key)
-        return DocumentTextBundle(full_text="", page_results=[], raw_text="", ocr_text="")
+        else:
+            logger.warning("Unsupported document type '%s' for %s", ext, object_key)
+            bundle = DocumentTextBundle(
+                full_text="",
+                page_results=[],
+                raw_text="",
+                ocr_text="",
+            )
+
+        return self._augment_with_llamaparse(bundle, file_bytes, object_key)
+
+    def _llamaparse_parse(
+        self, file_bytes: bytes, *, file_name: Optional[str] = None
+    ) -> Optional[Tuple[str, Dict[str, Any], List[str]]]:
+        """Run LlamaParse over the provided file content.
+
+        Returns a tuple of combined text, aggregated metadata, and the per-page
+        texts when parsing succeeds. ``None`` is returned when the parser is not
+        available or an error occurs.
+        """
+
+        parser = getattr(self, "_llamaparse_parser", None)
+        if parser is None or not file_bytes:
+            return None
+
+        suffix = Path(file_name or "document.pdf").suffix or ".pdf"
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                tmp_file.write(file_bytes)
+                tmp_file.flush()
+                tmp_path = tmp_file.name
+            documents = parser.load_data(tmp_path)
+        except Exception:
+            logger.warning(
+                "LlamaParse parsing failed for %s", file_name or "<memory>", exc_info=True
+            )
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    logger.debug("Failed to remove temporary file %s", tmp_path, exc_info=True)
+
+        if not documents:
+            return None
+
+        combined_texts: List[str] = []
+        page_texts: List[str] = []
+        metadata: Dict[str, Any] = {}
+
+        for document in documents:
+            raw_text = getattr(document, "text", None)
+            if isinstance(raw_text, str) and raw_text.strip():
+                cleaned = raw_text.strip()
+                combined_texts.append(cleaned)
+                page_texts.append(cleaned)
+
+            for attr_name in ("metadata", "extra_info"):
+                doc_meta = getattr(document, attr_name, None)
+                if isinstance(doc_meta, dict):
+                    for key, value in doc_meta.items():
+                        if value in (None, "", [], {}):
+                            continue
+                        metadata.setdefault(key, value)
+
+        combined = "\n".join(combined_texts).strip()
+        if not combined and not metadata:
+            return None
+        return combined or "", metadata, page_texts
+
+    def _augment_with_llamaparse(
+        self, bundle: DocumentTextBundle, file_bytes: bytes, object_key: str
+    ) -> DocumentTextBundle:
+        """Merge LlamaParse output into an existing :class:`DocumentTextBundle`."""
+
+        try:
+            result = self._llamaparse_parse(file_bytes, file_name=object_key)
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.debug("LlamaParse augmentation failed", exc_info=True)
+            result = None
+
+        if not result:
+            return bundle
+
+        llama_text, llama_meta, llama_pages = result
+        base_text = bundle.full_text or ""
+
+        if llama_text and len(llama_text) > len(base_text):
+            bundle.full_text = llama_text
+        if llama_text and not bundle.raw_text:
+            bundle.raw_text = llama_text
+        if llama_text:
+            bundle.llamaparse_text = llama_text
+
+        if llama_meta:
+            bundle.llamaparse_metadata.update(llama_meta)
+
+        if llama_pages:
+            log_entry = {
+                "parser": "llamaparse",
+                "route": "llamaparse",
+                "pages": len(llama_pages),
+                "char_count": sum(len(page or "") for page in llama_pages),
+            }
+            bundle.routing_log.append(log_entry)
+
+        return bundle
 
     def _parse_header_improved(
         self,
@@ -5176,12 +5327,25 @@ class DataExtractionAgent(BaseAgent):
                 )
 
     # ============================ VECTORIZING =============================
-    def _ensure_qdrant_collection(self) -> None:
+    def _get_qdrant_collection_name(self, doc_type: Any = None) -> str:
+        """Return the Qdrant collection name for the supplied document type."""
+
+        base = getattr(self.settings, "qdrant_collection_name", "procwise_document_embeddings")
+        if not isinstance(base, str) or not base.strip():
+            base = "procwise_document_embeddings"
+        base = re.sub(r"[^A-Za-z0-9_-]", "_", base.strip()) or "procwise_document_embeddings"
+
+        normalized_type = _normalize_label(doc_type)
+        doc_specific = {"invoice", "purchase_order", "quote", "contract"}
+        if normalized_type in doc_specific:
+            return f"{base}_{normalized_type}"
+        return base
+
+    def _ensure_qdrant_collection(self, doc_type: Any = None) -> str:
         """
         Determine vector size reliably and ensure the Qdrant collection exists.
         """
-        # Get target collection name
-        collection = self.settings.qdrant_collection_name
+        collection = self._get_qdrant_collection_name(doc_type)
 
         # Determine embedding dimension safely
         dim = None
@@ -5214,6 +5378,8 @@ class DataExtractionAgent(BaseAgent):
             distance="COSINE",
         )
 
+        return collection
+
     def _vectorize_document(
             self,
             full_text: str,
@@ -5226,11 +5392,14 @@ class DataExtractionAgent(BaseAgent):
         if not full_text:
             return
 
-        # Ensure collection exists (idempotent)
         try:
-            self._ensure_qdrant_collection()
+            collection_name = self._ensure_qdrant_collection(doc_type)
         except Exception:
-            logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
+            collection_name = self._get_qdrant_collection_name(doc_type)
+            logger.warning(
+                "Qdrant init skipped or failed (will attempt upsert-retry).",
+                exc_info=True,
+            )
 
         chunk_fn = self._chunk_text
         try:
@@ -5269,7 +5438,7 @@ class DataExtractionAgent(BaseAgent):
         # Upsert with create-on-404 retry
         try:
             self.agent_nick.qdrant_client.upsert(
-                collection_name=self.settings.qdrant_collection_name,
+                collection_name=collection_name,
                 points=points,
                 wait=True,
             )
@@ -5278,9 +5447,9 @@ class DataExtractionAgent(BaseAgent):
             msg = str(e)
             if "doesn't exist" in msg or "does not exist" in msg or "Not found" in msg:
                 logger.info("Qdrant collection missing — creating and retrying upsert...")
-                self._ensure_qdrant_collection()
+                collection_name = self._ensure_qdrant_collection(doc_type)
                 self.agent_nick.qdrant_client.upsert(
-                    collection_name=self.settings.qdrant_collection_name,
+                    collection_name=collection_name,
                     points=points,
                     wait=True,
                 )
@@ -5299,11 +5468,14 @@ class DataExtractionAgent(BaseAgent):
         if not pk_value:
             return
 
-        # Ensure collection exists (idempotent)
         try:
-            self._ensure_qdrant_collection()
+            collection_name = self._ensure_qdrant_collection(doc_type)
         except Exception:
-            logger.warning("Qdrant init skipped or failed (will attempt upsert-retry).", exc_info=True)
+            collection_name = self._get_qdrant_collection_name(doc_type)
+            logger.warning(
+                "Qdrant init skipped or failed (will attempt upsert-retry).",
+                exc_info=True,
+            )
 
         texts: List[str] = []
         meta: List[Tuple[str, Dict[str, Any]]] = []
@@ -5366,7 +5538,7 @@ class DataExtractionAgent(BaseAgent):
         # Upsert with create-on-404 retry
         try:
             self.agent_nick.qdrant_client.upsert(
-                collection_name=self.settings.qdrant_collection_name,
+                collection_name=collection_name,
                 points=points,
                 wait=True,
             )
@@ -5374,9 +5546,9 @@ class DataExtractionAgent(BaseAgent):
             msg = str(e)
             if "doesn't exist" in msg or "does not exist" in msg or "Not found" in msg:
                 logger.info("Qdrant collection missing — creating and retrying upsert...")
-                self._ensure_qdrant_collection()
+                collection_name = self._ensure_qdrant_collection(doc_type)
                 self.agent_nick.qdrant_client.upsert(
-                    collection_name=self.settings.qdrant_collection_name,
+                    collection_name=collection_name,
                     points=points,
                     wait=True,
                 )
@@ -6137,30 +6309,190 @@ class DataExtractionAgent(BaseAgent):
                 conn.close()
 
     # ============================ CLASSIFICATION ==========================
-    def _classify_doc_type(self, text: str) -> str:
-        snippet = text[:2000].lower()
-        scores = {dtype: sum(snippet.count(kw) for kw in kws) for dtype, kws in DOC_TYPE_KEYWORDS.items()}
+    def _classify_doc_type(
+        self,
+        text: str,
+        *,
+        file_bytes: Optional[bytes] = None,
+        file_name: Optional[str] = None,
+        text_bundle: Optional[DocumentTextBundle] = None,
+    ) -> str:
+        """Classify procurement documents with LlamaParse assistance when available."""
+
+        llama_label = self._llamaparse_doc_type(
+            text=text,
+            file_bytes=file_bytes,
+            file_name=file_name,
+            text_bundle=text_bundle,
+        )
+        if llama_label:
+            return llama_label
+        return self._fallback_classify_doc_type(text)
+
+    def _llamaparse_doc_type(
+        self,
+        *,
+        text: str,
+        file_bytes: Optional[bytes],
+        file_name: Optional[str],
+        text_bundle: Optional[DocumentTextBundle],
+    ) -> Optional[str]:
+        """Derive the document type using LlamaParse metadata and enriched text."""
+
+        metadata_candidates: List[Dict[str, Any]] = []
+        text_candidates: List[str] = []
+
+        if text_bundle is not None:
+            if text_bundle.llamaparse_metadata:
+                metadata_candidates.append(dict(text_bundle.llamaparse_metadata))
+            if text_bundle.llamaparse_text:
+                text_candidates.append(text_bundle.llamaparse_text)
+
+        parser_available = getattr(self, "_llamaparse_parser", None) is not None
+        if parser_available and not metadata_candidates and file_bytes:
+            parse_result = self._llamaparse_parse(file_bytes, file_name=file_name)
+            if parse_result:
+                llama_text, llama_meta, _ = parse_result
+                if llama_text:
+                    text_candidates.append(llama_text)
+                    if text_bundle is not None:
+                        if len(llama_text) > len(text_bundle.full_text or ""):
+                            text_bundle.full_text = llama_text
+                        if not text_bundle.raw_text:
+                            text_bundle.raw_text = llama_text
+                        text_bundle.llamaparse_text = llama_text
+                if llama_meta:
+                    metadata_candidates.append(llama_meta)
+                    if text_bundle is not None:
+                        text_bundle.llamaparse_metadata.update(llama_meta)
+
+        for metadata in metadata_candidates:
+            label = self._normalize_llamaparse_document_type(metadata)
+            if label:
+                return label
+
+        for candidate_text in text_candidates:
+            label = self._keyword_classify_doc_type(candidate_text)
+            if label != "Other":
+                return label
+
+        # fall back to keyword scoring on the provided text before conceding
+        label = self._keyword_classify_doc_type(text)
+        return label if label != "Other" else None
+
+    def _normalize_llamaparse_document_type(self, payload: Any) -> Optional[str]:
+        """Normalise metadata emitted by LlamaParse into canonical doc labels."""
+
+        if isinstance(payload, dict):
+            candidate_keys = (
+                "document_type",
+                "documentType",
+                "doc_type",
+                "type",
+                "category",
+                "documentCategory",
+                "classification",
+                "title",
+            )
+            for key in candidate_keys:
+                if key in payload:
+                    label = self._normalize_llamaparse_document_type(payload[key])
+                    if label:
+                        return label
+            for value in payload.values():
+                label = self._normalize_llamaparse_document_type(value)
+                if label:
+                    return label
+            return None
+
+        if isinstance(payload, (list, tuple, set)):
+            for item in payload:
+                label = self._normalize_llamaparse_document_type(item)
+                if label:
+                    return label
+            return None
+
+        if payload is None:
+            return None
+
+        label = str(payload).strip()
+        if not label:
+            return None
+
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+        padded = f" {normalized_text} "
+        mapping = {
+            "Invoice": ("invoice", "tax invoice", "bill", "accounts receivable"),
+            "Purchase_Order": ("purchase order", "purchase-order", "purchaseorder", "po", "p o"),
+            "Quote": ("quote", "quotation", "estimate", "proposal"),
+            "Contract": (
+                "contract",
+                "agreement",
+                "master service agreement",
+                "msa",
+                "service contract",
+                "statement of work",
+                "sow",
+            ),
+        }
+
+        for canonical, keywords in mapping.items():
+            for keyword in keywords:
+                keyword_norm = re.sub(r"[^a-z0-9]+", " ", keyword.lower()).strip()
+                if not keyword_norm:
+                    continue
+                if " " in keyword_norm:
+                    if keyword_norm in normalized_text:
+                        return canonical
+                else:
+                    if f" {keyword_norm} " in padded:
+                        return canonical
+
+        return None
+
+    def _keyword_classify_doc_type(self, text: str) -> str:
+        snippet = (text or "")[:2000].lower()
+        if not snippet:
+            return "Other"
+        scores = {
+            dtype: sum(snippet.count(kw) for kw in kws)
+            for dtype, kws in DOC_TYPE_KEYWORDS.items()
+        }
         best_type, best_score = max(scores.items(), key=lambda kv: kv[1])
-        if best_score > 0:
-            return best_type
-        prompt = ("Classify the following document as Invoice, Purchase_Order, Quote, Contract, or Other. "
-                  "Respond with only the label.\n\nContext:\n" + DOC_CONTEXT_TEXT + "\n\nDocument:\n" + snippet)
+        return best_type if best_score > 0 else "Other"
+
+    def _fallback_classify_doc_type(self, text: str) -> str:
+        keyword_label = self._keyword_classify_doc_type(text)
+        if keyword_label != "Other":
+            return keyword_label
+        return self._llm_classify_doc_type(text)
+
+    def _llm_classify_doc_type(self, text: str) -> str:
+        snippet = (text or "")[:2000]
+        prompt = (
+            "Classify the following document as Invoice, Purchase_Order, Quote, Contract, or Other. "
+            "Respond with only the label.\n\nContext:\n"
+            + DOC_CONTEXT_TEXT
+            + "\n\nDocument:\n"
+            + snippet
+        )
         try:
             resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
             label = resp.get("response", "").strip().lower()
             for canonical in DOC_TYPE_KEYWORDS:
-                if canonical.replace("_", " ").lower() in label:
+                canonical_label = canonical.replace("_", " ").lower()
+                if canonical_label in label:
                     return canonical
             if "invoice" in label:
                 return "Invoice"
-            if "purchase" in label or "po" in label:
+            if "purchase" in label or re.search(r"\bpo\b", label):
                 return "Purchase_Order"
-            if "quote" in label:
+            if "quote" in label or "quotation" in label:
                 return "Quote"
-            if "contract" in label:
+            if "contract" in label or "agreement" in label:
                 return "Contract"
         except Exception:
-            pass
+            logger.debug("LLM classification fallback failed", exc_info=True)
         return "Other"
 
     def _classify_product_type(self, text: str) -> str:
