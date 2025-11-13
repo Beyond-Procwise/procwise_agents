@@ -3,10 +3,15 @@ import importlib.util
 import json
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set
 from types import SimpleNamespace
+
+import hashlib
 
 import numpy as np
 import faiss
@@ -102,6 +107,25 @@ class RAGService:
         )
         self._reranker_max_chars = max(
             int(getattr(self.settings, "rag_reranker_max_chars", 1400) or 256), 256
+        )
+        self._rerank_cache_size = max(
+            int(getattr(self.settings, "rag_reranker_cache_size", 384) or 0), 0
+        )
+        self._rerank_cache: "OrderedDict[str, float]" = OrderedDict()
+        self._rerank_cache_lock = threading.Lock()
+        self._qdrant_search_workers = max(
+            int(getattr(self.settings, "rag_qdrant_search_workers", 4) or 1), 1
+        )
+        self._qdrant_hnsw_ef = max(
+            int(getattr(self.settings, "rag_qdrant_search_ef", 160) or 1), 16
+        )
+        self._qdrant_search_params = models.SearchParams(
+            hnsw_ef=self._qdrant_hnsw_ef,
+            exact=False,
+        )
+        self._qdrant_exact_search_params = models.SearchParams(
+            hnsw_ef=self._qdrant_hnsw_ef,
+            exact=True,
         )
 
     # ------------------------------------------------------------------
@@ -531,6 +555,151 @@ class RAGService:
 
         return fields
 
+    def _query_qdrant_collection(
+        self,
+        collection_name: str,
+        vector: Sequence[float],
+        *,
+        query_filter: Optional[models.Filter],
+        limit: int,
+    ) -> List[SimpleNamespace]:
+        if not collection_name or self.client is None:
+            return []
+
+        self._ensure_filter_indexes(collection_name, query_filter)
+
+        search_kwargs = dict(
+            collection_name=collection_name,
+            query_vector=vector,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        def _copy_params(params: Optional[models.SearchParams]) -> Optional[models.SearchParams]:
+            if params is None:
+                return None
+            copier = getattr(params, "model_copy", None)
+            if callable(copier):
+                try:
+                    return copier(deep=True)
+                except Exception:
+                    return params
+            return params
+
+        try:
+            raw_hits = self.client.search(
+                **search_kwargs,
+                search_params=_copy_params(self._qdrant_search_params),
+            )
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return []
+            logger.warning(
+                "Qdrant search failed for collection %s", collection_name, exc_info=True
+            )
+            return []
+        except Exception:
+            logger.warning(
+                "Qdrant search failed for collection %s", collection_name, exc_info=True
+            )
+            return []
+
+        if not raw_hits:
+            try:
+                raw_hits = self.client.search(
+                    **search_kwargs,
+                    search_params=_copy_params(self._qdrant_exact_search_params),
+                )
+            except UnexpectedResponse as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    return []
+                logger.warning(
+                    "Exact Qdrant search failed for collection %s",
+                    collection_name,
+                    exc_info=True,
+                )
+                return []
+            except Exception:
+                logger.warning(
+                    "Exact Qdrant search failed for collection %s",
+                    collection_name,
+                    exc_info=True,
+                )
+                return []
+
+        wrapped: List[SimpleNamespace] = []
+        for hit in raw_hits or []:
+            payload = dict(getattr(hit, "payload", {}) or {})
+            payload.setdefault("collection_name", collection_name)
+            wrapped.append(
+                SimpleNamespace(
+                    id=str(getattr(hit, "id", payload.get("record_id"))),
+                    payload=payload,
+                    score=float(getattr(hit, "score", 0.0)),
+                )
+            )
+
+        return wrapped
+
+    def _search_collections_parallel(
+        self,
+        requests: Sequence[Tuple[str, Optional[models.Filter]]],
+        vector: Sequence[float],
+        *,
+        limit: int,
+    ) -> Dict[str, List[SimpleNamespace]]:
+        if not requests or self.client is None:
+            return {}
+
+        tasks: List[Tuple[str, Optional[models.Filter]]] = [
+            (name, query_filter)
+            for name, query_filter in requests
+            if isinstance(name, str) and name
+        ]
+        if not tasks:
+            return {}
+
+        max_workers = min(len(tasks), max(self._qdrant_search_workers, 1))
+        results: Dict[str, List[SimpleNamespace]] = {}
+
+        if max_workers <= 1:
+            for name, query_filter in tasks:
+                results[name] = self._query_qdrant_collection(
+                    name,
+                    vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                )
+            return results
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._query_qdrant_collection,
+                    name,
+                    vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                ): name
+                for name, query_filter in tasks
+            }
+
+            for future in as_completed(future_map):
+                name = future_map[future]
+                try:
+                    results[name] = future.result()
+                except Exception:
+                    logger.warning(
+                        "Parallel Qdrant search failed for collection %s",
+                        name,
+                        exc_info=True,
+                    )
+                    results[name] = []
+
+        return results
+
     def _prepare_reranker_text(self, payload: Dict[str, Any]) -> str:
         """Extract a concise text snippet for cross-encoder reranking."""
 
@@ -596,23 +765,87 @@ class RAGService:
             truncated = combined[:max_chars].strip()
         return truncated + "…"
 
+    def _build_rerank_cache_key(
+        self, query: Optional[str], document: Optional[str]
+    ) -> Optional[str]:
+        if self._rerank_cache_size <= 0:
+            return None
+        if not query or not document:
+            return None
+        try:
+            query_text = str(query).strip()
+            document_text = str(document).strip()
+        except Exception:
+            return None
+        if not query_text or not document_text:
+            return None
+        trimmed_document = document_text[: self._reranker_max_chars]
+        payload = f"{query_text}\u241f{trimmed_document}"
+        try:
+            return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
     def _batched_reranker_predict(self, pairs: Sequence[Tuple[str, str]]) -> List[float]:
-        """Score ``pairs`` using the cross-encoder in small batches."""
+        """Score ``pairs`` using the cross-encoder in small batches.
+
+        Results are memoised in a bounded LRU cache so repeated or highly
+        similar queries avoid recomputing expensive cross-encoder scores.
+        """
 
         if not pairs:
             return []
 
-        batch_size = max(self._reranker_batch_size, 1)
-        scores: List[float] = []
-        for start in range(0, len(pairs), batch_size):
-            chunk = list(pairs[start : start + batch_size])
-            if not chunk:
-                continue
-            chunk_scores = self._reranker.predict(chunk)
-            if hasattr(chunk_scores, "tolist"):
-                chunk_scores = chunk_scores.tolist()
-            scores.extend(float(score) for score in chunk_scores)
-        return scores
+        cache_keys: List[Optional[str]] = [
+            self._build_rerank_cache_key(query, document) for query, document in pairs
+        ]
+        scores: List[Optional[float]] = [None] * len(pairs)
+
+        if self._rerank_cache_size > 0:
+            with self._rerank_cache_lock:
+                for idx, key in enumerate(cache_keys):
+                    if key is None:
+                        continue
+                    cached = self._rerank_cache.get(key)
+                    if cached is None:
+                        continue
+                    # Refresh the LRU position
+                    self._rerank_cache.move_to_end(key)
+                    scores[idx] = float(cached)
+
+        missing_pairs: List[Tuple[str, str]] = []
+        missing_indices: List[int] = []
+        for idx, (pair, cached_score) in enumerate(zip(pairs, scores)):
+            if cached_score is None:
+                missing_pairs.append(pair)
+                missing_indices.append(idx)
+
+        if missing_pairs:
+            batch_size = max(self._reranker_batch_size, 1)
+            computed_scores: List[float] = []
+            for start in range(0, len(missing_pairs), batch_size):
+                chunk = list(missing_pairs[start : start + batch_size])
+                if not chunk:
+                    continue
+                chunk_scores = self._reranker.predict(chunk)
+                if hasattr(chunk_scores, "tolist"):
+                    chunk_scores = chunk_scores.tolist()
+                computed_scores.extend(float(score) for score in chunk_scores)
+
+            for idx, score in zip(missing_indices, computed_scores):
+                scores[idx] = float(score)
+
+            if self._rerank_cache_size > 0 and computed_scores:
+                with self._rerank_cache_lock:
+                    for idx, score in zip(missing_indices, computed_scores):
+                        key = cache_keys[idx]
+                        if key is None:
+                            continue
+                        self._rerank_cache[key] = float(score)
+                        while len(self._rerank_cache) > self._rerank_cache_size:
+                            self._rerank_cache.popitem(last=False)
+
+        return [float(score) if score is not None else 0.0 for score in scores]
 
     def _ensure_filter_indexes(
         self, collection_name: Optional[str], query_filter: Optional[models.Filter]
@@ -1056,81 +1289,6 @@ class RAGService:
                 )
 
         collections_to_query: Tuple[Tuple[str, Optional[models.Filter]], ...] = tuple()
-        if self.client is not None:
-            _, vector = _ensure_query_vectors()
-            search_params = models.SearchParams(hnsw_ef=256, exact=False)
-
-            def _search_collection(
-                name: str,
-                *,
-                query_filter: Optional[models.Filter],
-            ) -> List[SimpleNamespace]:
-                if not name:
-                    return []
-
-                self._ensure_filter_indexes(name, query_filter)
-                try:
-                    raw_hits = self.client.search(
-                        collection_name=name,
-                        query_vector=vector,
-                        query_filter=query_filter,
-                        limit=prefetch,
-                        with_payload=True,
-                        with_vectors=False,
-                        search_params=search_params,
-                    )
-                except UnexpectedResponse as exc:
-                    if getattr(exc, "status_code", None) == 404:
-                        return []
-                    logger.warning(
-                        "Qdrant search failed for collection %s", name, exc_info=True
-                    )
-                    return []
-                except Exception:
-                    logger.warning(
-                        "Qdrant search failed for collection %s", name, exc_info=True
-                    )
-                    return []
-
-                if not raw_hits:
-                    try:
-                        raw_hits = self.client.search(
-                            collection_name=name,
-                            query_vector=vector,
-                            query_filter=query_filter,
-                            limit=prefetch,
-                            with_payload=True,
-                            with_vectors=False,
-                            search_params=models.SearchParams(
-                                hnsw_ef=256, exact=True
-                            ),
-                        )
-                    except UnexpectedResponse as exc:
-                        if getattr(exc, "status_code", None) == 404:
-                            return []
-                        logger.warning(
-                            "Exact Qdrant search failed for collection %s", name, exc_info=True
-                        )
-                        return []
-                    except Exception:
-                        logger.warning(
-                            "Exact Qdrant search failed for collection %s", name, exc_info=True
-                        )
-                        return []
-
-                wrapped: List[SimpleNamespace] = []
-                for hit in raw_hits or []:
-                    payload = dict(getattr(hit, "payload", {}) or {})
-                    payload.setdefault("collection_name", name)
-                    wrapped.append(
-                        SimpleNamespace(
-                            id=str(getattr(hit, "id", payload.get("record_id"))),
-                            payload=payload,
-                            score=float(getattr(hit, "score", 0.0)),
-                        )
-                    )
-                return wrapped
-
         base_collections: List[Tuple[str, Optional[models.Filter]]] = []
 
         def _filter_signature(value: Optional[models.Filter]) -> str:
@@ -1214,19 +1372,26 @@ class RAGService:
 
         collections_to_query = tuple(base_collections)
 
-        for name, collection_filter in collections_to_query:
-            hits = _search_collection(name, query_filter=collection_filter)
-            for rank, hit in enumerate(hits[:prefetch], 1):
-                payload = dict(hit.payload or {})
-                payload.setdefault("collection_name", name)
-                _register_candidate(
-                    "qdrant",
-                    payload,
-                    hit.id,
-                    float(getattr(hit, "score", 0.0)),
-                    rank,
-                    weights["qdrant"],
-                )
+        if collections_to_query and self.client is not None:
+            _, vector = _ensure_query_vectors()
+            batched_hits = self._search_collections_parallel(
+                collections_to_query,
+                vector,
+                limit=prefetch,
+            )
+            for name, _ in collections_to_query:
+                hits = batched_hits.get(name, [])
+                for rank, hit in enumerate(hits[:prefetch], 1):
+                    payload = dict(getattr(hit, "payload", {}) or {})
+                    payload.setdefault("collection_name", name)
+                    _register_candidate(
+                        "qdrant",
+                        payload,
+                        getattr(hit, "id", payload.get("record_id")),
+                        float(getattr(hit, "score", 0.0)),
+                        rank,
+                        weights["qdrant"],
+                    )
 
         if not candidates:
             return []
