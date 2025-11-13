@@ -14,7 +14,7 @@ The module provides a CLI with dedicated sub-commands so each step can
 be orchestrated from automation or executed manually when needed.
 """
 from __future__ import annotations
-
+from unsloth import FastLanguageModel  # type: ignore
 import argparse
 import json
 import logging
@@ -34,10 +34,6 @@ except ModuleNotFoundError:  # pragma: no cover - import guard for --help invoca
 from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
                           PreTrainedTokenizerBase)
 
-try:  # pragma: no cover - optional import
-    from unsloth import FastLanguageModel  # type: ignore
-except Exception:  # pragma: no cover - optional import
-    FastLanguageModel = None
 
 try:  # pragma: no cover - optional import guard
     from peft import LoraConfig, PeftModel
