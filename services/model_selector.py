@@ -1865,6 +1865,17 @@ class RAGPipeline:
         if not normalised:
             return '<section class="llm-answer__segment"><p>No answer available.</p></section>'
 
+        def _insert_inline_breaks(block: str) -> str:
+            pattern = re.compile(r"(?<!\n)(?:\s*)(\d+[\.)])\s+(?=[A-Za-z])")
+
+            def repl(match: re.Match) -> str:
+                marker = match.group(1)
+                return "\n" + marker + " "
+
+            return pattern.sub(repl, block)
+
+        normalised = _insert_inline_breaks(normalised)
+
         header = (
             '<header class="llm-answer__heading">'
             "<h2>Here’s what I found</h2>"

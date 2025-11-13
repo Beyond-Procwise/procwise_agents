@@ -658,23 +658,21 @@ class RAGQwen30b:
             # set host if provided
             if OLLAMA_HOST:
                 ollama.host = OLLAMA_HOST
-            gen = ollama.generate(model=model_name, prompt=prompt_payload, options=options)
-            # Ollama returns an iterator or object depending on client; coerce to string
+            gen = ollama.generate(
+                model=model_name,
+                prompt=prompt_payload,
+                options=options,
+                stream=False,
+            )
             if isinstance(gen, dict):
-                # some clients return dict with text
-                answer_text = gen.get("output") or gen.get("text") or ""
+                answer_text = (
+                    gen.get("response")
+                    or gen.get("output")
+                    or gen.get("text")
+                    or ""
+                )
             else:
-                # try to read .text or iterate
-                try:
-                    answer_text = str(gen)
-                except Exception:
-                    answer_text = ""
-            if not answer_text:
-                # try to extract from returned fields
-                try:
-                    answer_text = getattr(gen, "text", "")
-                except Exception:
-                    answer_text = ""
+                answer_text = str(gen) if gen else ""
         except Exception:
             logger.exception("Ollama generation failed")
             answer_text = ""
