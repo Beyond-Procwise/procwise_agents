@@ -47,7 +47,7 @@ def test_vectorize_document_normalizes_labels(monkeypatch):
 
     agent._vectorize_document("hello world", "1", ["Invoice"], ["Hardware"], "doc.pdf")
 
-    assert captured["collection"] == "test_invoice"
+    assert captured["collection"] == "test"
     payload = captured["points"][0].payload
     assert payload["document_type"] == "invoice"
     assert payload["product_type"] == "hardware"
