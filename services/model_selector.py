@@ -1861,49 +1861,148 @@ class RAGPipeline:
         return deduped[:3]
 
     def _plain_text_to_html(self, text: str) -> str:
-        if not text:
-            return (
-                '<section class="llm-answer__segment">'
-                "<p>No answer available.</p>"
-                "</section>"
-            )
+        normalised = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if not normalised:
+            return '<section class="llm-answer__segment"><p>No answer available.</p></section>'
 
-        normalised = text.replace("\r\n", "\n").replace("\r", "\n")
-        html_parts: List[str] = []
+        header = (
+            '<header class="llm-answer__heading">'
+            "<h2>Here’s what I found</h2>"
+            "<p class=\"llm-answer__intro\">I pulled the key details into an easy-to-scan summary for you.</p>"
+            "</header>"
+        )
+
+        html_parts: List[str] = [
+            header,
+            '<div class="llm-answer__segment llm-answer__segment--body">',
+        ]
         current_list: List[str] = []
+        list_type: Optional[str] = None
+        definition_items: List[Tuple[str, str]] = []
+        first_paragraph_rendered = False
+        sources: List[str] = []
 
-        def append_segment(inner_html: str) -> None:
-            html_parts.append(
-                '<section class="llm-answer__segment">' + inner_html + "</section>"
-            )
+        bullet_pattern = re.compile(r"^(?:[-*\u2022])\s+")
+        ordered_pattern = re.compile(r"^\s*\d+[\.)]\s+")
+        definition_pattern = re.compile(r"^\s*([^:]{1,80})\s*:\s*(.+)$")
+
+        def format_inline(value: str) -> str:
+            escaped = escape(value)
+            escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+            escaped = re.sub(r"__(.+?)__", r"<strong>\1</strong>", escaped)
+            escaped = re.sub(r"\*(.+?)\*", r"<em>\1</em>", escaped)
+            return escaped
 
         def flush_list() -> None:
-            nonlocal current_list
-            if current_list:
-                list_items = "".join(f"<li>{item}</li>" for item in current_list)
-                append_segment(
-                    '<ul class="llm-answer__pointers">' + list_items + "</ul>"
-                )
-                current_list = []
+            nonlocal current_list, list_type
+            if not current_list:
+                return
+            tag = "ol" if list_type == "ordered" else "ul"
+            items = "".join(f"<li>{item}</li>" for item in current_list)
+            html_parts.append(f'<{tag} class="llm-answer__list">{items}</{tag}>')
+            current_list = []
+            list_type = None
 
-        bullet_pattern = re.compile(r"^(?:[-*\u2022]|\d+[\.)])\s+")
+        def flush_definitions() -> None:
+            nonlocal definition_items
+            if not definition_items:
+                return
+            rows = "".join(
+                f'<div class="llm-answer__definition"><dt>{format_inline(term)}</dt>'
+                f"<dd>{format_inline(explanation)}</dd></div>"
+                for term, explanation in definition_items
+            )
+            html_parts.append(f'<dl class="llm-answer__definitions">{rows}</dl>')
+            definition_items = []
+
+        def append_paragraph(content: str) -> None:
+            nonlocal first_paragraph_rendered
+            css_class = "llm-answer__lead" if not first_paragraph_rendered else "llm-answer__paragraph"
+            first_paragraph_rendered = True
+            html_parts.append(f'<p class="{css_class}">{format_inline(content)}</p>')
 
         for raw_line in normalised.split("\n"):
             line = raw_line.strip()
             if not line:
                 flush_list()
+                flush_definitions()
                 continue
+
+            source_idx = line.lower().find("sources:")
+            if source_idx != -1:
+                before = line[:source_idx].strip()
+                after = line[source_idx + len("sources:") :].strip()
+                if after:
+                    for token in re.split(r"[;,]", after):
+                        doc = token.strip()
+                        if doc:
+                            sources.append(doc)
+                if not before:
+                    continue
+                line = before
+
             if bullet_pattern.match(line):
+                flush_definitions()
                 content = bullet_pattern.sub("", line).strip()
-                current_list.append(escape(content))
+                if not content:
+                    continue
+                if list_type not in (None, "unordered"):
+                    flush_list()
+                list_type = "unordered"
+                current_list.append(format_inline(content))
                 continue
+
+            if ordered_pattern.match(line):
+                flush_definitions()
+                content = ordered_pattern.sub("", line).strip()
+                if not content:
+                    continue
+                if list_type not in (None, "ordered"):
+                    flush_list()
+                list_type = "ordered"
+                current_list.append(format_inline(content))
+                continue
+
+            definition_match = definition_pattern.match(line)
+            if definition_match and len(definition_match.group(1).split()) <= 12:
+                flush_list()
+                term = definition_match.group(1).strip()
+                explanation = definition_match.group(2).strip()
+                if term and explanation:
+                    definition_items.append((term, explanation))
+                continue
+
             flush_list()
-            append_segment(f"<p>{escape(line)}</p>")
+            flush_definitions()
+            append_paragraph(line)
 
         flush_list()
+        flush_definitions()
 
-        if not html_parts:
-            append_segment("<p>No answer available.</p>")
+        if len(html_parts) == 2:
+            html_parts.append('<p class="llm-answer__paragraph">No answer available.</p>')
+
+        html_parts.append("</div>")
+
+        if sources:
+            unique_sources: List[str] = []
+            seen: Set[str] = set()
+            for doc in sources:
+                lowered = doc.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                unique_sources.append(doc)
+            chips = "".join(
+                f'<span class="llm-answer__source-chip">{escape(doc)}</span>'
+                for doc in unique_sources
+            )
+            html_parts.append(
+                '<footer class="llm-answer__sources">'
+                "<h3>Sources</h3>"
+                f"<div class=\"llm-answer__source-list\">{chips}</div>"
+                "</footer>"
+            )
 
         return "".join(html_parts)
 
