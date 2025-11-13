@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import quote_plus
 from copy import deepcopy
 
 from services.event_bus import get_event_bus
@@ -12,6 +14,14 @@ from models.supplier_ranking_trainer import SupplierRankingTrainer
 from models.context_trainer import ContextTrainer, TrainingConfig
 from services.rag_training_pipeline import LayeredRAGTrainer
 from services.phi4_fine_tuning import Phi4HumanizationFineTuner
+from training.pipeline import (
+    ExportConfig,
+    GGUFConfig,
+    MergeConfig,
+    PipelineRunConfig,
+    TrainConfig,
+    run_full_pipeline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +100,33 @@ class ModelTrainingService:
             self._phi4_fine_tuner = tuner
         return tuner
 
+    @staticmethod
+    def _build_training_dsn(settings) -> str:
+        user = quote_plus(getattr(settings, "db_user", ""))
+        password = quote_plus(getattr(settings, "db_password", ""))
+        host = getattr(settings, "db_host", "localhost")
+        port = getattr(settings, "db_port", 5432)
+        name = getattr(settings, "db_name", "postgres")
+        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+    @staticmethod
+    def _apply_config_overrides(config: Any, overrides: Dict[str, Any], *, path_fields: Sequence[str]) -> Any:
+        if not overrides:
+            return config
+        for key, value in overrides.items():
+            if not hasattr(config, key):
+                logger.warning(
+                    "Ignoring override for unknown field '%s' on %s",
+                    key,
+                    type(config).__name__,
+                )
+                continue
+            if key in path_fields and isinstance(value, str):
+                setattr(config, key, Path(value))
+            else:
+                setattr(config, key, value)
+        return config
+
     # ------------------------------------------------------------------
     # Database utilities
     # ------------------------------------------------------------------
@@ -117,6 +154,168 @@ class ModelTrainingService:
                 conn.commit()
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to ensure agent training queue table")
+
+    def _mark_training_examples_used(self, example_ids: Sequence[int]) -> None:
+        if not example_ids:
+            return
+        try:
+            with self.agent_nick.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE proc.rag_training_examples SET used_in_training = TRUE WHERE example_id = ANY(%s)",
+                        (list(example_ids),),
+                    )
+                conn.commit()
+        except Exception:
+            logger.exception("Failed to mark RAG training examples as used")
+
+    def _run_instruction_fine_tuning_pipeline(self) -> Dict[str, Any]:
+        settings = getattr(self.agent_nick, "settings", None)
+        if settings is None:
+            return {"status": "skipped", "reason": "missing_settings"}
+        if not getattr(settings, "instruction_training_enabled", True):
+            return {"status": "disabled"}
+
+        try:
+            dsn = self._build_training_dsn(settings)
+        except Exception:
+            logger.exception("Failed to construct Postgres DSN for instruction fine-tuning")
+            return {"status": "failed", "error": "dsn_generation_failed"}
+
+        export_path = Path(settings.instruction_training_dataset_path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        train_output_dir = Path(settings.instruction_training_output_dir)
+        train_output_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir = Path(settings.instruction_training_merged_dir)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        export_cfg = ExportConfig(
+            dsn=dsn,
+            query=settings.instruction_training_query,
+            output_path=export_path,
+            chunk_size=getattr(settings, "instruction_training_chunk_size", 1_000),
+            id_column=getattr(settings, "instruction_training_id_column", None),
+        )
+
+        train_cfg = TrainConfig(
+            base_model=settings.instruction_training_base_model,
+            train_file=export_path,
+            output_dir=train_output_dir,
+            system_prompt=getattr(settings, "instruction_training_system_prompt", None) or None,
+            chat_template=getattr(settings, "instruction_training_chat_template", None) or None,
+            use_unsloth=getattr(settings, "instruction_training_use_unsloth", False),
+        )
+        train_cfg = self._apply_config_overrides(
+            train_cfg,
+            getattr(settings, "instruction_training_train_overrides", {}),
+            path_fields=("train_file", "output_dir", "eval_file"),
+        )
+
+        merge_cfg = MergeConfig(
+            base_model=train_cfg.base_model,
+            adapter_path=train_cfg.output_dir,
+            output_dir=merged_dir,
+            safe_serialization=getattr(settings, "instruction_training_safe_serialization", True),
+        )
+        merge_cfg = self._apply_config_overrides(
+            merge_cfg,
+            getattr(settings, "instruction_training_merge_overrides", {}),
+            path_fields=("adapter_path", "output_dir"),
+        )
+
+        gguf_cfg: Optional[GGUFConfig] = None
+        llama_cpp_dir = getattr(settings, "instruction_training_llama_cpp_dir", None)
+        if llama_cpp_dir:
+            gguf_output = getattr(settings, "instruction_training_gguf_output", None)
+            gguf_output_path = Path(gguf_output) if gguf_output else merged_dir / "model-f16.gguf"
+            gguf_output_path.parent.mkdir(parents=True, exist_ok=True)
+            quantize = getattr(settings, "instruction_training_quantize_preset", None)
+            quantized_output = getattr(settings, "instruction_training_quantized_output", None)
+            quantized_output_path = Path(quantized_output) if quantized_output else None
+            if quantize and quantized_output_path is None:
+                quantized_output_path = gguf_output_path.with_name(
+                    f"{gguf_output_path.stem}-{quantize}.gguf"
+                )
+            if quantized_output_path is not None:
+                quantized_output_path.parent.mkdir(parents=True, exist_ok=True)
+            gguf_cfg = GGUFConfig(
+                llama_cpp_dir=Path(llama_cpp_dir),
+                hf_model_dir=merged_dir,
+                gguf_output=gguf_output_path,
+                quantize=quantize,
+                quantized_output=quantized_output_path,
+            )
+            gguf_cfg = self._apply_config_overrides(
+                gguf_cfg,
+                getattr(settings, "instruction_training_gguf_overrides", {}),
+                path_fields=("llama_cpp_dir", "hf_model_dir", "gguf_output", "quantized_output"),
+            )
+
+        min_records = getattr(settings, "instruction_training_min_records", 1)
+        try:
+            min_records_int = int(min_records)
+        except (TypeError, ValueError):
+            min_records_int = 1
+        min_records_int = max(1, min_records_int)
+
+        pipeline_cfg = PipelineRunConfig(
+            export=export_cfg,
+            train=train_cfg,
+            merge=merge_cfg,
+            gguf=gguf_cfg,
+            min_records=min_records_int,
+        )
+
+        try:
+            result = run_full_pipeline(pipeline_cfg)
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+            logger.exception("Instruction fine-tuning dependencies missing")
+            return {
+                "status": "failed",
+                "error": "missing_dependency",
+                "detail": str(exc),
+            }
+        except Exception:  # pragma: no cover - defensive catch
+            logger.exception("Instruction fine-tuning pipeline failed")
+            return {"status": "failed"}
+
+        summary: Dict[str, Any] = {
+            "status": "completed" if result.adapter_dir else "skipped",
+            "exported": result.export.count,
+            "dataset_path": str(result.export.output_path),
+            "min_records": min_records_int,
+        }
+
+        if not result.adapter_dir:
+            if result.export.count == 0:
+                summary["reason"] = "no_data"
+            elif result.export.count < min_records_int:
+                summary["reason"] = "insufficient_records"
+            else:
+                summary["reason"] = "unknown"
+            return summary
+
+        summary.update(
+            {
+                "adapter_dir": str(result.adapter_dir),
+                "merged_model_dir": str(result.merged_model_dir)
+                if result.merged_model_dir
+                else None,
+                "gguf_model_path": str(result.gguf_model_path)
+                if result.gguf_model_path
+                else None,
+                "quantized_model_path": str(result.quantized_model_path)
+                if result.quantized_model_path
+                else None,
+            }
+        )
+
+        updated = 0
+        if result.export.record_ids:
+            self._mark_training_examples_used(result.export.record_ids)
+            updated = len(result.export.record_ids)
+        summary["updated_examples"] = updated
+        return summary
 
     def _ensure_supplier_model_table(self) -> None:
         try:
@@ -397,6 +596,8 @@ class ModelTrainingService:
 
         feedback_summary = self._process_feedback_for_training()
 
+        instruction_summary = self._run_instruction_fine_tuning_pipeline()
+
         # ------------------------------------------------------------------
         # RAG qwen3-30b integration for generating instruction tuning examples
         # ------------------------------------------------------------------
@@ -452,6 +653,7 @@ class ModelTrainingService:
             "phi4_fine_tuning": phi4_result,
             "rag_qwen30b_finetuning": rag_qwen_result,
             "feedback_summary": feedback_summary,
+            "instruction_fine_tuning": instruction_summary,
         }
 
     def _process_feedback_for_training(self) -> Dict[str, Any]:

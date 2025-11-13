@@ -2,7 +2,7 @@
 
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
@@ -56,6 +56,96 @@ class Settings(BaseSettings):
     context_model_output_dir: str = Field(
         default=os.path.join(PROJECT_ROOT, "models", "context-aware-model"),
         env="CONTEXT_MODEL_OUTPUT_DIR",
+    )
+
+    instruction_training_enabled: bool = Field(
+        default=True, env="INSTRUCTION_TRAINING_ENABLED"
+    )
+    instruction_training_query: str = Field(
+        default=(
+            "SELECT example_id, query AS instruction, response AS output "
+            "FROM proc.rag_training_examples "
+            "WHERE sentiment = 'positive' AND confidence >= 0.7 "
+            "AND COALESCE(used_in_training, FALSE) = FALSE"
+        ),
+        env="INSTRUCTION_TRAINING_QUERY",
+    )
+    instruction_training_dataset_path: str = Field(
+        default=os.path.join(
+            PROJECT_ROOT,
+            "resources",
+            "training",
+            "instruction",
+            "train.jsonl",
+        ),
+        env="INSTRUCTION_TRAINING_DATASET_PATH",
+    )
+    instruction_training_output_dir: str = Field(
+        default=os.path.join(PROJECT_ROOT, "models", "instruction", "adapters"),
+        env="INSTRUCTION_TRAINING_OUTPUT_DIR",
+    )
+    instruction_training_merged_dir: str = Field(
+        default=os.path.join(PROJECT_ROOT, "models", "instruction", "merged"),
+        env="INSTRUCTION_TRAINING_MERGED_DIR",
+    )
+    instruction_training_llama_cpp_dir: Optional[str] = Field(
+        default=None, env="INSTRUCTION_TRAINING_LLAMA_CPP_DIR"
+    )
+    instruction_training_gguf_output: str = Field(
+        default=os.path.join(
+            PROJECT_ROOT,
+            "models",
+            "instruction",
+            "gguf",
+            "model-f16.gguf",
+        ),
+        env="INSTRUCTION_TRAINING_GGUF_OUTPUT",
+    )
+    instruction_training_quantized_output: Optional[str] = Field(
+        default=os.path.join(
+            PROJECT_ROOT,
+            "models",
+            "instruction",
+            "gguf",
+            "model-Q4_K_M.gguf",
+        ),
+        env="INSTRUCTION_TRAINING_QUANTIZED_OUTPUT",
+    )
+    instruction_training_quantize_preset: Optional[str] = Field(
+        default="Q4_K_M", env="INSTRUCTION_TRAINING_QUANTIZE_PRESET"
+    )
+    instruction_training_base_model: str = Field(
+        default="mistralai/Mistral-7B-v0.3", env="INSTRUCTION_TRAINING_BASE_MODEL"
+    )
+    instruction_training_system_prompt: Optional[str] = Field(
+        default=None, env="INSTRUCTION_TRAINING_SYSTEM_PROMPT"
+    )
+    instruction_training_chat_template: Optional[str] = Field(
+        default=None, env="INSTRUCTION_TRAINING_CHAT_TEMPLATE"
+    )
+    instruction_training_use_unsloth: bool = Field(
+        default=False, env="INSTRUCTION_TRAINING_USE_UNSLOTH"
+    )
+    instruction_training_chunk_size: int = Field(
+        default=1_000, env="INSTRUCTION_TRAINING_CHUNK_SIZE"
+    )
+    instruction_training_id_column: str = Field(
+        default="example_id", env="INSTRUCTION_TRAINING_ID_COLUMN"
+    )
+    instruction_training_min_records: int = Field(
+        default=25, env="INSTRUCTION_TRAINING_MIN_RECORDS"
+    )
+    instruction_training_safe_serialization: bool = Field(
+        default=True, env="INSTRUCTION_TRAINING_SAFE_SERIALIZATION"
+    )
+    instruction_training_train_overrides: Dict[str, Any] = Field(
+        default_factory=dict, env="INSTRUCTION_TRAINING_TRAIN_OVERRIDES"
+    )
+    instruction_training_merge_overrides: Dict[str, Any] = Field(
+        default_factory=dict, env="INSTRUCTION_TRAINING_MERGE_OVERRIDES"
+    )
+    instruction_training_gguf_overrides: Dict[str, Any] = Field(
+        default_factory=dict, env="INSTRUCTION_TRAINING_GGUF_OVERRIDES"
     )
 
     # Email settings
@@ -279,38 +369,44 @@ class Settings(BaseSettings):
         env_file_encoding = 'utf-8'
         extra = "ignore"
 
+    @staticmethod
+    def _parse_mapping(value: Any) -> Dict[str, Any]:
+        if value in (None, "", {}):
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+                raise ValueError("Value must be valid JSON mapping") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("JSON value must decode to an object")
+            return parsed
+        raise TypeError("Unsupported type; expected dict or JSON string")
+
     @field_validator("agent_model_overrides", mode="before")
     @classmethod
     def _coerce_agent_model_overrides(cls, value):
         """Normalise overrides supplied via environment variables."""
 
-        if value in (None, "", {}):
-            return {}
-        if isinstance(value, dict):
-            return {
-                str(key).strip(): str(val).strip()
-                for key, val in value.items()
-                if str(key).strip() and str(val).strip()
-            }
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError as exc:  # pragma: no cover - defensive
-                raise ValueError(
-                    "AGENT_MODEL_OVERRIDES must be valid JSON mapping"
-                ) from exc
-            if not isinstance(parsed, dict):
-                raise ValueError(
-                    "AGENT_MODEL_OVERRIDES must decode to a JSON object"
-                )
-            return {
-                str(key).strip(): str(val).strip()
-                for key, val in parsed.items()
-                if str(key).strip() and str(val).strip()
-            }
-        raise TypeError(
-            "Unsupported type for AGENT_MODEL_OVERRIDES; expected dict or JSON string"
-        )
+        parsed = cls._parse_mapping(value)
+        return {
+            str(key).strip(): str(val).strip()
+            for key, val in parsed.items()
+            if str(key).strip() and str(val).strip()
+        }
+
+    @field_validator(
+        "instruction_training_train_overrides",
+        "instruction_training_merge_overrides",
+        "instruction_training_gguf_overrides",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_instruction_overrides(cls, value):
+        parsed = cls._parse_mapping(value)
+        return parsed
 
 try:
     settings = Settings()
