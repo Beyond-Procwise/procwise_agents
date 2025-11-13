@@ -31,7 +31,7 @@ Start the demo container once infrastructure is ready:
 docker compose up app
 ```
 
-The `app` service executes `end_to_end_demo.py`, which will:
+The `app` service executes `scripts/end_to_end_demo.py`, which will:
 
 * Refresh the knowledge graph and Qdrant embeddings
 * Execute a hybrid spend analysis query
@@ -71,18 +71,19 @@ The `app` service executes `end_to_end_demo.py`, which will:
 4. Load data and test the engine:
 
    ```bash
-   python procurement_knowledge_graph.py
-   python end_to_end_demo.py
+   python -m procurement_knowledge_graph.procurement_knowledge_graph --full-refresh
+   python scripts/end_to_end_demo.py
    ```
 
 ## 4. Production deployment tips
 
-* Schedule `procurement_knowledge_graph.py` on a timer or event trigger to keep
+* Schedule `procurement_knowledge_graph.procurement_knowledge_graph` on a timer or event trigger to keep
   the graph current. The script is idempotent and resumes from the last synced
   timestamp per entity.
 * Use distinct `QDRANT_COLLECTION_PREFIX` values for staging vs production to
   avoid cross-environment collisions.
 * Configure Ollama model caching volumes on persistent storage to prevent
   repeated downloads.
-* Integrate `ProcwiseIntegrationFacade` functions into existing services by
-  importing the module and reusing the shared environment variables.
+* Integrate `ProcWiseKnowledgeGraphAgent` functions into existing services by
+  importing `procurement_knowledge_graph.procwise_kg_integration` and reusing
+  the shared environment variables.

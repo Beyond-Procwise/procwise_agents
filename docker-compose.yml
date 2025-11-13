@@ -70,7 +70,7 @@ services:
     volumes:
       - .:/app
     working_dir: /app
-    command: ["python", "end_to_end_demo.py"]
+    command: ["python", "scripts/end_to_end_demo.py"]
 
 volumes:
   postgres-data:

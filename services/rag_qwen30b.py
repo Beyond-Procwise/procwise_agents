@@ -4,6 +4,7 @@ import re
 import time
 import unicodedata
 import hashlib
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
@@ -25,6 +26,7 @@ RERANK_BATCH = int(os.getenv("RERANK_BATCH", "16"))
 RERANK_FP16 = bool(int(os.getenv("RERANK_FP16", "1")))
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-30b-procwise")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST")
+QDRANT_VECTOR_NAME = os.getenv("QDRANT_VECTOR_NAME", "text")
 
 # Hallucination refusal exact sentence
 REFUSAL_SENTENCE = "I don't have enough information in the provided documents."
@@ -57,6 +59,25 @@ def _norm_text_for_hash(text: str) -> str:
 def _hash_text(text: str) -> str:
     norm = _norm_text_for_hash(text)
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()
+
+
+def _hashed_token_vector(text: str, dims: int = 64) -> Optional[np.ndarray]:
+    """Fallback lightweight vector using hashing trick when dense embedding missing."""
+    if not text:
+        return None
+    tokens = re.findall(r"[0-9a-z]+", text.lower())
+    if not tokens:
+        return None
+    vec = np.zeros(dims, dtype=np.float32)
+    for tok in tokens:
+        digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8, person=b"rag_hash").digest()
+        idx = int.from_bytes(digest[:4], "big") % dims
+        sign = 1 if (digest[4] & 1) == 0 else -1
+        vec[idx] += sign
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        return None
+    return vec / norm
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -100,15 +121,7 @@ class RAGQwen30b:
             from sentence_transformers import CrossEncoder
 
             cross_encoder_cls = CrossEncoder
-        try:
-            self._reranker = load_cross_encoder(RERANK_MODEL, cross_encoder_cls, self.device)
-        except Exception:
-            logger.exception("Failed to load cross-encoder; retrying once on CPU")
-            try:
-                self._reranker = load_cross_encoder(RERANK_MODEL, cross_encoder_cls, "cpu")
-            except Exception:
-                logger.exception("Cross-encoder init failed permanently; pipeline will degrade")
-                self._reranker = None
+        self._reranker = self._init_reranker(cross_encoder_cls)
         # Telemetry
         self.telemetry = {
             "dense_count": 0,
@@ -118,8 +131,41 @@ class RAGQwen30b:
             "packed_chars": 0,
         }
 
+    def _init_reranker(self, cross_encoder_cls):
+        """Load cross-encoder with an 8s circuit breaker before falling back to CPU."""
+        target_device = self.device or "cpu"
+        if target_device == "cpu":
+            return self._load_reranker_once(cross_encoder_cls, "cpu")
+        # try device twice if each attempt exceeds 8s
+        for attempt in range(2):
+            reranker, duration = self._load_reranker_once(cross_encoder_cls, target_device, return_duration=True)
+            if reranker is None:
+                continue
+            if duration > 8.0 and attempt == 0:
+                logger.warning("Cross-encoder init on %s took %.2fs (>8s); retrying once", target_device, duration)
+                continue
+            return reranker
+        # fallback to CPU
+        logger.warning("Falling back to CPU for cross-encoder after slow/failed attempts on %s", target_device)
+        reranker = self._load_reranker_once(cross_encoder_cls, "cpu")
+        if reranker is None:
+            logger.exception("Cross-encoder init failed permanently; pipeline will degrade")
+        return reranker
+
+    def _load_reranker_once(self, cross_encoder_cls, device, return_duration: bool = False):
+        start = time.time()
+        try:
+            reranker = load_cross_encoder(RERANK_MODEL, cross_encoder_cls, device)
+        except Exception:
+            logger.exception("Failed to load cross-encoder on %s", device)
+            reranker = None
+        duration = time.time() - start
+        if return_duration:
+            return reranker, duration
+        return reranker
+
     # -------------------- Retrieval & rerank --------------------------------
-    def retrieve_and_rerank(self, query: str, top_k: int = RAG_TOP_K, rerank_top_n: int = RAG_RERANK_TOP_N, vector_name: str = "text", collections: Optional[List[str]] = None) -> List[Chunk]:
+    def retrieve_and_rerank(self, query: str, top_k: int = RAG_TOP_K, rerank_top_n: int = RAG_RERANK_TOP_N, vector_name: Optional[str] = None, collections: Optional[List[str]] = None) -> List[Chunk]:
         """Retrieve candidates from Qdrant and rerank using cross-encoder. Returns list of chunks with added fields:
         - rerank_score
         - embedding (if available or computed)
@@ -134,6 +180,7 @@ class RAGQwen30b:
             q_vec = [0.0]
 
         search_collections = collections or [self.primary_collection]
+        named_vector = vector_name or QDRANT_VECTOR_NAME
         all_hits = []
         for coll in search_collections:
             try:
@@ -141,7 +188,7 @@ class RAGQwen30b:
                     collection_name=coll,
                     query_vector=q_vec,
                     limit=top_k,
-                    vector_name=vector_name,
+                    vector_name=named_vector,
                 )
             except Exception:
                 logger.exception("Qdrant search failed for collection %s; continuing", coll)
@@ -216,14 +263,22 @@ class RAGQwen30b:
         """
         # Precompute embeddings where missing
         for c in candidates:
-            if c.get("vector") is None:
+            vector = c.get("vector")
+            if vector is not None:
                 try:
-                    emb = self.embedder.encode(c.get("content", ""), normalize_embeddings=True)
-                    c["vector"] = np.asarray(emb, dtype=np.float32)
+                    c["vector"] = np.asarray(vector, dtype=np.float32)
+                    continue
                 except Exception:
                     c["vector"] = None
-            else:
-                c["vector"] = np.asarray(c["vector"], dtype=np.float32) if c.get("vector") is not None else None
+            content = c.get("content", "")
+            embedded = None
+            try:
+                embedded = self.embedder.encode(content, normalize_embeddings=True)
+            except Exception:
+                embedded = None
+            if embedded is None:
+                embedded = _hashed_token_vector(content)
+            c["vector"] = np.asarray(embedded, dtype=np.float32) if embedded is not None else None
 
         # Within-doc dedupe: keep highest rerank_score per similar group
         by_doc: Dict[Any, List[Chunk]] = {}
@@ -444,39 +499,104 @@ class RAGQwen30b:
         return chunk
 
     # -------------------- Context packing ----------------------------------
-    def pack_context(self, compressed_chunks: List[Chunk], max_chars: int = RAG_CONTEXT_MAX_CHARS) -> Tuple[str, List[Chunk]]:
-        packed = []
+    def pack_context(self, compressed_chunks: List[Chunk], max_chars: int = RAG_CONTEXT_MAX_CHARS, ensure_min_docs: int = 3) -> Tuple[str, List[Chunk]]:
+        packed_blocks: List[Dict[str, Any]] = []
         packed_chars = 0
-        included_doc_ids: List[str] = []
-        for c in compressed_chunks:
-            text = c.get("compressed_text") or c.get("content") or ""
-            if not text:
+        doc_counts: Dict[str, int] = defaultdict(int)
+        available_docs = [c.get("doc_id") or "unknown" for c in compressed_chunks]
+        target_min_docs = min(ensure_min_docs, len({d for d in available_docs if d and d != "unknown"}))
+
+        for chunk in compressed_chunks:
+            remaining = max_chars - packed_chars
+            block, block_len = self._format_block(chunk, remaining)
+            if not block:
+                if remaining <= 0:
+                    break
                 continue
-            doc = c.get("doc_id") or "unknown"
-            # determine citation span
-            span = None
-            md = c.get("payload") or {}
-            if md.get("line_start") is not None and md.get("line_end") is not None:
-                span = f"{doc}({md.get('line_start')}-{md.get('line_end')})"
-            else:
-                span = f"{doc}"
-            block = f"[{span}] {text}\n\n"
-            if packed_chars + len(block) > max_chars:
-                # stop packing when next block would exceed the budget
+            packed_blocks.append({"doc": chunk.get("doc_id") or "unknown", "block": block, "chunk": chunk, "chars": block_len})
+            packed_chars += block_len
+            doc_counts[chunk.get("doc_id") or "unknown"] += 1
+            if packed_chars >= max_chars:
                 break
-            packed.append((doc, block))
-            packed_chars += len(block)
-            if doc not in included_doc_ids:
-                included_doc_ids.append(doc)
+
+        # If we failed to capture enough distinct docs but have more available, try to inject extras.
+        included_docs = {blk["doc"] for blk in packed_blocks if blk["doc"] and blk["doc"] != "unknown"}
+        if len(included_docs) < target_min_docs:
+            missing_docs = [
+                doc
+                for doc in ({c.get("doc_id") or "unknown" for c in compressed_chunks} - included_docs)
+                if doc and doc != "unknown"
+            ]
+            for doc in missing_docs:
+                chunk = next((c for c in compressed_chunks if (c.get("doc_id") or "unknown") == doc), None)
+                if chunk is None:
+                    continue
+                remaining = max_chars - packed_chars
+                block, block_len = self._format_block(chunk, remaining)
+                if not block:
+                    # try freeing space by dropping the last block from an overrepresented doc
+                    drop_idx = next(
+                        (idx for idx in reversed(range(len(packed_blocks))) if doc_counts[packed_blocks[idx]["doc"]] > 1),
+                        None,
+                    )
+                    if drop_idx is None:
+                        continue
+                    removed = packed_blocks.pop(drop_idx)
+                    packed_chars -= removed["chars"]
+                    doc_counts[removed["doc"]] -= 1
+                    if doc_counts[removed["doc"]] == 0:
+                        doc_counts.pop(removed["doc"], None)
+                        if removed["doc"] != "unknown":
+                            included_docs.discard(removed["doc"])
+                    remaining = max_chars - packed_chars
+                    block, block_len = self._format_block(chunk, remaining)
+                    if not block:
+                        continue
+                packed_blocks.append({"doc": doc, "block": block, "chunk": chunk, "chars": block_len})
+                packed_chars += block_len
+                doc_counts[doc] += 1
+                if doc != "unknown":
+                    included_docs.add(doc)
+                if len(included_docs) >= target_min_docs:
+                    break
+
         self.telemetry["packed_chars"] = packed_chars
-        ctx = "".join(b for _, b in packed)
-        # emit telemetry top docs
-        top_docs = included_doc_ids[:5]
-        logger.info("RAG pack: packed_chars=%d top_docs=%s", packed_chars, top_docs)
-        return ctx, [c for c in compressed_chunks if (c.get("doc_id") in included_doc_ids)]
+        context_str = "".join(blk["block"] for blk in packed_blocks)
+        ordered_top_docs: List[str] = []
+        for blk in packed_blocks:
+            doc = blk["doc"]
+            if doc and doc not in ordered_top_docs:
+                ordered_top_docs.append(doc)
+            if len(ordered_top_docs) == 5:
+                break
+        logger.info("RAG pack: packed_chars=%d top_docs=%s", packed_chars, ordered_top_docs)
+        return context_str, [blk["chunk"] for blk in packed_blocks]
+
+    def _format_block(self, chunk: Chunk, remaining_chars: int) -> Tuple[str, int]:
+        if remaining_chars <= 0:
+            return "", 0
+        text = chunk.get("compressed_text") or chunk.get("content") or ""
+        if not text:
+            return "", 0
+        doc = chunk.get("doc_id") or "unknown"
+        md = chunk.get("payload") or {}
+        if md.get("line_start") is not None and md.get("line_end") is not None:
+            span = f"{doc}({md.get('line_start')}-{md.get('line_end')})"
+        else:
+            span = f"{doc}"
+        prefix = f"[{span}] "
+        suffix = "\n\n"
+        available_for_text = remaining_chars - len(prefix) - len(suffix)
+        if available_for_text <= 0:
+            return "", 0
+        trimmed_text = text[:available_for_text]
+        if not trimmed_text.strip():
+            return "", 0
+        block = f"{prefix}{trimmed_text}{suffix}"
+        return block, len(block)
 
     # -------------------- Full pipeline ------------------------------------
-    def answer(self, query: str, *, ensure_min_docs: int = 3) -> Dict[str, Any]:
+    def answer(self, query: str, *, ensure_min_docs: int = 3, collections: Optional[List[str]] = None) -> Dict[str, Any]:
         start = time.time()
         # Detect purchase order / invoice queries and adjust retrieval accordingly
         financial_q = False
@@ -485,11 +605,25 @@ class RAGQwen30b:
             financial_q = True
 
         # Stage A: retrieve & rerank
-        if financial_q:
-            # broaden retrieval for invoice/PO related queries
-            dense = self.retrieve_and_rerank(query, top_k=max(RAG_TOP_K, 30), rerank_top_n=max(RAG_RERANK_TOP_N, 20), collections=[self.primary_collection, self.uploaded_collection])
-        else:
-            dense = self.retrieve_and_rerank(query, top_k=RAG_TOP_K, rerank_top_n=RAG_RERANK_TOP_N)
+        retrieval_collections: Optional[List[str]] = None
+        if collections:
+            retrieval_collections = list(collections)
+        elif financial_q:
+            retrieval_collections = [self.primary_collection, self.uploaded_collection]
+
+        top_k = RAG_TOP_K
+        rerank_top_n = RAG_RERANK_TOP_N
+        if financial_q and not collections:
+            # broaden retrieval for invoice/PO related queries when caller does not override collections
+            top_k = max(RAG_TOP_K, 30)
+            rerank_top_n = max(RAG_RERANK_TOP_N, 20)
+
+        dense = self.retrieve_and_rerank(
+            query,
+            top_k=top_k,
+            rerank_top_n=rerank_top_n,
+            collections=retrieval_collections,
+        )
         # Stage B1: hash dedupe
         after_hash = self.hash_dedupe(dense)
         # Stage B2: semantic dedupe
@@ -502,27 +636,8 @@ class RAGQwen30b:
             after_cap = self.per_doc_cap(after_sem, max_per_doc=RAG_PER_DOC_CAP)
         # Stage D: compress
         compressed = [self.compress_chunk(query, c, per_chunk_chars=COMPRESS_PER_CHUNK_CHARS) for c in after_cap]
-        # Stage E: pack context
-        ctx, used_chunks = self.pack_context(compressed, max_chars=RAG_CONTEXT_MAX_CHARS)
-        # Ensure at least ensure_min_docs distinct doc_ids when available
-        available_doc_ids = {c.get("doc_id") for c in after_sem if c.get("doc_id")}
-        if len({c.get("doc_id") for c in used_chunks if c.get("doc_id")}) < min(ensure_min_docs, len(available_doc_ids)):
-            # attempt to add missing docs greedily from after_sem
-            missing = []
-            included = {c.get("doc_id") for c in used_chunks if c.get("doc_id")}
-            for c in after_sem:
-                did = c.get("doc_id")
-                if not did or did in included:
-                    continue
-                # compress and try to append if budget allows
-                comp = self.compress_chunk(query, c, per_chunk_chars=COMPRESS_PER_CHUNK_CHARS)
-                block = f"[{did}] {comp.get('compressed_text') or comp.get('content') or ''}\n\n"
-                if len(ctx) + len(block) <= RAG_CONTEXT_MAX_CHARS:
-                    ctx += block
-                    used_chunks.append(comp)
-                    included.add(did)
-                if len(included) >= min(ensure_min_docs, len(available_doc_ids)):
-                    break
+        # Stage E: pack context with doc diversity guarantee
+        ctx, used_chunks = self.pack_context(compressed, max_chars=RAG_CONTEXT_MAX_CHARS, ensure_min_docs=ensure_min_docs)
         # If no chunks were kept
         if not used_chunks:
             # Pass explicit token to generator context to force refusal

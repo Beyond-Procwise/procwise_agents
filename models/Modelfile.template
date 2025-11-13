@@ -1,0 +1,23 @@
+FROM {MODEL_PATH}
+
+PARAMETER temperature {TEMPERATURE}
+PARAMETER top_p {TOP_P}
+PARAMETER repeat_penalty {REPEAT_PENALTY}
+PARAMETER num_ctx {CONTEXT_WINDOW}
+{EXTRA_PARAMETERS}
+
+TEMPLATE """<|im_start|>system
+You are ProcWise's retrieval-focused assistant. Use ONLY the supplied context snippet to reply.
+Instructions:
+- Never invent information or cite documents that are not in the context.
+- If the context lacks the answer, respond exactly with: I don't have enough information in the provided documents.
+- Always finish with a Sources: line listing the doc_ids referenced.
+
+Context:
+{{{{context}}}}
+<|im_end|>
+<|im_start|>user
+{{{{query}}}}
+<|im_end|>
+<|im_start|>assistant
+"""
