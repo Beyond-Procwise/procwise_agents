@@ -4,14 +4,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from rank_bm25 import BM25Okapi
 import requests
+import numpy as np
+import torch
+from sentence_transformers import CrossEncoder, SentenceTransformer
+from transformers import pipeline
 
 LOGGER = logging.getLogger("hybrid_query_engine")
 logging.basicConfig(
@@ -27,6 +32,9 @@ class RetrievalResult:
     snippet: str
     weight: float
     payload: Dict[str, Any]
+    collection: Optional[str] = None
+    document_id: Optional[str] = None
+    rerank_score: Optional[float] = None
 
 
 class OllamaChatClient:
@@ -185,80 +193,217 @@ class Neo4jQueryService:
 
 
 class QdrantRetriever:
-    """Helper that wraps Qdrant vector search and lexical fallback."""
+    """Hybrid dense+lexical retriever with collection routing and reranking."""
 
-    def __init__(self, client: QdrantClient, collection: str, ollama: OllamaChatClient) -> None:
+    def __init__(
+        self,
+        client: QdrantClient,
+        collections: Sequence[Dict[str, str]],
+        embed_model: str,
+        rerank_model: str,
+        router_model: str,
+        route_top_k: int = 3,
+        per_collection_k: int = 15,
+    ) -> None:
+        if not collections:
+            raise ValueError("QdrantRetriever requires at least one collection configuration")
         self._client = client
-        self._collection = collection
-        self._ollama = ollama
+        self._collections = list(collections)
+        self._route_top_k = max(1, route_top_k)
+        self._per_collection_k = max(1, per_collection_k)
+        self._label_to_name = {cfg.get("label", cfg["name"]): cfg["name"] for cfg in self._collections}
+        self._name_to_label = {cfg["name"]: cfg.get("label", cfg["name"]) for cfg in self._collections}
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._embedder = SentenceTransformer(embed_model, device=device)
+        self._reranker = CrossEncoder(rerank_model, device=device)
+        router_device = 0 if device == "cuda" else -1
+        self._router = pipeline(
+            "zero-shot-classification",
+            model=router_model,
+            device=router_device,
+        )
 
-    def search(self, text: str, filters: Optional[Dict[str, Any]] = None, limit: int = 8) -> List[RetrievalResult]:
-        qdrant_filter = None
-        if filters:
-            must = []
-            for key, value in filters.items():
-                must.append(qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=value)))
-            qdrant_filter = qmodels.Filter(must=must)
+    def search(self, text: str, filters: Optional[Dict[str, Any]] = None, limit: int = 12) -> List[RetrievalResult]:
+        if not text.strip():
+            return []
+        filters = dict(filters) if filters else {}
+        forced_collections = filters.pop("collection", None)
+        selected_collections = self._route_collections(text, forced_collections)
+        query_vector = self._encode_query(text)
+        per_collection_results: List[List[Dict[str, Any]]] = []
+        for collection in selected_collections:
+            per_collection_results.append(
+                self._search_collection(collection, query_vector, filters, limit=self._per_collection_k)
+            )
+        fused_candidates = self._reciprocal_rank_fusion(per_collection_results)
+        if fused_candidates:
+            reranked = self._cross_encoder_rerank(text, fused_candidates, top_k=limit)
+            results = [self._to_retrieval_result(doc) for doc in reranked]
+            if results:
+                return results
+        LOGGER.info("Falling back to sparse retrieval for query '%s'", text)
+        return self._bm25_fallback(text, selected_collections, filters, limit)
+
+    def _encode_query(self, query: str) -> np.ndarray:
+        return self._embedder.encode([f"query: {query}"], normalize_embeddings=True)[0]
+
+    def _route_collections(
+        self, query: str, forced: Optional[Any] = None
+    ) -> List[str]:
+        if forced:
+            if isinstance(forced, str):
+                return [forced]
+            if isinstance(forced, Sequence):
+                return [str(item) for item in forced] or [cfg["name"] for cfg in self._collections]
+        labels = list(self._label_to_name.keys())
+        if not labels:
+            return [cfg["name"] for cfg in self._collections]
+        try:
+            prediction = self._router(query, candidate_labels=labels, multi_label=True)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning("Router failed (%s); defaulting to all collections", exc)
+            return [cfg["name"] for cfg in self._collections]
+        pairs = list(zip(prediction["labels"], prediction["scores"]))
+        pairs.sort(key=lambda item: item[1], reverse=True)
+        thresholded = [label for label, score in pairs[: self._route_top_k] if score >= 0.15]
+        if not thresholded:
+            return [cfg["name"] for cfg in self._collections]
+        return [self._label_to_name[label] for label in thresholded if label in self._label_to_name]
+
+    def _search_collection(
+        self,
+        collection: str,
+        query_vector: np.ndarray,
+        filters: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        qdrant_filter = self._build_filter(filters)
         hits = self._client.search(
-            collection_name=self._collection,
-            query_vector=self._ollama.embed(text),
+            collection_name=collection,
+            query_vector=query_vector.astype(np.float32).tolist(),
             query_filter=qdrant_filter,
             with_payload=True,
             limit=limit,
+            search_params=qmodels.SearchParams(hnsw_ef=128, exact=False),
         )
-        results = [
-            RetrievalResult(
-                source="vector",
-                title=_safe_title(hit.payload),
-                snippet=hit.payload.get("text", ""),
-                weight=1.0 - hit.score,
-                payload=hit.payload,
+        results = []
+        for hit in hits:
+            payload = hit.payload or {}
+            results.append(
+                {
+                    "collection": collection,
+                    "id": payload.get("doc_id", hit.id),
+                    "title": _safe_title(payload),
+                    "text": payload.get("text", ""),
+                    "score": float(hit.score),
+                    "payload": payload,
+                }
             )
-            for hit in hits
-        ]
-        if not results or all(r.weight < 0.2 for r in results):
-            LOGGER.info("Falling back to sparse retrieval for query '%s'", text)
-            results = self._bm25_fallback(text, filters)
         return results
 
-    def _bm25_fallback(self, text: str, filters: Optional[Dict[str, Any]]) -> List[RetrievalResult]:
-        payloads = self._snapshot_payloads(filters)
-        documents = [p.get("text", "") for p in payloads]
+    def _build_filter(self, filters: Optional[Dict[str, Any]]) -> Optional[qmodels.Filter]:
+        if not filters:
+            return None
+        conditions: List[qmodels.FieldCondition] = []
+        for key, value in filters.items():
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                conditions.append(qmodels.FieldCondition(key=key, match=qmodels.MatchAny(any=list(value))))
+            else:
+                conditions.append(qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=value)))
+        return qmodels.Filter(must=conditions) if conditions else None
+
+    def _reciprocal_rank_fusion(self, ranked_lists: Sequence[List[Dict[str, Any]]], k: float = 60.0) -> List[Dict[str, Any]]:
+        scores: Dict[Tuple[str, Any], float] = {}
+        seen: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+        for lst in ranked_lists:
+            for rank, item in enumerate(lst, start=1):
+                key = (item["collection"], item["id"])
+                scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+                seen[key] = item
+        fused = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+        return [seen[key] for key, _ in fused]
+
+    def _cross_encoder_rerank(self, query: str, docs: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        if not docs:
+            return []
+        pairs = [[query, doc.get("text", "") or ""] for doc in docs]
+        scores = self._reranker.predict(pairs).tolist()
+        for doc, score in zip(docs, scores):
+            doc["rerank_score"] = float(score)
+        docs.sort(key=lambda item: item.get("rerank_score", 0.0), reverse=True)
+        return docs[:top_k]
+
+    def _to_retrieval_result(self, doc: Dict[str, Any]) -> RetrievalResult:
+        payload = doc.get("payload", {})
+        snippet = doc.get("text") or payload.get("text", "")
+        collection = doc.get("collection")
+        label = self._name_to_label.get(collection, collection)
+        weight = doc.get("rerank_score") if doc.get("rerank_score") is not None else doc.get("score", 0.0)
+        document_id = doc.get("id")
+        return RetrievalResult(
+            source=label or "vector",
+            title=doc.get("title") or _safe_title(payload),
+            snippet=snippet,
+            weight=weight,
+            payload=payload,
+            collection=collection,
+            document_id=str(document_id) if document_id is not None else None,
+            rerank_score=doc.get("rerank_score"),
+        )
+
+    def _bm25_fallback(
+        self,
+        text: str,
+        collections: Sequence[str],
+        filters: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> List[RetrievalResult]:
+        payloads = self._snapshot_payloads(collections, filters)
+        documents = [payload.get("text", "") for payload in payloads]
         if not documents:
             return []
         bm25 = BM25Okapi([doc.lower().split() for doc in documents])
         scores = bm25.get_scores(text.lower().split())
-        ranked = sorted(zip(payloads, scores), key=lambda item: item[1], reverse=True)[:8]
-        return [
-            RetrievalResult(
-                source="sparse",
-                title=_safe_title(payload),
-                snippet=payload.get("text", ""),
-                weight=score,
-                payload=payload,
+        ranked = sorted(zip(payloads, scores), key=lambda item: item[1], reverse=True)[:limit]
+        results: List[RetrievalResult] = []
+        for payload, score in ranked:
+            collection = payload.get("collection")
+            label = self._name_to_label.get(collection, collection)
+            results.append(
+                RetrievalResult(
+                    source=label or "sparse",
+                    title=_safe_title(payload),
+                    snippet=payload.get("text", ""),
+                    weight=float(score),
+                    payload=payload,
+                    collection=collection,
+                    document_id=str(payload.get("doc_id")) if payload.get("doc_id") else None,
+                )
             )
-            for payload, score in ranked
-        ]
-
-    def _snapshot_payloads(self, filters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        scroll_filter = None
-        if filters:
-            must = [qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v)) for k, v in filters.items()]
-            scroll_filter = qmodels.Filter(must=must)
-        results: List[Dict[str, Any]] = []
-        offset = None
-        while True:
-            points, offset = self._client.scroll(
-                collection_name=self._collection,
-                scroll_filter=scroll_filter,
-                with_payload=True,
-                limit=256,
-                offset=offset,
-            )
-            results.extend([p.payload for p in points if p.payload])
-            if offset is None:
-                break
         return results
+
+    def _snapshot_payloads(
+        self, collections: Sequence[str], filters: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        qdrant_filter = self._build_filter(filters)
+        snapshots: List[Dict[str, Any]] = []
+        for collection in collections:
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=qdrant_filter,
+                    with_payload=True,
+                    limit=256,
+                    offset=offset,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    payload.setdefault("collection", collection)
+                    snapshots.append(payload)
+                if offset is None:
+                    break
+        return snapshots
 
 
 class HybridQueryEngine:
@@ -378,11 +523,7 @@ class HybridQueryEngine:
         return combined
 
     def _synthesise_answer(self, query: str, intent: Dict[str, Any], results: Sequence[RetrievalResult]) -> str:
-        context_parts = []
-        for result in results[:6]:
-            masked_payload = _mask_internal_ids(result.payload)
-            context_parts.append(f"Source: {result.source}\nTitle: {result.title}\nData: {json.dumps(masked_payload)}")
-        context_text = "\n\n".join(context_parts)
+        context_text = pack_context(results)
         system_prompt = (
             "You are a procurement intelligence assistant. Use the provided context to answer the question in HTML with headings, "
             "bullet lists, and tables when appropriate. Do not mention internal identifiers, collection names, or table names."
@@ -440,8 +581,128 @@ def build_default_engine() -> HybridQueryEngine:
     graph_service = Neo4jQueryService(neo4j_uri, neo4j_user, neo4j_password)
     qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     ollama = OllamaChatClient(ollama_host, model=model)
-    retriever = QdrantRetriever(qdrant_client, collection_prefix + "procwise_procurement_embeddings", ollama)
+    collections_raw = os.environ.get("QDRANT_COLLECTIONS")
+    collections: List[Dict[str, str]] = []
+    if collections_raw:
+        try:
+            parsed = json.loads(collections_raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "name" in item:
+                        name = _apply_prefix(collection_prefix, item["name"])
+                        label = item.get("label") or item.get("title") or name
+                        collections.append({"name": name, "label": label})
+                    elif isinstance(item, str):
+                        collections.append(_parse_collection_entry(collection_prefix, item))
+        except json.JSONDecodeError:
+            for entry in collections_raw.split(","):
+                entry = entry.strip()
+                if entry:
+                    collections.append(_parse_collection_entry(collection_prefix, entry))
+    if not collections:
+        default_name = _apply_prefix(collection_prefix, "procwise_procurement_embeddings")
+        collections = [{"name": default_name, "label": "Procurement"}]
+    embed_model = os.environ.get("EMBED_MODEL", "intfloat/e5-large-v2")
+    rerank_model = os.environ.get("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    router_model = os.environ.get("ROUTER_MODEL", "facebook/bart-large-mnli")
+    route_top_k = int(os.environ.get("RETRIEVAL_ROUTE_TOP_K", "3"))
+    per_collection_k = int(os.environ.get("RETRIEVAL_PER_COLLECTION_K", "15"))
+    retriever = QdrantRetriever(
+        qdrant_client,
+        collections=collections,
+        embed_model=embed_model,
+        rerank_model=rerank_model,
+        router_model=router_model,
+        route_top_k=route_top_k,
+        per_collection_k=per_collection_k,
+    )
     return HybridQueryEngine(graph_service, retriever, ollama)
+
+
+def _apply_prefix(prefix: str, name: str) -> str:
+    if not prefix:
+        return name
+    if name.startswith(prefix):
+        return name
+    return f"{prefix}{name}"
+
+
+def _parse_collection_entry(prefix: str, entry: str) -> Dict[str, str]:
+    if ":" in entry:
+        name_part, label_part = entry.split(":", 1)
+        name = _apply_prefix(prefix, name_part.strip())
+        label = label_part.strip() or name
+    else:
+        name = _apply_prefix(prefix, entry.strip())
+        label = name
+    return {"name": name, "label": label}
+
+
+def pack_context(results: Sequence[RetrievalResult], max_tokens: int = 3000) -> str:
+    if not results:
+        return ""
+
+    def estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text.split()) * 1.2))
+
+    def is_summary(result: RetrievalResult) -> bool:
+        payload = result.payload or {}
+        if payload.get("is_summary"):
+            return True
+        section = str(payload.get("section", "")).lower()
+        return section in {"summary", "overview", "abstract"}
+
+    tokens_left = max_tokens
+    context_blocks: List[str] = []
+    seen: Set[Tuple[Optional[str], Optional[str], str]] = set()
+
+    def add_result(res: RetrievalResult) -> None:
+        nonlocal tokens_left
+        if tokens_left <= 0:
+            return
+        key = (res.collection, res.document_id, res.title)
+        if key in seen:
+            return
+        seen.add(key)
+        masked_payload = _mask_internal_ids(res.payload)
+        doc_id = res.document_id or masked_payload.get("doc_id") or masked_payload.get("id") or "unknown"
+        collection_label = res.collection or res.source or "document"
+        snippet = (res.snippet or "")[:2000]
+        block_parts = [f"[{collection_label}:{doc_id}] {res.title}"]
+        if snippet:
+            block_parts.append(f"Snippet: {snippet}")
+        if masked_payload:
+            block_parts.append(f"Metadata: {json.dumps(masked_payload, ensure_ascii=False)}")
+        block_text = "\n".join(block_parts)
+        context_blocks.append(block_text)
+        tokens_left -= min(estimate_tokens(block_text), 300)
+
+    for summary_result in results:
+        if is_summary(summary_result):
+            add_result(summary_result)
+            if tokens_left <= 0:
+                return "\n---\n".join(context_blocks)
+
+    counter = Counter((res.collection or res.source or "document") for res in results[:30])
+    total = sum(counter.values()) or 1
+    for collection, freq in counter.most_common():
+        quota = max(1, int((freq / total) * (max_tokens / 300)))
+        added = 0
+        for res in results:
+            if (res.collection or res.source or "document") != collection:
+                continue
+            if tokens_left <= 0 or added >= quota:
+                break
+            add_result(res)
+            added += 1
+        if tokens_left <= 0:
+            break
+
+    return "\n---\n".join(context_blocks)
 
 
 def _mask_internal_ids(payload: Dict[str, Any]) -> Dict[str, Any]:
