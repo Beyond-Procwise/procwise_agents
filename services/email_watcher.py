@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from email import policy
@@ -24,12 +24,15 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from agents.base_agent import AgentContext, AgentOutput
 from agents.negotiation_agent import NegotiationAgent
 from agents.supplier_interaction_agent import SupplierInteractionAgent
+from services.event_bus import get_event_bus
 from services.process_routing_service import ProcessRoutingService
 from repositories import (
+    draft_rfq_emails_repo,
     supplier_interaction_repo,
     supplier_response_repo,
-    workflow_email_tracking_repo as tracking_repo,
+    workflow_email_tracking_repo,
     workflow_round_response_repo,
+    workflow_lifecycle_repo,
 )
 from repositories.supplier_interaction_repo import SupplierInteractionRow
 from repositories.supplier_response_repo import SupplierResponseRow
@@ -42,6 +45,8 @@ from utils.email_tracking import (
 )
 
 logger = logging.getLogger(__name__)
+
+tracking_repo = workflow_email_tracking_repo
 
 
 # ---------------------------------------------------------------------------
