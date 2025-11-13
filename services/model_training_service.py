@@ -397,12 +397,60 @@ class ModelTrainingService:
 
         feedback_summary = self._process_feedback_for_training()
 
+        # ------------------------------------------------------------------
+        # RAG qwen3-30b integration for generating instruction tuning examples
+        # ------------------------------------------------------------------
+        rag_qwen_result: Optional[Dict[str, Any]] = None
+        try:
+            # Import lazily to avoid hard dependency at module import time
+            from services.rag_qwen30b import RAGQwen30b
+
+            rag_pipe = RAGQwen30b(self.agent_nick)
+            instruction_examples: List[Dict[str, Any]] = []
+
+            # Build instruction examples from recent workflow context when possible
+            for item in (workflow_context or [])[:25]:
+                try:
+                    q = None
+                    # common field names observed in learning records
+                    for candidate in ("query", "question", "prompt", "input"):
+                        if isinstance(item.get(candidate), str) and item.get(candidate).strip():
+                            q = item.get(candidate).strip()
+                            break
+                    if not q:
+                        continue
+                    # Use the RAG pipeline to produce an answer that can be used as a completion
+                    resp = rag_pipe.answer(q, ensure_min_docs=3)
+                    answer_text = resp.get("answer", "").strip()
+                    if not answer_text or answer_text.startswith("I don't have enough information"):
+                        continue
+                    instruction_examples.append({"prompt": q, "completion": answer_text})
+                except Exception:
+                    logger.exception("Failed to generate RAG instruction example for workflow item")
+
+            rag_qwen_result = None
+            if instruction_examples:
+                try:
+                    # Persist via the layered RAG trainer's layer two helper
+                    layer2_summary = self._rag_trainer._run_layer_two(instruction_examples)
+                    rag_qwen_result = {
+                        "generated_examples": len(instruction_examples),
+                        "layer2_summary": layer2_summary,
+                    }
+                except Exception:
+                    logger.exception("Failed to persist RAG-generated instruction examples")
+                    rag_qwen_result = {"generated_examples": len(instruction_examples), "layer2_summary": None}
+        except Exception:
+            logger.exception("RAG qwen3-30b integration failed during training dispatch")
+            rag_qwen_result = {"error": "integration_failed"}
+
         return {
             "training_jobs": training_jobs,
             "relationship_jobs": relationship_jobs,
             "workflow_context": workflow_context,
             "negotiation_learnings": negotiation_learnings,
             "phi4_fine_tuning": phi4_result,
+            "rag_qwen30b_finetuning": rag_qwen_result,
             "feedback_summary": feedback_summary,
         }
 
@@ -514,7 +562,7 @@ class ModelTrainingService:
                                 example.get("retrieved_docs", []),
                             ),
                         )
-            conn.commit()
+                conn.commit()
             logger.info("Stored %s RAG training examples", len(examples))
         except Exception:  # pragma: no cover
             logger.exception("Failed to persist RAG training examples")

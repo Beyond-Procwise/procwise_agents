@@ -2330,7 +2330,31 @@ class Orchestrator:
             responses_received = watcher_result.get("responses_received") or 0
         pending_negotiation = data.get("negotiation_context") or data.get("supplier_responses")
         trigger = workflow_config.get("states", {}).get("NEGOTIATE", {})
-        return trigger.get("enabled", True) and (responses_received > 0 or bool(pending_negotiation))
+        gating_result: Optional[Dict[str, Any]] = None
+        min_responses = int(trigger.get("min_responses", trigger.get("min_supplier_responses", 3)))
+        if trigger.get("enabled", True):
+            try:
+                from services.procwise_knowledge_graph import should_trigger_negotiation
+
+                gating_result = should_trigger_negotiation(
+                    context.workflow_id,
+                    rfq_id=data.get("rfq_id"),
+                    min_responses=min_responses,
+                )
+                results["knowledge_graph_negotiation_gate"] = gating_result
+                data.setdefault("negotiation_gate", gating_result)
+            except Exception:  # pragma: no cover - defensive integration
+                logger.exception(
+                    "Knowledge graph negotiation gate failed for workflow %s", context.workflow_id
+                )
+        proceed = trigger.get("enabled", True) and (
+            responses_received > 0 or bool(pending_negotiation)
+        )
+        if gating_result is not None:
+            if not gating_result.get("should_trigger_negotiation"):
+                return False
+            proceed = proceed or gating_result.get("should_trigger_negotiation", False)
+        return proceed
 
     def _execute_agent(self, agent_name: str, context: AgentContext) -> Any:
         """Execute single agent"""
