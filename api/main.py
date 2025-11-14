@@ -1,7 +1,9 @@
 import sys, os, uvicorn, logging
+from contextlib import asynccontextmanager
+from typing import Any, Optional, Protocol, cast
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 
 # Ensure GPU utilisation by default on compatible hardware
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -36,9 +38,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
                     handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(LOG_DIR, "procwise.log"))])
 logger = logging.getLogger(__name__)
 
+
+class ProcwiseAppState(Protocol):
+    agent_nick: Optional["AgentNick"]
+    model_training_endpoint: Optional["ModelTrainingEndpoint"]
+    orchestrator: Optional["Orchestrator"]
+    rag_pipeline: Optional["RAGPipeline"]
+    agent_registry: Optional["AgentRegistry"]
+    supplier_interaction_agent: Optional["SupplierInteractionAgent"]
+    negotiation_agent: Optional["NegotiationAgent"]
+    email_watcher_runner: Optional[Any]
+    backend_scheduler: Any
+    email_watcher_service: Optional[Any]
+    email_watcher_owned: bool
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("API starting up...")
+    state = cast(ProcwiseAppState, app.state)
     try:
         agent_nick = AgentNick()
         discrepancy_agent = DiscrepancyDetectionAgent(agent_nick)
@@ -79,60 +96,67 @@ async def lifespan(app: FastAPI):
                 "SupplierInteractionAgent": "supplier_interaction",
             }
         )
-        app.state.agent_nick = agent_nick
-        app.state.model_training_endpoint = ModelTrainingEndpoint(agent_nick)
+        state.agent_nick = agent_nick
+        state.model_training_endpoint = ModelTrainingEndpoint(agent_nick)
         orchestrator = Orchestrator(
             agent_nick,
-            training_endpoint=app.state.model_training_endpoint,
+            training_endpoint=state.model_training_endpoint,
         )
-        app.state.orchestrator = orchestrator
-        app.state.rag_pipeline = RAGPipeline(agent_nick)
-        app.state.agent_registry = agent_nick.agents
-        app.state.supplier_interaction_agent = supplier_interaction_agent
-        app.state.negotiation_agent = negotiation_agent
-        app.state.email_watcher_runner = run_email_watcher_for_workflow
+        state.orchestrator = orchestrator
+        state.rag_pipeline = RAGPipeline(agent_nick)
+        state.agent_registry = agent_nick.agents
+        state.supplier_interaction_agent = supplier_interaction_agent
+        state.negotiation_agent = negotiation_agent
+        state.email_watcher_runner = run_email_watcher_for_workflow
         backend_scheduler = orchestrator.backend_scheduler
-        app.state.backend_scheduler = backend_scheduler
+        state.backend_scheduler = backend_scheduler
         try:
             email_watcher_service = backend_scheduler.get_email_watcher_service()
         except Exception:
             logger.exception("Failed to obtain email watcher service from backend scheduler")
             email_watcher_service = None
-        app.state.email_watcher_service = email_watcher_service
-        app.state.email_watcher_owned = False
+        state.email_watcher_service = email_watcher_service
+        state.email_watcher_owned = False
         logger.info("System initialized successfully.")
     except Exception as e:
         logger.critical(f"FATAL: System initialization failed: {e}", exc_info=True)
-        app.state.orchestrator = None; app.state.rag_pipeline = None
-        app.state.email_watcher_runner = None
-        app.state.email_watcher_service = None
-        app.state.email_watcher_owned = False
+        state.agent_nick = None
+        state.model_training_endpoint = None
+        state.orchestrator = None
+        state.rag_pipeline = None
+        state.agent_registry = None
+        state.supplier_interaction_agent = None
+        state.negotiation_agent = None
+        state.email_watcher_runner = None
+        state.email_watcher_service = None
+        state.email_watcher_owned = False
+        state.backend_scheduler = None
     yield
-    if hasattr(app.state, "agent_nick"):
-        app.state.agent_nick = None
-    if hasattr(app.state, "email_watcher_runner"):
-        app.state.email_watcher_runner = None
-    if hasattr(app.state, "email_watcher_service"):
-        service = app.state.email_watcher_service
-        owned = getattr(app.state, "email_watcher_owned", True)
+    if hasattr(state, "agent_nick"):
+        state.agent_nick = None
+    if hasattr(state, "email_watcher_runner"):
+        state.email_watcher_runner = None
+    if hasattr(state, "email_watcher_service"):
+        service = state.email_watcher_service
+        owned = getattr(state, "email_watcher_owned", True)
         if service and owned:
             try:
                 service.stop()
             except Exception:  # pragma: no cover - defensive shutdown
                 logger.exception("Failed to stop EmailWatcherService during shutdown")
-        app.state.email_watcher_service = None
-    if hasattr(app.state, "email_watcher_owned"):
-        app.state.email_watcher_owned = False
-    if hasattr(app.state, "backend_scheduler"):
-        app.state.backend_scheduler = None
-    if hasattr(app.state, "supplier_interaction_agent"):
-        app.state.supplier_interaction_agent = None
-    if hasattr(app.state, "negotiation_agent"):
-        app.state.negotiation_agent = None
-    if hasattr(app.state, "agent_registry"):
-        app.state.agent_registry = None
-    if hasattr(app.state, "model_training_endpoint"):
-        app.state.model_training_endpoint = None
+        state.email_watcher_service = None
+    if hasattr(state, "email_watcher_owned"):
+        state.email_watcher_owned = False
+    if hasattr(state, "backend_scheduler"):
+        state.backend_scheduler = None
+    if hasattr(state, "supplier_interaction_agent"):
+        state.supplier_interaction_agent = None
+    if hasattr(state, "negotiation_agent"):
+        state.negotiation_agent = None
+    if hasattr(state, "agent_registry"):
+        state.agent_registry = None
+    if hasattr(state, "model_training_endpoint"):
+        state.model_training_endpoint = None
     logger.info("API shutting down.")
 
 app = FastAPI(title="ProcWise API v4 (Definitive)", version="4.0", lifespan=lifespan)

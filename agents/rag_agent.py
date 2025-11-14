@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from html import escape
+
 import numpy as np
 
 from .base_agent import AgentOutput, AgentStatus, BaseAgent
@@ -1130,6 +1132,11 @@ class RAGAgent(BaseAgent):
         extracted = extracted_data or {}
         plan = plan or {}
         raw_answer = raw_answer or ""
+
+        structured_html = self._render_structured_html(raw_answer, plan)
+        if structured_html:
+            return sanitize_html(structured_html)
+
         heuristics = self._build_heuristic_atoms(
             query=query,
             raw_answer=raw_answer,
@@ -1137,22 +1144,7 @@ class RAGAgent(BaseAgent):
             plan=plan,
             followups=followups,
         )
-
-        model_atoms: Dict[str, Any] = {}
-        if self._should_invoke_atom_model():
-            try:
-                model_atoms = self._request_atoms_via_llm(
-                    query=query,
-                    raw_answer=raw_answer,
-                    docs=list(docs or []),
-                    heuristics=heuristics,
-                )
-            except Exception:  # pragma: no cover - defensive logging only
-                logger.exception("Failed to extract HTML atoms via LLM; using heuristics")
-                model_atoms = {}
-
-        merged_atoms = self._merge_atom_payloads(heuristics, model_atoms)
-        final_atoms = self._finalise_atoms(merged_atoms)
+        final_atoms = self._finalise_atoms(heuristics)
 
         html_answer = compose_html_answer(
             summary=final_atoms["summary"],
@@ -1165,9 +1157,93 @@ class RAGAgent(BaseAgent):
         )
         return sanitize_html(html_answer)
 
-    def _should_invoke_atom_model(self) -> bool:
-        disabled = getattr(self.agent_nick.settings, "disable_rag_atoms_llm", False)
-        return not bool(disabled)
+    def _render_structured_html(self, answer: str, plan: Dict[str, Any]) -> str:
+        """Convert markdown-style sections into sanitized HTML."""
+
+        text = (answer or "").strip()
+        if not text:
+            return ""
+
+        sections = self._split_structured_sections(text)
+        if not sections:
+            return ""
+
+        plan_sections = plan.get("sections") if isinstance(plan, dict) else None
+        html_parts: List[str] = ["<section>"]
+        for index, (header, body) in enumerate(sections):
+            heading = header.strip()
+            if not heading and isinstance(plan_sections, list) and index < len(plan_sections):
+                heading = str(plan_sections[index]).strip().replace("_", " ").title()
+            tag = "h2" if index == 0 else "h3"
+            if heading:
+                html_parts.append(f"<{tag}>{escape(heading)}</{tag}>")
+            body_html = self._render_section_body(body)
+            if body_html:
+                html_parts.append(body_html)
+        html_parts.append("</section>")
+
+        rendered = "\n".join(part for part in html_parts if part).strip()
+        return rendered if rendered != "<section></section>" else ""
+
+    def _split_structured_sections(self, text: str) -> List[Tuple[str, str]]:
+        sections: List[Tuple[str, str]] = []
+        current_header: Optional[str] = None
+        buffer: List[str] = []
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                if current_header is not None or buffer:
+                    sections.append(
+                        (current_header or "", "\n".join(buffer).strip())
+                    )
+                current_header = stripped[3:].strip()
+                buffer = []
+            else:
+                buffer.append(line)
+
+        if current_header is not None or buffer:
+            sections.append((current_header or "", "\n".join(buffer).strip()))
+
+        cleaned: List[Tuple[str, str]] = []
+        for header, body in sections:
+            if header.strip() or body.strip():
+                cleaned.append((header, body))
+        if not cleaned and text.strip():
+            cleaned.append(("", text.strip()))
+        return cleaned
+
+    def _render_section_body(self, body: str) -> str:
+        if not body:
+            return ""
+
+        lines = [line.rstrip() for line in body.splitlines()]
+        html_parts: List[str] = []
+        list_buffer: List[str] = []
+
+        def flush_list() -> None:
+            if not list_buffer:
+                return
+            html_parts.append("<ul>")
+            for item in list_buffer:
+                html_parts.append(f"<li>{escape(item)}</li>")
+            html_parts.append("</ul>")
+            list_buffer.clear()
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                flush_list()
+                continue
+            list_match = re.match(r"^([-*]|\d+\.)\s+(.*)", stripped)
+            if list_match:
+                list_buffer.append(list_match.group(2).strip())
+                continue
+            flush_list()
+            html_parts.append(f"<p>{escape(stripped)}</p>")
+
+        flush_list()
+        return "\n".join(part for part in html_parts if part).strip()
 
     def _build_heuristic_atoms(
         self,
@@ -1328,235 +1404,6 @@ class RAGAgent(BaseAgent):
                 if cleaned:
                     return f"Share {cleaned.lower()} next if you want deeper coverage."
         return "Share another detail when you want a deeper dive."
-
-    def _request_atoms_via_llm(
-        self,
-        *,
-        query: str,
-        raw_answer: str,
-        docs: Sequence[Any],
-        heuristics: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        context_snippets = self._collect_atom_context(raw_answer, docs)
-        payload = {
-            "question": query,
-            "context_snippets": context_snippets,
-            "heuristics": heuristics,
-        }
-        user_instruction = (
-            json.dumps(payload, ensure_ascii=False, indent=2)
-            + "\nReturn ONLY valid JSON with keys: summary, scope, rules, exclusions, policies, next_steps, followup."
-        )
-
-        model_name = self._resolve_atom_model_name()
-        response = self.call_ollama(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": ATOM_EXTRACTION_SYSTEM},
-                {"role": "user", "content": user_instruction},
-            ],
-            options={
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "num_ctx": 8192,
-                "num_predict": 1024,
-            },
-        )
-        raw_text = self._extract_llm_message(response)
-        return self._parse_atom_json(raw_text)
-
-    def _resolve_atom_model_name(self, fallback: str = "phi4:latest") -> str:
-        """Return the preferred LLM identifier for HTML atom extraction."""
-
-        # ``BaseAgent`` exposes ``get_agent_model`` in newer deployments. Older
-        # builds might not, so we defensively probe before invoking to avoid the
-        # AttributeError observed in production.
-        resolver = getattr(self, "get_agent_model", None)
-        if callable(resolver):
-            try:
-                model_name = resolver("rag_agent_html_atoms", fallback=fallback)
-            except TypeError:
-                model_name = resolver("rag_agent_html_atoms")  # type: ignore[misc]
-            if isinstance(model_name, str) and model_name.strip():
-                return model_name.strip()
-
-        # Allow the agent nickname wrapper to supply overrides when available.
-        nick_resolver = getattr(self.agent_nick, "get_agent_model", None)
-        if callable(nick_resolver):
-            try:
-                model_name = nick_resolver("rag_agent_html_atoms", fallback=fallback)
-            except TypeError:
-                model_name = nick_resolver("rag_agent_html_atoms")  # type: ignore[misc]
-            if isinstance(model_name, str) and model_name.strip():
-                return model_name.strip()
-
-        configured = getattr(self.settings, "rag_model", None)
-        if isinstance(configured, str) and configured.strip():
-            return configured.strip()
-
-        return fallback
-
-    @staticmethod
-    def _extract_llm_message(response: Dict[str, Any]) -> str:
-        if not isinstance(response, dict):
-            return ""
-        message = response.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str):
-                return content.strip()
-        content = response.get("response")
-        if isinstance(content, str):
-            return content.strip()
-        return ""
-
-    def _collect_atom_context(self, raw_answer: str, docs: Sequence[Any]) -> List[str]:
-        snippets: List[str] = []
-        stripped = self._clean_prompt_text(self._strip_markdown(raw_answer or ""))
-        if stripped:
-            snippets.append(self._truncate_context(f"Answer scope: {stripped}"))
-        for doc in docs[:8]:
-            payload = getattr(doc, "payload", {}) or {}
-            summary = payload.get("summary") or payload.get("text_summary")
-            label = payload.get("source_label") or payload.get("record_id") or "Context"
-            snippet = f"{label}: {summary}" if summary else str(label)
-            cleaned = self._clean_prompt_text(snippet)
-            if cleaned:
-                snippets.append(self._truncate_context(cleaned))
-            if len(snippets) >= 8:
-                break
-        return snippets
-
-    def _truncate_context(self, text: str, limit: int = 600) -> str:
-        cleaned = text.strip()
-        if len(cleaned) <= limit:
-            return cleaned
-        return cleaned[: limit - 1].rstrip() + "…"
-
-    def _clean_prompt_text(self, text: str) -> str:
-        cleaned = (text or "").replace("static_policy", "policy library")
-        cleaned = re.sub(r"document_id\s*[:=]\s*\S+", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"procwise_document_embeddings", "procurement knowledge base", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        return cleaned
-
-    def _parse_atom_json(self, text: str) -> Dict[str, Any]:
-        if not text:
-            return {}
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            return {}
-        candidate = match.group(0)
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            cleaned = re.sub(r'\\(?!["\/bfnrtu])', "", candidate)
-            try:
-                parsed = json.loads(cleaned)
-            except Exception:
-                return {}
-        if isinstance(parsed, dict):
-            return parsed
-        return {}
-
-    def _merge_atom_payloads(
-        self,
-        fallback: Dict[str, Any],
-        model_atoms: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        merged = dict(fallback)
-        for key in ("summary", "followup"):
-            value = model_atoms.get(key)
-            if isinstance(value, str) and value.strip():
-                merged[key] = value.strip()
-
-        list_mappings: Dict[str, Tuple[str, ...]] = {
-            "scope": ("scope", "applicability", "audience", "coverage"),
-            "rules": ("rules", "allowed"),
-            "exclusions": ("exclusions", "prohibited"),
-            "next_steps": ("next_steps", "notes"),
-        }
-
-        for target, candidates in list_mappings.items():
-            for candidate in candidates:
-                value = model_atoms.get(candidate)
-                if isinstance(value, (list, tuple)):
-                    cleaned: List[str] = []
-                    for item in value:
-                        text = str(item).strip()
-                        if text:
-                            cleaned.append(text)
-                        if len(cleaned) >= _MAX_ATOM_LIST_ITEMS:
-                            break
-                    if cleaned:
-                        merged[target] = cleaned
-                        break
-                elif isinstance(value, str) and value.strip():
-                    merged[target] = [value.strip()]
-                    break
-
-        policy_value = None
-        for key in ("policies", "policy_rows", "details"):
-            value = model_atoms.get(key)
-            if isinstance(value, (list, tuple)):
-                policy_value = value
-                break
-        if policy_value is not None:
-            rows: List[Tuple[str, str, str]] = []
-            for idx, entry in enumerate(policy_value, start=1):
-                name: str
-                effective: str
-                note_text: str
-                if isinstance(entry, (list, tuple)):
-                    if len(entry) >= 3:
-                        name = str(entry[0]).strip()
-                        effective = str(entry[1]).strip()
-                        note_text = str(entry[2]).strip()
-                    elif len(entry) == 2:
-                        name = str(entry[0]).strip()
-                        effective = ""
-                        note_text = str(entry[1]).strip()
-                    elif len(entry) == 1:
-                        name = str(entry[0]).strip()
-                        effective = ""
-                        note_text = ""
-                    else:
-                        continue
-                elif isinstance(entry, dict):
-                    name = str(
-                        entry.get("name")
-                        or entry.get("policy")
-                        or entry.get("title")
-                        or entry.get("condition")
-                        or f"Item {idx}"
-                    ).strip()
-                    effective = str(
-                        entry.get("effective")
-                        or entry.get("date")
-                        or entry.get("timeline")
-                        or entry.get("window")
-                        or ""
-                    ).strip()
-                    note_text = str(
-                        entry.get("notes")
-                        or entry.get("owner")
-                        or entry.get("description")
-                        or entry.get("value")
-                        or ""
-                    ).strip()
-                elif isinstance(entry, str) and entry.strip():
-                    name, description = self._split_condition_description(entry, idx)
-                    name = name.strip()
-                    note_text = description.strip()
-                    effective = ""
-                else:
-                    continue
-                rows.append((name, effective, note_text))
-                if len(rows) >= _MAX_ATOM_LIST_ITEMS:
-                    break
-            if rows:
-                merged["policies"] = rows
-        return merged
 
     def _finalise_atoms(self, atoms: Dict[str, Any]) -> Dict[str, Any]:
         summary = str(atoms.get("summary") or "").strip()
