@@ -96,11 +96,11 @@ Static question/answer memory – A curated set of frequently asked questions wi
 
 RAGAgent uses cross‑encoder re‑ranking and improved chunking to select only the most relevant sentences or paragraphs from the above collections. It then calls the phi4 model with a prompt that instructs the model to speak like a helpful colleague: concise, semi‑formal and empathic. Policy answers are formatted into clear sections (e.g., What You Must Do, What's Prohibited, Spending Limits, Approval Requirements, Examples, Exceptions) with bullet points for ease of reading. Continuation prompts such as “good, but be more detailed” are treated as follow‑up questions rather than feedback; pure positive or negative feedback triggers a brief acknowledgement. The previous learning collection has been removed from the retrieval pipeline to avoid leaking internal data.
 
-🤖 Model Configuration (Ollama)
+🤖 Model Configuration (LM Studio)
 
-Agents discover installed local models via:
-
-ollama list
+Agents discover installed local models via the LM Studio OpenAI-compatible API
+(`curl http://127.0.0.1:1234/v1/models`) and cache the roster for fast
+fallback between preferred chat models.
 
 Supported roster (graceful fallback handled in code/config):
 

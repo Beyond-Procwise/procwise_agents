@@ -63,9 +63,9 @@ The `app` service executes `scripts/end_to_end_demo.py`, which will:
    export QDRANT_URL=http://localhost:6333
    export QDRANT_API_KEY=
    export QDRANT_COLLECTION_PREFIX=dev_
-   export OLLAMA_HOST=http://localhost:11434
+   export LMSTUDIO_BASE_URL=http://127.0.0.1:1234
    export LLM_DEFAULT_MODEL=phi4:latest
-   export OLLAMA_EMBED_MODEL=nomic-embed-text
+   export LMSTUDIO_EMBED_MODEL=nomic-embed-text
    ```
 
 4. Load data and test the engine:

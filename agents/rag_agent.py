@@ -1511,7 +1511,7 @@ class RAGAgent(BaseAgent):
         )
 
         model_name = self._resolve_atom_model_name()
-        response = self.call_ollama(
+        response = self.call_lmstudio(
             model=model_name,
             messages=[
                 {"role": "system", "content": ATOM_EXTRACTION_SYSTEM},

@@ -19,10 +19,10 @@ from collections import defaultdict
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
-import ollama
 import torch
 
 from config.settings import settings
+from services.lmstudio_client import LMStudioClientError, get_lmstudio_client
 
 logger = logging.getLogger(__name__)
 
@@ -432,19 +432,19 @@ class PromptEngine:
             options = {"temperature": 0.0}
             if torch.cuda.is_available():
                 options["num_gpu_layers"] = -1
-            response = ollama.generate(
+            client = get_lmstudio_client()
+            result = client.chat(
                 model=self.llm_model,
-                prompt=prompt,
-                format="json",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
                 options=options,
             )
-            parsed_query = json.loads(response.get("response"))
+            parsed_query = json.loads(result.get("message", {}).get("content", "{}"))
             logger.info("PromptEngine: Query deconstructed successfully -> %s", parsed_query)
             return parsed_query
-        except Exception as exc:  # pragma: no cover - runtime/network issues
+        except (LMStudioClientError, json.JSONDecodeError, Exception) as exc:  # pragma: no cover - runtime/network issues
             logger.exception("PromptEngine failed to deconstruct query: %s", exc)
             return None
 
 
 __all__ = ["PromptEngine"]
-

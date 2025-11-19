@@ -1795,7 +1795,7 @@ class SupplierRankingAgent(BaseAgent):
                 else:
                     if isinstance(candidate, str) and candidate.strip():
                         model_name = candidate.strip()
-            resp = self.call_ollama(prompt, model=model_name)
+            resp = self.call_lmstudio(prompt, model=model_name)
             return resp.get("response", "").strip()
         except Exception:
             logger.exception("Justification generation failed")

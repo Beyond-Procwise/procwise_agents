@@ -209,16 +209,19 @@ class Settings(BaseSettings):
     neo4j_username: str = Field(default="neo4j", env="NEO4J_USERNAME")
     neo4j_password: str = Field(default="neo4j", env="NEO4J_PASSWORD")
 
-    ollama_base_url: str = Field(
-        default="http://localhost:11434", env="OLLAMA_BASE_URL"
+    lmstudio_base_url: str = Field(
+        default="http://127.0.0.1:1234", env="LMSTUDIO_BASE_URL"
     )
-    ollama_generate_model: str = Field(
-        default="llama3.2", env="OLLAMA_GENERATE_MODEL"
+    lmstudio_chat_model: str = Field(
+        default="microsoft/phi-4-reasoning-plus", env="LMSTUDIO_CHAT_MODEL"
     )
-    ollama_embedding_model: str = Field(
-        default="all-minilm", env="OLLAMA_EMBED_MODEL"
+    lmstudio_embedding_model: str = Field(
+        default="nomic-embed-text", env="LMSTUDIO_EMBED_MODEL"
     )
-    ollama_timeout: int = Field(default=120, env="OLLAMA_TIMEOUT")
+    lmstudio_timeout: int = Field(default=120, env="LMSTUDIO_TIMEOUT")
+    lmstudio_api_key: Optional[str] = Field(
+        default=None, env="LMSTUDIO_API_KEY"
+    )
 
     ses_inbound_role_arn: Optional[str] = Field(default=None, env="SES_INBOUND_ROLE_ARN")
     ses_region: Optional[str] = Field(default="eu-west-1", env="SES_REGION")
@@ -269,8 +272,8 @@ class Settings(BaseSettings):
     imap_search_criteria: str = Field(default="ALL", env="IMAP_SEARCH_CRITERIA")
 
     extraction_model: str = "gpt-oss:20b"
-    llm_backend: str = Field(default="ollama", env="LLM_BACKEND")
-    langchain_provider: str = Field(default="ollama", env="LANGCHAIN_PROVIDER")
+    llm_backend: str = Field(default="lmstudio", env="LLM_BACKEND")
+    langchain_provider: str = Field(default="lmstudio", env="LANGCHAIN_PROVIDER")
     langchain_model: Optional[str] = Field(
         default="qwen3:30b", env="LANGCHAIN_MODEL"
     )
@@ -348,20 +351,6 @@ class Settings(BaseSettings):
     )
     agent_model_overrides: Dict[str, str] = Field(
         default_factory=dict, env="AGENT_MODEL_OVERRIDES"
-    )
-    ollama_quantized_model: Optional[str] = Field(
-        default=None, env="OLLAMA_QUANTIZED_MODEL"
-    )
-    ollama_gpu_layers: Optional[int] = Field(
-        default=None, env="OLLAMA_GPU_LAYERS"
-    )
-    ollama_num_batch: Optional[int] = Field(default=256, env="OLLAMA_NUM_BATCH")
-    ollama_context_window: int = Field(default=8192, env="OLLAMA_CONTEXT_WINDOW")
-    ollama_tokenizer: Optional[str] = Field(
-        default="llama3", env="OLLAMA_TOKENIZER"
-    )
-    ollama_adapter: Optional[str] = Field(
-        default=None, env="OLLAMA_ADAPTER"
     )
     stream_llm_responses: bool = Field(
         default=False, env="STREAM_LLM_RESPONSES"

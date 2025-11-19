@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Set
 
 from html import escape
-import ollama
 import pdfplumber
 from botocore.exceptions import ClientError
 from sentence_transformers import CrossEncoder
@@ -23,6 +22,10 @@ from qdrant_client import models
 from agents.base_agent import AgentStatus
 from agents.rag_agent import RAGAgent
 from services.redis_client import get_redis_client
+from services.lmstudio_client import (
+    LMStudioClientError,
+    get_lmstudio_client,
+)
 from .rag_service import RAGService
 from .nltk_pipeline import NLTKProcessor
 from utils.gpu import configure_gpu, load_cross_encoder
@@ -2237,7 +2240,7 @@ class RAGPipeline:
         return formatted.strip()
 
     def _generate_response(self, prompt: str, model: str) -> Dict:
-        """Calls :func:`ollama.chat` once to get answer and follow-ups."""
+        """Calls the LM Studio chat endpoint once to get answer and follow-ups."""
         system = (
             "System (Joshi)\n"
             "You are Joshi, the ProcWise SME. Sound like a caring, capable coworker—warm, semi-formal, and concise without seeming scripted. "
@@ -2253,8 +2256,9 @@ class RAGPipeline:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
+        client = get_lmstudio_client()
         try:
-            base_options = dict(self.agent_nick.ollama_options() or {})
+            base_options = dict(self.agent_nick.lmstudio_options() or {})
         except Exception:
             base_options = {}
         temperature = base_options.get("temperature", 0.0)
@@ -2267,40 +2271,23 @@ class RAGPipeline:
         else:
             base_options["temperature"] = min(0.7, temperature + 0.1)
         base_options.setdefault("top_p", 0.9)
-        chat_kwargs = {
-            "model": model,
-            "messages": messages,
-            "options": base_options,
-            "format": "json",
-        }
-
-        stream_enabled = bool(getattr(settings, "stream_llm_responses", False))
-        if stream_enabled:
-            try:
-                stream = ollama.chat(**{**chat_kwargs, "stream": True})
-                content_chunks: List[str] = []
-                for event in stream:
-                    fragment = (event or {}).get("message", {}).get("content")
-                    if fragment:
-                        content_chunks.append(fragment)
-                content = "".join(content_chunks)
-                if content:
-                    return json.loads(content)
-                logger.warning("Streaming response returned no content; retrying without streaming")
-            except json.JSONDecodeError as exc:
-                logger.error("Error parsing streamed JSON response: %s", exc)
-            except Exception as exc:
-                logger.error("Streaming LLM response failed: %s", exc)
+        base_options.setdefault("max_tokens", -1)
 
         try:
-            response = ollama.chat(**chat_kwargs)
+            response = client.chat(
+                model=model,
+                messages=messages,
+                options=base_options,
+                response_format={"type": "json_object"},
+            )
             content = response.get("message", {}).get("content", "")
-            return json.loads(content)
+            return json.loads(content or "{}")
         except json.JSONDecodeError as e:
             logger.error(f"Error parsing JSON response: {e}")
-            return {"answer": content.strip() or "Could not generate an answer.", "follow_ups": []}
-        except Exception as e:
-            logger.error(f"Error generating answer: {e}")
+            fallback = content.strip() if content else ""
+            return {"answer": fallback or "Could not generate an answer.", "follow_ups": []}
+        except LMStudioClientError as e:
+            logger.error(f"Error generating answer from LM Studio: %s", e)
             return {"answer": "Could not generate an answer.", "follow_ups": []}
 
     def answer_question(

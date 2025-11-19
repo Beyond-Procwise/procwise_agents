@@ -1577,7 +1577,7 @@ def test_parse_response_uses_llm_when_available(monkeypatch):
         )
     }
 
-    monkeypatch.setattr(agent, "call_ollama", lambda **kwargs: llm_payload)
+    monkeypatch.setattr(agent, "call_lmstudio", lambda **kwargs: llm_payload)
 
     parsed = agent._parse_response(
         "Offering revised pricing",

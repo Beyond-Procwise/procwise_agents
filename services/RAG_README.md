@@ -20,8 +20,8 @@ Operational safeguards:
 2. Candidates pass through exact-hash and semantic dedupe, then a per-doc cap that still guarantees breadth.
 3. Compression scores sentences with the reranker + MMR to retain only salient evidence, respecting `COMPRESS_PER_CHUNK_CHARS`.
 4. Context packing enforces the `RAG_CONTEXT_MAX_CHARS` budget and guarantees at least three distinct `doc_id` sources whenever available.
-5. Generation always goes through Ollama `qwen3-30b-procwise` with strict refusal fallback when no context survives.
+5. Generation always goes through the LM Studio-hosted `qwen3-30b-procwise` model with strict refusal fallback when no context survives.
 
-Make sure `OLLAMA_MODEL=qwen3-30b-procwise` and `OLLAMA_HOST` are set appropriately wherever the service runs.
+Make sure `LMSTUDIO_MODEL=qwen3-30b-procwise` (or set `LMSTUDIO_CHAT_MODEL`) and `LMSTUDIO_BASE_URL` are set appropriately wherever the service runs.
 
-After each fine-tune, render a fresh Modelfile via `python -m training.pipeline render-modelfile --template models/Modelfile.template --weights <path to gguf>` and (re)create the Ollama model with `ollama create qwen3-30b-procwise -f <Modelfile>`. This ensures the ChatML instructions that enforce context-only answers and `Sources:` formatting stay consistent with the service contract.
+After each fine-tune, render a fresh Modelfile via `python -m training.pipeline render-modelfile --template models/Modelfile.template --weights <path to gguf>` and import it into LM Studio (`Models > Add Custom Model`). This ensures the ChatML instructions enforced by the Modelfile stay consistent with the service contract.

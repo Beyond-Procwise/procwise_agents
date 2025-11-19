@@ -275,7 +275,7 @@ def test_pipeline_answer_returns_documents(monkeypatch):
         qdrant_client=SimpleNamespace(
             search=lambda **_: [SimpleNamespace(id="1", payload={"record_id": "R1", "summary": "s"}, score=1.0)]
         ),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
     result = pipeline.answer_question("q", "user")
@@ -332,7 +332,7 @@ def test_pipeline_returns_fallback_when_no_retrieval(monkeypatch):
         ),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     monkeypatch.setattr(
@@ -407,7 +407,7 @@ def test_pipeline_static_answer_is_conversational(monkeypatch):
         ),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -492,7 +492,7 @@ def test_feedback_acknowledgment_skips_question_preamble(monkeypatch):
         ),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -563,7 +563,7 @@ def test_pipeline_uploaded_context_mode(monkeypatch):
         settings=SimpleNamespace(qdrant_collection_name="c", s3_bucket_name="b", reranker_model="x"),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -649,7 +649,7 @@ def test_pipeline_uploaded_context_scoped_to_session(monkeypatch):
         settings=SimpleNamespace(qdrant_collection_name="c", s3_bucket_name="b", reranker_model="x"),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -716,7 +716,7 @@ def test_pipeline_prefers_explicit_session_id(monkeypatch):
         ),
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)

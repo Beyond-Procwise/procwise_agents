@@ -21,8 +21,11 @@ from http import HTTPStatus
 
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-import ollama
-from ollama._types import ResponseError
+
+from services.lmstudio_client import (
+    LMStudioClientError,
+    get_lmstudio_client,
+)
 
 from config.settings import settings
 from orchestration.prompt_engine import PromptEngine
@@ -45,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 def _build_phi4_fallback_models() -> Tuple[str, ...]:
-    """Return fallback model identifiers that keep Joshi on phi4."""
+    """Return fallback model identifiers for the LM Studio deployment."""
 
     configured = getattr(settings, "rag_model", None)
     candidates: List[str] = []
@@ -61,7 +64,7 @@ def _build_phi4_fallback_models() -> Tuple[str, ...]:
     return tuple(candidates)
 
 
-_OLLAMA_FALLBACK_MODELS: Tuple[str, ...] = _build_phi4_fallback_models()
+_LMSTUDIO_FALLBACK_MODELS: Tuple[str, ...] = _build_phi4_fallback_models()
 
 
 def _slugify_agent_name(value: Any) -> str:
@@ -888,7 +891,7 @@ class BaseAgent:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
-    def call_ollama(
+    def call_lmstudio(
         self,
         prompt: Optional[str] = None,
         model: Optional[str] = None,
@@ -896,13 +899,9 @@ class BaseAgent:
         messages: Optional[List[Dict[str, str]]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Wrapper around :func:`ollama.generate`/``ollama.chat`` used by agents.
+        """Wrapper around the LM Studio chat/completions API."""
 
-        ``messages`` enables use of the chat endpoint which streams tokens faster
-        on GPU-enabled systems.  When ``messages`` is provided the ``prompt`` is
-        ignored.
-        """
-        backend = getattr(self.settings, "llm_backend", "ollama") or "ollama"
+        backend = getattr(self.settings, "llm_backend", "lmstudio") or "lmstudio"
         if backend.lower() == "langchain":
             try:
                 return self._call_langchain_chat(
@@ -914,7 +913,7 @@ class BaseAgent:
                 )
             except Exception as exc:
                 logger.error(
-                    "LangChain backend failed; falling back to Ollama pipeline.",
+                    "LangChain backend failed; falling back to LM Studio pipeline.",
                     exc_info=exc,
                 )
 
@@ -935,165 +934,67 @@ class BaseAgent:
             else:
                 if isinstance(resolved_model, str) and resolved_model.strip():
                     base_model = resolved_model.strip()
-        quantized = getattr(self.settings, "ollama_quantized_model", None)
 
-        missing_models = getattr(self, "_missing_ollama_models", None)
-        if missing_models is None:
-            missing_models = set()
-            self._missing_ollama_models = missing_models
+        options_from_kwargs = kwargs.pop("options", {}) or {}
+        options = {**self.agent_nick.lmstudio_options(), **options_from_kwargs}
+        response_format = {"type": "json_object"} if format == "json" else None
 
-        options_from_kwargs = kwargs.pop("options", {})
-        base_kwargs = kwargs
+        candidate_names: List[str] = []
+        for candidate in (model, base_model):
+            if candidate and candidate not in candidate_names:
+                candidate_names.append(candidate)
+        for fallback_name in _LMSTUDIO_FALLBACK_MODELS:
+            if fallback_name not in candidate_names:
+                candidate_names.append(fallback_name)
 
-        options = {**self.agent_nick.ollama_options(), **options_from_kwargs}
-        def _is_gpt_oss(name: Optional[str]) -> bool:
-            return bool(name and "gpt-oss" in name)
-        if _is_gpt_oss(model) or _is_gpt_oss(base_model) or _is_gpt_oss(quantized):
-            options.setdefault("reasoning_effort", "medium")
-        optimized_defaults = {}
-        gpu_layers = getattr(self.settings, "ollama_gpu_layers", None)
-        if gpu_layers is not None:
-            optimized_defaults["gpu_layers"] = int(gpu_layers)
-        num_batch = getattr(self.settings, "ollama_num_batch", None)
-        if num_batch is not None:
-            optimized_defaults["num_batch"] = int(num_batch)
-        context_window = getattr(self.settings, "ollama_context_window", None)
-        if context_window:
-            optimized_defaults["num_ctx"] = int(context_window)
-        optimized_defaults.setdefault("num_thread", max(1, os.cpu_count() or 1))
-        optimized_defaults.setdefault(
-            "num_gpu", max(1, int(os.getenv("OLLAMA_NUM_GPU", "1")))
-        )
-        for key, value in optimized_defaults.items():
-            options.setdefault(key, value)
-
-        tokenizer = getattr(self.settings, "ollama_tokenizer", None)
-        if tokenizer:
-            options.setdefault("tokenizer", tokenizer)
-        adapter = getattr(self.settings, "ollama_adapter", None)
-        if adapter:
-            options.setdefault("adapter", adapter)
-
-        requested_candidates: List[Tuple[str, bool]] = []
-        if (
-            quantized
-            and (model is None or model == base_model)
-            and quantized not in missing_models
-        ):
-            requested_candidates.append((quantized, True))
-
-        base_candidate = model or base_model
-        if base_candidate:
-            requested_candidates.append((base_candidate, False))
-
-        deduped_candidates: List[Tuple[str, bool]] = []
-        seen_names: set[str] = set()
-        for name, is_quantized in requested_candidates:
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            deduped_candidates.append((name, is_quantized))
-        requested_candidates = deduped_candidates
-
-        fallback_candidates: List[Tuple[str, bool]] = []
-        for fallback_name in _OLLAMA_FALLBACK_MODELS:
-            if fallback_name in seen_names:
-                continue
-            seen_names.add(fallback_name)
-            fallback_candidates.append((fallback_name, False))
-
-        available_models = self._get_available_ollama_models()
-        available_set = set(available_models)
-
-        candidate_models: List[Tuple[str, bool]] = []
+        available_models = self._get_available_lmstudio_models()
         if available_models:
-            for name, is_quantized in requested_candidates:
-                if name in available_set:
-                    candidate_models.append((name, is_quantized))
-        if not candidate_models:
-            candidate_models.extend(fallback_candidates)
-        if not candidate_models and available_models:
-            fallback_model = next((m for m in available_models if m), None)
-            if fallback_model:
-                logger.warning(
-                    "Requested Ollama models %s not available; falling back to '%s'.",
-                    [name for name, _ in requested_candidates],
-                    fallback_model,
-                )
-                candidate_models.append((fallback_model, False))
+            filtered = [name for name in candidate_names if name in available_models]
+            if filtered:
+                candidate_names = filtered
 
-        if not candidate_models:
-            error_msg = "No available Ollama models detected from 'ollama list'."
+        if not candidate_names:
+            error_msg = "No available LM Studio models detected."
             logger.error(error_msg)
             return {"response": "", "error": error_msg}
 
         last_error: Optional[Exception] = None
-        attempted_models: set[str] = set()
-        idx = 0
-        while idx < len(candidate_models):
-            model_to_use, is_quantized = candidate_models[idx]
-            idx += 1
-            attempted_models.add(model_to_use)
+        client = getattr(self.agent_nick, "lmstudio_client", None) or get_lmstudio_client()
+        for model_to_use in candidate_names:
             try:
-                attempt_options = dict(options)
                 if messages is not None:
-                    return ollama.chat(
+                    return client.chat(
                         model=model_to_use,
                         messages=messages,
-                        options=attempt_options,
-                        stream=False,
-                        **base_kwargs,
+                        response_format=response_format,
+                        options=options,
                     )
-                return ollama.generate(
+                return client.generate(
                     model=model_to_use,
                     prompt=prompt or "",
                     format=format,
-                    stream=False,
-                    options=attempt_options,
-                    **base_kwargs,
+                    options=options,
                 )
-            except ResponseError as exc:
-                message = exc.args[0] if exc.args else ""
-                status_code = exc.args[1] if len(exc.args) > 1 else None
-                is_not_found = "not found" in str(message).lower() or status_code == 404
-                if is_quantized and is_not_found:
-                    missing_models.add(model_to_use)
-                    logger.warning(
-                        "Quantized Ollama model '%s' unavailable (status: %s); falling back to '%s'.",
-                        model_to_use,
-                        status_code,
-                        base_model,
-                    )
-                    self._remove_cached_ollama_model(model_to_use)
-                    continue
-                if is_not_found:
-                    logger.warning(
-                        "Ollama model '%s' unavailable (status: %s); refreshing available model list.",
-                        model_to_use,
-                        status_code,
-                    )
-                    self._remove_cached_ollama_model(model_to_use)
-                    available_models = self._get_available_ollama_models(force_refresh=True)
-                    fallback_model = next(
-                        (m for m in available_models if m not in attempted_models),
-                        None,
-                    )
-                    if fallback_model:
-                        candidate_models.append((fallback_model, False))
-                        continue
+            except LMStudioClientError as exc:
+                logger.warning(
+                    "LM Studio model '%s' unavailable or failed: %s",
+                    model_to_use,
+                    exc,
+                )
+                self._remove_cached_lmstudio_model(model_to_use)
                 last_error = exc
-                break
+                continue
             except Exception as exc:  # pragma: no cover - network / runtime issues
                 last_error = exc
                 break
 
         if last_error is not None:
-            logger.error("Ollama call failed", exc_info=last_error)
+            logger.error("LM Studio call failed", exc_info=last_error)
             return {"response": "", "error": str(last_error)}
 
         # Defensive fallback if the loop completes without returning (should not happen)
-        logger.error("Ollama call failed for unknown reasons")
-        return {"response": "", "error": "Unknown Ollama invocation failure"}
+        logger.error("LM Studio call failed for unknown reasons")
+        return {"response": "", "error": "Unknown LM Studio invocation failure"}
 
     def _call_langchain_chat(
         self,
@@ -1105,9 +1006,9 @@ class BaseAgent:
     ) -> Dict[str, Any]:
         """Invoke the configured LangChain chat model.
 
-        The interface mirrors :meth:`call_ollama` so that agents can switch
-        between the native Ollama client and LangChain-powered execution using
-        the ``LLM_BACKEND`` configuration flag.
+        The interface mirrors :meth:`call_lmstudio` so that agents can switch
+        between the native LM Studio client and LangChain-powered execution
+        using the ``LLM_BACKEND`` configuration flag.
         """
 
         chat_model = self._get_langchain_chat_model(model_override=model)
@@ -1183,7 +1084,7 @@ class BaseAgent:
                 "LangChain backend requested but 'langchain' is not installed."
             )
 
-        provider = (getattr(self.settings, "langchain_provider", "ollama") or "").lower()
+        provider = (getattr(self.settings, "langchain_provider", "lmstudio") or "").lower()
         model_identifier = model_name or getattr(self.settings, "langchain_model", None)
         if not model_identifier:
             raise RuntimeError(
@@ -1193,15 +1094,10 @@ class BaseAgent:
         base_url = getattr(self.settings, "langchain_api_base", None)
         api_key = getattr(self.settings, "langchain_api_key", None)
 
-        if provider in {"ollama", "ollama-chat"}:
-            module = importlib.import_module("langchain_community.chat_models")
-            chat_cls = getattr(module, "ChatOllama")
-            init_kwargs: Dict[str, Any] = {"model": model_identifier}
-            if base_url:
-                init_kwargs["base_url"] = base_url
-            return chat_cls(**init_kwargs)
+        if provider == "lmstudio" and not base_url:
+            base_url = getattr(self.settings, "lmstudio_base_url", None)
 
-        if provider in {"openai", "azure-openai", "gpt"}:
+        if provider in {"lmstudio", "openai", "azure-openai", "gpt"}:
             if importlib.util.find_spec("langchain_openai") is None:
                 raise RuntimeError(
                     "LangChain OpenAI integration is not installed. Add 'langchain-openai'."
@@ -1282,42 +1178,37 @@ class BaseAgent:
 
         return lc_messages
 
-    def _get_available_ollama_models(self, force_refresh: bool = False) -> List[str]:
-        """Return the cached list of Ollama models available on the host."""
+    def _get_available_lmstudio_models(self, force_refresh: bool = False) -> List[str]:
+        """Return the cached list of LM Studio models available on the host."""
 
-        cached: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
+        cache_attr = "_available_lmstudio_models"
+        cached: Optional[List[str]] = getattr(self.agent_nick, cache_attr, None)
         if force_refresh or cached is None:
             names: List[str] = []
             try:
-                response = ollama.list()
-                models = response.get("models", []) if isinstance(response, dict) else []
-                for entry in models:
-                    if not isinstance(entry, dict):
-                        continue
-                    name = entry.get("name") or entry.get("model")
-                    if name:
-                        names.append(name)
-            except Exception as exc:  # pragma: no cover - external dependency failure
-                logger.warning("Failed to retrieve available Ollama models: %s", exc)
+                client = getattr(self.agent_nick, "lmstudio_client", None) or get_lmstudio_client()
+                names = client.list_models()
+            except LMStudioClientError as exc:  # pragma: no cover - external dependency failure
+                logger.warning("Failed to retrieve available LM Studio models: %s", exc)
             if not names:
-                names = list(_OLLAMA_FALLBACK_MODELS)
+                names = list(_LMSTUDIO_FALLBACK_MODELS)
             cached = names
-            setattr(self.agent_nick, "_available_ollama_models", cached)
+            setattr(self.agent_nick, cache_attr, cached)
         if not cached:
-            cached = list(_OLLAMA_FALLBACK_MODELS)
-            setattr(self.agent_nick, "_available_ollama_models", cached)
+            cached = list(_LMSTUDIO_FALLBACK_MODELS)
+            setattr(self.agent_nick, cache_attr, cached)
         return list(cached)
 
-    def _remove_cached_ollama_model(self, model_name: str) -> None:
-        """Remove a model from the cached ``ollama list`` response."""
+    def _remove_cached_lmstudio_model(self, model_name: str) -> None:
+        """Remove a model from the cached LM Studio model list."""
 
-        cache: Optional[List[str]] = getattr(self.agent_nick, "_available_ollama_models", None)
+        cache: Optional[List[str]] = getattr(self.agent_nick, "_available_lmstudio_models", None)
         if not cache:
             return
         if model_name not in cache:
             return
         updated = [name for name in cache if name != model_name]
-        setattr(self.agent_nick, "_available_ollama_models", updated)
+        setattr(self.agent_nick, "_available_lmstudio_models", updated)
 
     def vector_search(self, query: str, top_k: int = 5):
         """Search the vector database for similar content.
@@ -1360,11 +1251,11 @@ class AgentNick:
         self.settings = settings
         logger.info("Initializing shared clients...")
         self.device = configure_gpu()
-        os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
         os.environ.setdefault("OMP_NUM_THREADS", "8")
         self._db_engine = None
         self.qdrant_client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
         self.embedding_model = SentenceTransformer(self.settings.embedding_model, device=self.device)
+        self.lmstudio_client = get_lmstudio_client()
         self.learning_repository = LearningRepository(self)
         self.static_policy_loader: Optional[StaticPolicyLoader] = None
         s3_pool = max(4, int(getattr(self.settings, "s3_max_pool_connections", 64)))
@@ -1508,11 +1399,9 @@ class AgentNick:
             except Exception:
                 logger.exception("Failed to close DB connection")
 
-    def ollama_options(self) -> Dict[str, Any]:
-        """Return default options for Ollama requests respecting GPU availability."""
-        if self.device == "cuda":
-            return {"num_gpu_layers": -1, "keep_alive": "10m"}
-        return {"keep_alive": "10m"}
+    def lmstudio_options(self) -> Dict[str, Any]:
+        """Return default options for LM Studio requests."""
+        return {"temperature": 0.2, "max_tokens": -1}
 
     def _build_agent_model_registry(self) -> Dict[str, str]:
         """Compile the agent → model preference map with overrides applied."""

@@ -85,32 +85,32 @@ class QdrantConfig:
 
 
 @dataclass(frozen=True)
-class OllamaConfig:
+class LMStudioConfig:
     base_url: str
-    generate_model: str
+    chat_model: str
     embedding_model: str
     timeout: int
 
     @classmethod
-    def from_env(cls) -> "OllamaConfig":
-        base_url = _getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        generate_model = _getenv("OLLAMA_GENERATE_MODEL", "llama3.2")
-        embedding_model = _getenv("OLLAMA_EMBED_MODEL", "all-minilm")
-        timeout = int(_getenv("OLLAMA_TIMEOUT", "120"))
+    def from_env(cls) -> "LMStudioConfig":
+        base_url = _getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234")
+        chat_model = _getenv("LMSTUDIO_CHAT_MODEL", "microsoft/phi-4-reasoning-plus")
+        embedding_model = _getenv("LMSTUDIO_EMBED_MODEL", "nomic-embed-text")
+        timeout = int(_getenv("LMSTUDIO_TIMEOUT", "120"))
         return cls(
             base_url=base_url,
-            generate_model=generate_model,
+            chat_model=chat_model,
             embedding_model=embedding_model,
             timeout=timeout,
         )
 
     @classmethod
-    def from_settings(cls, settings) -> "OllamaConfig":
+    def from_settings(cls, settings) -> "LMStudioConfig":
         return cls(
-            base_url=settings.ollama_base_url,
-            generate_model=settings.ollama_generate_model,
-            embedding_model=settings.ollama_embedding_model,
-            timeout=settings.ollama_timeout,
+            base_url=settings.lmstudio_base_url,
+            chat_model=settings.lmstudio_chat_model,
+            embedding_model=settings.lmstudio_embedding_model,
+            timeout=settings.lmstudio_timeout,
         )
 
 
@@ -119,7 +119,7 @@ class AppConfig:
     postgres: PostgresConfig
     neo4j: Neo4jConfig
     qdrant: QdrantConfig
-    ollama: OllamaConfig
+    lmstudio: LMStudioConfig
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -127,7 +127,7 @@ class AppConfig:
             postgres=PostgresConfig.from_env(),
             neo4j=Neo4jConfig.from_env(),
             qdrant=QdrantConfig.from_env(),
-            ollama=OllamaConfig.from_env(),
+            lmstudio=LMStudioConfig.from_env(),
         )
 
     @classmethod
@@ -136,7 +136,7 @@ class AppConfig:
             postgres=PostgresConfig.from_settings(settings),
             neo4j=Neo4jConfig.from_settings(settings),
             qdrant=QdrantConfig.from_settings(settings),
-            ollama=OllamaConfig.from_settings(settings),
+            lmstudio=LMStudioConfig.from_settings(settings),
         )
 
 
@@ -153,6 +153,6 @@ __all__ = [
     "PostgresConfig",
     "Neo4jConfig",
     "QdrantConfig",
-    "OllamaConfig",
+    "LMStudioConfig",
     "app_config_from_global_settings",
 ]

@@ -97,7 +97,7 @@ def test_supplier_history_does_not_trigger_policy_mode(monkeypatch):
         settings=settings,
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)
@@ -181,7 +181,7 @@ def test_policy_mode_includes_primary_collection_context(monkeypatch):
         settings=settings,
         embedding_model=DummyEmbed(),
         qdrant_client=SimpleNamespace(),
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     pipeline = RAGPipeline(nick, cross_encoder_cls=DummyCrossEncoder, use_nltk=False)

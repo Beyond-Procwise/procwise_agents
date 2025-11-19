@@ -57,7 +57,7 @@ class _DummyAgentNick:
         conn = sqlite3.connect(self._db_path)
         return conn
 
-    def ollama_options(self):  # pragma: no cover - deterministic default
+    def lmstudio_options(self):  # pragma: no cover - deterministic default
         return {}
 
 

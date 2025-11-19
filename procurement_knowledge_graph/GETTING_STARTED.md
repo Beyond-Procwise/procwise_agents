@@ -86,7 +86,7 @@ All interactions use the live Neo4j, Qdrant, and Ollama services.
 
 - **Neo4j authentication failures** – Ensure `NEO4J_USERNAME` and `NEO4J_PASSWORD` match the running container.
 - **Qdrant connection refused** – Check port mapping `6333:6333` and firewall settings.
-- **Slow LLM responses** – Confirm `OLLAMA_KEEP_ALIVE` is set (see docker-compose). Consider enabling GPU acceleration.
+- **Slow LLM responses** – Confirm LM Studio is running with the required models preloaded and consider enabling GPU acceleration.
 - **Threading header mismatch** – Run `get_email_thread_context` to inspect recorded message IDs and ensure dispatch tracking is enabled.
 
 ## 9. Next Steps

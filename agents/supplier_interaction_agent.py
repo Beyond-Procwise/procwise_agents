@@ -3862,7 +3862,7 @@ class SupplierInteractionAgent(BaseAgent):
                 else:
                     if isinstance(candidate, str) and candidate.strip():
                         model_name = candidate.strip()
-            response = self.call_ollama(
+            response = self.call_lmstudio(
                 model=model_name,
                 format="json",
                 messages=[

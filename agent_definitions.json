@@ -3,7 +3,7 @@
     "agentId": 1,
     "agentType": "DataExtractionAgent",
     "description": "Extracts structured data from PDF documents and stores it.",
-    "dependencies": ["s3_client", "db_client", "qdrant_client", "ollama_client", "embedding_model"]
+    "dependencies": ["s3_client", "db_client", "qdrant_client", "lmstudio_client", "embedding_model"]
   },
   {
     "agentId": 2,

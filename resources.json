@@ -15,9 +15,9 @@
     "description": "Client for interacting with Qdrant vector database."
   },
   {
-    "resourceId": "ollama_client",
+    "resourceId": "lmstudio_client",
     "type": "Client",
-    "description": "Client for interacting with local Ollama LLMs."
+    "description": "Client for interacting with the local LM Studio server."
   },
   {
     "resourceId": "embedding_model",

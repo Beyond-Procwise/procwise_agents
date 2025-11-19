@@ -142,7 +142,7 @@ def test_base_agent_writes_context_dataset(tmp_path):
         prompt_engine=SimpleNamespace(),
         process_routing_service=RecordingProcessRoutingService(),
         learning_repository=None,
-        ollama_options=lambda: {},
+        lmstudio_options=lambda: {},
     )
 
     agent = ContextAwareAgent(nick, memory, writer)

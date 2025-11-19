@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-import requests
 from loguru import logger
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
@@ -16,7 +15,8 @@ from retrying import retry
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from .config import AppConfig, Neo4jConfig, OllamaConfig, PostgresConfig, QdrantConfig
+from services.lmstudio_client import LMStudioClient
+from .config import AppConfig, LMStudioConfig, Neo4jConfig, PostgresConfig, QdrantConfig
 
 
 SCHEMA = "proc"
@@ -39,53 +39,19 @@ class DataFrames:
     categories: pd.DataFrame
 
 
-class OllamaClient:
-    def __init__(self, config: OllamaConfig) -> None:
-        self._config = config
-
-    @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10_000)
-    def embed(self, texts: List[str]) -> List[List[float]]:
-        payload = {"model": self._config.embedding_model, "input": texts}
-        url = f"{self._config.base_url}/api/embeddings"
-        response = requests.post(url, json=payload, timeout=self._config.timeout)
-        response.raise_for_status()
-        data = response.json()
-        if "data" not in data:
-            raise ValueError(f"Unexpected embedding response: {data}")
-        return [item["embedding"] for item in data["data"]]
-
-    @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10_000)
-    def generate(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
-        payload = {
-            "model": self._config.generate_model,
-            "prompt": prompt,
-            "stream": False,
-        }
-        if options:
-            payload.update(options)
-        url = f"{self._config.base_url}/api/generate"
-        response = requests.post(url, json=payload, timeout=self._config.timeout)
-        response.raise_for_status()
-        data = response.json()
-        text = data.get("response")
-        if not text:
-            raise ValueError(f"Empty response from Ollama: {data}")
-        return text
-
-
 class ProcurementKnowledgeGraph:
     def __init__(
         self,
         postgres_config: PostgresConfig,
         neo4j_config: Neo4jConfig,
         qdrant_config: QdrantConfig,
-        ollama_config: OllamaConfig,
+        lmstudio_config: LMStudioConfig,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
         self._postgres_config = postgres_config
         self._neo4j_config = neo4j_config
         self._qdrant_config = qdrant_config
-        self._ollama_config = ollama_config
+        self._lmstudio_config = lmstudio_config
         self._batch_size = batch_size
 
         self._engine: Engine = create_engine(self._postgres_config.dsn, pool_size=10, max_overflow=5)
@@ -95,12 +61,15 @@ class ProcurementKnowledgeGraph:
             max_connection_pool_size=50,
         )
         self._qdrant = QdrantClient(host=self._qdrant_config.host, port=self._qdrant_config.port, api_key=self._qdrant_config.api_key)
-        self._ollama = OllamaClient(self._ollama_config)
+        self._lmstudio = LMStudioClient(
+            base_url=self._lmstudio_config.base_url,
+            timeout=self._lmstudio_config.timeout,
+        )
         logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "ProcurementKnowledgeGraph":
-        return cls(config.postgres, config.neo4j, config.qdrant, config.ollama)
+        return cls(config.postgres, config.neo4j, config.qdrant, config.lmstudio)
 
     def close(self) -> None:
         logger.info("Closing database connections")
@@ -119,8 +88,11 @@ class ProcurementKnowledgeGraph:
             session.run("RETURN 1")
         logger.info("Testing Qdrant connection")
         self._qdrant.get_collections()
-        logger.info("Testing Ollama embedding endpoint")
-        self._ollama.embed(["connection test"])
+        logger.info("Testing LM Studio embedding endpoint")
+        self._lmstudio.embed(
+            model=self._lmstudio_config.embedding_model,
+            inputs=["connection test"],
+        )
 
     # -----------------------------------------------------
     # Data extraction
@@ -587,7 +559,10 @@ class ProcurementKnowledgeGraph:
             if not descriptions:
                 continue
             logger.info("Generating embeddings for {name}", name=name)
-            vectors = self._ollama.embed(descriptions)
+            vectors = self._lmstudio.embed(
+                model=self._lmstudio_config.embedding_model,
+                inputs=descriptions,
+            )
             points = []
             for idx, vector in enumerate(vectors):
                 payload = payloads[idx]

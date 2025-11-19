@@ -43,6 +43,7 @@ from utils.email_markers import attach_hidden_marker
 from pathlib import Path
 
 from services.redis_client import get_workflow_redis_client
+from services.lmstudio_client import get_lmstudio_client
 
 logger = logging.getLogger(__name__)
 
@@ -6153,16 +6154,23 @@ class NegotiationAgent(BaseAgent):
 
         if LLM_ENABLED and text:
             try:  # pragma: no cover - optional dependency
-                import ollama  # type: ignore
-
                 prompt = (
                     "Extract JSON with keys: tone (firm/flexible/neutral), finality_hint (bool), "
                     "capacity_tight (bool), moq (int or null), payment_terms_hint (tradeable/fixed/null), "
                     "delivery_flex (possible/unlikely/null), concession_band_pct (float or null). Only return JSON.\n\n"
                     f"Text:\n{text}"
                 )
-                resp = ollama.generate(model=LLM_MODEL, prompt=prompt, options={"temperature": 0.1})
-                content = resp.get("response") or ""
+                client = get_lmstudio_client()
+                resp = client.generate(
+                    model=LLM_MODEL,
+                    prompt=prompt,
+                    format="json",
+                    options={"temperature": 0.1},
+                )
+                content = (
+                    resp.get("response")
+                    or resp.get("message", {}).get("content", "")
+                )
                 if "{" in content and "}" in content:
                     content = content[content.find("{") : content.rfind("}") + 1]
                     parsed = json.loads(content)

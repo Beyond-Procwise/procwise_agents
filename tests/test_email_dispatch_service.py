@@ -5,8 +5,6 @@ import types
 from types import SimpleNamespace
 from typing import List
 
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

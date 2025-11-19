@@ -71,26 +71,27 @@ A Docker Compose stack ships with managed services for:
 ## Model Training & Evaluation
 
 The `training/pipeline.py` module now exposes a modular workflow for exporting
-instruction data, fine-tuning with Unsloth-powered QLoRA, rendering Ollama
-Modelfiles, and validating the resulting RAG behaviour.
+instruction data, fine-tuning with Unsloth-powered QLoRA, rendering LM Studio
+model descriptors, and validating the resulting RAG behaviour.
 
 Key commands (run via `python -m training.pipeline <command> ...`):
 
 - `export-data` – stream instruction data from Postgres directly to JSONL.
+- `build-domain-dataset` – enrich exported instructions with grounded passages pulled from Qdrant (via `doc_id` or any payload key) to keep the finetuned model focused on ProcWise knowledge.
 - `train` – launch Unsloth + TRL supervised fine-tuning with reproducible
   configs and deterministic logging.
 - `convert-gguf` – convert merged HF weights into GGUF (and optionally quantize)
-  for Ollama.
+  for LM Studio ingestion.
 - `render-modelfile` – fill `models/Modelfile.template` with the new weight
-  path, temperature, and context window. This produces the Modelfile that
-  should be registered as `qwen3-30b-procwise` for the RAG agent.
+  path, temperature, and context window. This produces the descriptor that
+  should be imported into LM Studio as `qwen3-30b-procwise` for the RAG agent.
 - `rag-eval` – execute the upgraded retrieval pipeline across multiple Qdrant
   collections using a JSON/JSONL list of benchmark queries. The command writes
   aggregate metrics (doc diversity, latency, refusal rate) plus optional deltas
   versus a baseline report.
 
 See `services/RAG_README.md` for environment knobs. After each training run,
-render a Modelfile, `ollama create qwen3-30b-procwise -f <Modelfile>`, and run
-`rag-eval` with your preferred factory (e.g. `services.rag_service:build_rag`)
+render a Modelfile (for LM Studio import) and register it via the LM Studio UI
+or CLI, then run `rag-eval` with your preferred factory (e.g. `services.rag_service:build_rag`)
 to confirm the model understands, retrieves, and cites context correctly across
-all configured collections.
+all configured collections. For a complete walkthrough see `docs/FINETUNING.md`.

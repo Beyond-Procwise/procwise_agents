@@ -1,15 +1,17 @@
+import hashlib
+import json
 import logging
 import os
 import re
 import time
 import unicodedata
-import hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-import ollama
+
+from config.settings import settings
+from services.lmstudio_client import get_lmstudio_client
 from utils.gpu import configure_gpu, load_cross_encoder
 
 logger = logging.getLogger(__name__)
@@ -25,8 +27,10 @@ COMPRESS_PER_CHUNK_CHARS = int(os.getenv("COMPRESS_PER_CHUNK_CHARS", "1200"))
 RERANK_MODEL = os.getenv("RERANK_MODEL", os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"))
 RERANK_BATCH = int(os.getenv("RERANK_BATCH", "16"))
 RERANK_FP16 = bool(int(os.getenv("RERANK_FP16", "1")))
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-30b-procwise")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST")
+LMSTUDIO_MODEL = os.getenv(
+    "LMSTUDIO_MODEL",
+    getattr(settings, "lmstudio_chat_model", "microsoft/phi-4-reasoning-plus"),
+)
 RAG_EMBED_BATCH = int(os.getenv("RAG_EMBED_BATCH", "16"))
 
 # Hallucination refusal exact sentence
@@ -693,39 +697,49 @@ class RAGQwen30b:
         if not used_chunks:
             # Pass explicit token to generator context to force refusal
             ctx = "NO RELEVANT CONTEXT"
-        # Stage F: generation via Ollama
-        # Enforce exclusive model
-        model_name = OLLAMA_MODEL
+        # Stage F: generation via LM Studio
+        model_name = (
+            getattr(self.settings, "lmstudio_chat_model", None)
+            or LMSTUDIO_MODEL
+        )
         options = {
             "temperature": 0.2,
             "top_p": 0.9,
-            "num_ctx": 8192,
-            "repeat_penalty": 1.05,
+            "max_tokens": -1,
         }
         prompt_payload = {"query": query, "context": ctx}
         answer_text = ""
         sources = []
+        client = get_lmstudio_client()
+        system_prompt = (
+            "You are ProcWise's sourcing copilot. "
+            "Given the JSON payload containing a query and supporting context, "
+            "draft a concise answer grounded only in that context. "
+            "Always finish with a 'Sources:' line listing the unique document_ids "
+            "referenced in the answer separated by commas. "
+            "If the context indicates 'NO RELEVANT CONTEXT', respond with a "
+            "brief refusal followed by 'Sources:'."
+        )
         try:
-            # set host if provided
-            if OLLAMA_HOST:
-                ollama.host = OLLAMA_HOST
-            gen = ollama.generate(
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt_payload, ensure_ascii=False),
+                },
+            ]
+            gen = client.chat(
                 model=model_name,
-                prompt=prompt_payload,
+                messages=messages,
                 options=options,
-                stream=False,
             )
-            if isinstance(gen, dict):
-                answer_text = (
-                    gen.get("response")
-                    or gen.get("output")
-                    or gen.get("text")
-                    or ""
-                )
-            else:
-                answer_text = str(gen) if gen else ""
+            answer_text = (
+                gen.get("message", {}).get("content")
+                or gen.get("response")
+                or ""
+            )
         except Exception:
-            logger.exception("Ollama generation failed")
+            logger.exception("LM Studio generation failed")
             answer_text = ""
 
         # If generator returned empty or NO RELEVANT CONTEXT, enforce refusal sentence

@@ -821,7 +821,7 @@ def test_llm_structured_pass_populates_header(monkeypatch):
         captured_prompts.append(prompt)
         return llm_payload
 
-    monkeypatch.setattr(agent, "call_ollama", fake_call)
+    monkeypatch.setattr(agent, "call_lmstudio", fake_call)
 
     result = agent._extract_structured_data(
         "Invoice INV1 from ACME for 1 Widget", b"", "Invoice"
@@ -847,7 +847,7 @@ def test_classify_doc_type_keyword_scoring(monkeypatch):
     def fail_call(**kwargs):
         raise AssertionError("LLM should not be used for obvious keywords")
 
-    monkeypatch.setattr(agent, "call_ollama", fail_call)
+    monkeypatch.setattr(agent, "call_lmstudio", fail_call)
 
     assert (
         agent._classify_doc_type("Invoice number INV-1 for services rendered")
@@ -877,7 +877,7 @@ def test_classify_doc_type_llm_fallback(monkeypatch):
     agent = DataExtractionAgent(nick)
 
     monkeypatch.setattr(
-        agent, "call_ollama", lambda **kwargs: {"response": "Contract"}
+        agent, "call_lmstudio", lambda **kwargs: {"response": "Contract"}
     )
 
     # Text deliberately avoids any predefined keywords so the LLM is used.
@@ -896,7 +896,7 @@ def test_classification_prompt_includes_context(monkeypatch):
         captured["prompt"] = prompt
         return {"response": "Invoice"}
 
-    monkeypatch.setattr(agent, "call_ollama", fake_call)
+    monkeypatch.setattr(agent, "call_lmstudio", fake_call)
 
     agent._classify_doc_type("irrelevant text")
     assert "buyer sends a purchase order" in captured["prompt"].lower()
@@ -918,7 +918,7 @@ def test_llm_structured_prompt_includes_context(monkeypatch):
             )
         }
 
-    monkeypatch.setattr(agent, "call_ollama", fake_call)
+    monkeypatch.setattr(agent, "call_lmstudio", fake_call)
 
     agent._llm_structured_extraction("text", "Invoice")
     prompt_lower = captured["prompt"].lower()
@@ -1075,7 +1075,7 @@ def test_recover_missing_critical_fields_uses_document_context(monkeypatch):
         }
         return {"response": json.dumps(payload)}
 
-    monkeypatch.setattr(agent, "call_ollama", fake_call)
+    monkeypatch.setattr(agent, "call_lmstudio", fake_call)
 
     validation_report = {"warnings": []}
     recovered = agent._recover_missing_critical_fields(

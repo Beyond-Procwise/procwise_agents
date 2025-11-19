@@ -36,16 +36,6 @@ services:
     volumes:
       - qdrant-storage:/qdrant/storage
 
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h
-    volumes:
-      - ollama-models:/root/.ollama
-
   app:
     build:
       context: .
@@ -59,14 +49,14 @@ services:
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ""
       QDRANT_COLLECTION_PREFIX: demo_
-      OLLAMA_HOST: http://ollama:11434
+      LMSTUDIO_BASE_URL: http://host.docker.internal:1234
+      LMSTUDIO_CHAT_MODEL: microsoft/phi-4-reasoning-plus
+      LMSTUDIO_EMBED_MODEL: nomic-embed-text
       LLM_DEFAULT_MODEL: phi4:latest
-      OLLAMA_EMBED_MODEL: nomic-embed-text
     depends_on:
       - postgres
       - neo4j
       - qdrant
-      - ollama
     volumes:
       - .:/app
     working_dir: /app
@@ -77,4 +67,3 @@ volumes:
   neo4j-data:
   neo4j-logs:
   qdrant-storage:
-  ollama-models:

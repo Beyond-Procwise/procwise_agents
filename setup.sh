@@ -18,14 +18,15 @@ export NEO4J_PASSWORD="password"
 export QDRANT_URL="http://localhost:6333"
 export QDRANT_API_KEY=""
 export QDRANT_COLLECTION_PREFIX="demo_"
-export OLLAMA_HOST="http://localhost:11434"
+export LMSTUDIO_BASE_URL="http://127.0.0.1:1234"
+export LMSTUDIO_CHAT_MODEL="microsoft/phi-4-reasoning-plus"
+export LMSTUDIO_EMBED_MODEL="nomic-embed-text"
 export LLM_DEFAULT_MODEL="phi4:latest"
-export OLLAMA_EMBED_MODEL="nomic-embed-text"
 
 COMPOSE_FILE="docker-compose.yml"
 
 echo "Launching infrastructure..."
-docker compose -f "$COMPOSE_FILE" up -d postgres neo4j qdrant ollama
+docker compose -f "$COMPOSE_FILE" up -d postgres neo4j qdrant
 
 echo "Waiting for Postgres to be available..."
 until docker compose -f "$COMPOSE_FILE" exec -T postgres pg_isready -U procwise -d procwise >/dev/null 2>&1; do
@@ -153,10 +154,5 @@ SQL
 echo "Checking Neo4j connectivity..."
 docker compose -f "$COMPOSE_FILE" exec -T neo4j cypher-shell -u neo4j -p password "RETURN 1;" >/dev/null
 
-echo "Pulling Ollama model phi4:latest..."
-docker compose -f "$COMPOSE_FILE" exec -T ollama ollama pull phi4:latest
-
-echo "Pulling Ollama embedding model nomic-embed-text..."
-docker compose -f "$COMPOSE_FILE" exec -T ollama ollama pull nomic-embed-text
-
-echo "All services are ready. Run 'docker compose up app' to execute the demo." 
+echo "Ensure LM Studio is running locally (default http://127.0.0.1:1234) with the required models loaded."
+echo "All services are ready. Run 'docker compose up app' to execute the demo."

@@ -811,7 +811,7 @@ class DataExtractionAgent(BaseAgent):
             candidates = preferred_models
 
         try:
-            available = set(self._get_available_ollama_models())
+            available = set(self._get_available_lmstudio_models())
         except Exception:
             logger.debug(
                 "Unable to list Ollama models; defaulting to first configured preference",
@@ -4664,7 +4664,7 @@ class DataExtractionAgent(BaseAgent):
         payload: Dict[str, Any] = {}
         for _ in range(3):
             try:
-                response = self.call_ollama(
+                response = self.call_lmstudio(
                     prompt=(
                         prompt
                         + "\n\nInstructions:\n"
@@ -5100,7 +5100,7 @@ class DataExtractionAgent(BaseAgent):
         prompt = "\n".join(prompt_parts)
 
         try:
-            response = self.call_ollama(
+            response = self.call_lmstudio(
                 prompt=prompt,
                 model=self.extraction_model,
                 format="json",
@@ -5234,7 +5234,7 @@ class DataExtractionAgent(BaseAgent):
         prompt = "\n\n".join(part for part in prompt_parts if part)
 
         try:
-            response = self.call_ollama(
+            response = self.call_lmstudio(
                 prompt=prompt,
                 model=self.extraction_model,
                 format="json",
@@ -6473,7 +6473,7 @@ class DataExtractionAgent(BaseAgent):
             + snippet
         )
         try:
-            resp = self.call_ollama(prompt=prompt, model=self.extraction_model)
+            resp = self.call_lmstudio(prompt=prompt, model=self.extraction_model)
             label = resp.get("response", "").strip().lower()
             for canonical in DOC_TYPE_KEYWORDS:
                 canonical_label = canonical.replace("_", " ").lower()

@@ -51,21 +51,6 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:0.1.47
-    restart: unless-stopped
-    environment:
-      OLLAMA_KEEP_ALIVE: "24h"
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-models:/root/.ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
   pgadmin:
     image: dpage/pgadmin4:8.7
     restart: unless-stopped
@@ -83,4 +68,3 @@ volumes:
   neo4j-data:
   neo4j-logs:
   qdrant-storage:
-  ollama-models:

@@ -8,6 +8,24 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from agents import base_agent
 
 
+class StubLMStudioClient:
+    def __init__(self, models=None):
+        self._models = models or []
+        self.chat_calls = []
+        self.generate_calls = []
+
+    def list_models(self):
+        return list(self._models)
+
+    def chat(self, **kwargs):
+        self.chat_calls.append(kwargs)
+        return {"message": {"content": "ok"}, "response": "ok"}
+
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        return {"response": "ok", "model": kwargs.get("model")}
+
+
 class DummyProcessRoutingService:
     def __init__(self):
         self._counter = 0
@@ -31,14 +49,13 @@ class DummyAgentNick:
         self.settings = SimpleNamespace(
             script_user="tester",
             extraction_model="gpt-oss",
-            ollama_quantized_model=None,
         )
         self.prompt_engine = SimpleNamespace()
         self.learning_repository = None
         self.process_routing_service = DummyProcessRoutingService()
         self._connection_factory = connection_factory
 
-    def ollama_options(self):
+    def lmstudio_options(self):
         return {}
 
     def get_db_connection(self):
@@ -51,41 +68,31 @@ def make_base_agent():
     return base_agent.BaseAgent(DummyAgentNick())
 
 
-def test_call_ollama_prefers_fallback_when_list_empty(monkeypatch):
-    monkeypatch.setattr(base_agent.ollama, "list", lambda: {"models": []})
-
-    captured = {}
-
-    assert base_agent._OLLAMA_FALLBACK_MODELS == (
-        "phi4:latest",
-        "phi4",
-    )
-
-    def fake_generate(model, **kwargs):
-        captured["model"] = model
-        return {"response": "ok", "model": model, "kwargs": kwargs}
-
-    monkeypatch.setattr(base_agent.ollama, "generate", fake_generate)
+def test_call_lmstudio_prefers_fallback_when_list_empty(monkeypatch):
+    stub_client = StubLMStudioClient(models=[])
+    monkeypatch.setattr(base_agent, "get_lmstudio_client", lambda: stub_client)
 
     agent = make_base_agent()
+    result = agent.call_lmstudio(prompt="hi", model="totally-missing")
 
-    result = agent.call_ollama(prompt="hi", model="totally-missing")
-
-    assert result["model"] == base_agent._OLLAMA_FALLBACK_MODELS[0]
-    assert captured["model"] == base_agent._OLLAMA_FALLBACK_MODELS[0]
-    assert getattr(agent.agent_nick, "_available_ollama_models") == list(
-        base_agent._OLLAMA_FALLBACK_MODELS
+    assert (
+        stub_client.generate_calls[0]["model"]
+        == base_agent._LMSTUDIO_FALLBACK_MODELS[0]
+    )
+    assert result["model"] == base_agent._LMSTUDIO_FALLBACK_MODELS[0]
+    assert getattr(agent.agent_nick, "_available_lmstudio_models") == list(
+        base_agent._LMSTUDIO_FALLBACK_MODELS
     )
 
 
 def test_get_available_models_returns_fallback_when_empty(monkeypatch):
+    stub_client = StubLMStudioClient(models=[])
+    monkeypatch.setattr(base_agent, "get_lmstudio_client", lambda: stub_client)
+
     agent = make_base_agent()
+    models = agent._get_available_lmstudio_models(force_refresh=True)
 
-    monkeypatch.setattr(base_agent.ollama, "list", lambda: {"models": []})
-
-    models = agent._get_available_ollama_models(force_refresh=True)
-
-    assert models == list(base_agent._OLLAMA_FALLBACK_MODELS)
+    assert models == list(base_agent._LMSTUDIO_FALLBACK_MODELS)
 
 
 def test_prepare_logged_output_strips_knowledge_without_touching_original():

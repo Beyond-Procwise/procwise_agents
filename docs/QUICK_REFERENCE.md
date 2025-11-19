@@ -20,9 +20,9 @@ docker compose logs -f app                         # Stream app logs
 | `QDRANT_URL` | Base URL for Qdrant vector store |
 | `QDRANT_API_KEY` | Optional API key for managed Qdrant deployments |
 | `QDRANT_COLLECTION_PREFIX` | Prefix applied to the procurement embeddings collection |
-| `OLLAMA_HOST` | HTTP endpoint for Ollama |
+| `LMSTUDIO_BASE_URL` | HTTP endpoint for the LM Studio server |
 | `LLM_DEFAULT_MODEL` | Default chat model (phi4:latest recommended) |
-| `OLLAMA_EMBED_MODEL` | Embedding model for vector creation |
+| `LMSTUDIO_EMBED_MODEL` | Embedding model for vector creation |
 
 ## Sample Graph Queries
 
@@ -54,9 +54,9 @@ print(similar)
 
 ## Troubleshooting
 
-* **Vectors missing** – Verify `OLLAMA_EMBED_MODEL` is available (`ollama list`).
+* **Vectors missing** – Verify `LMSTUDIO_EMBED_MODEL` is available in LM Studio.
 * **Neo4j auth errors** – Confirm `NEO4J_AUTH` in docker-compose matches exported
   credentials.
-* **Slow answers** – Ensure Ollama has pre-pulled models and adequate CPU/GPU.
+* **Slow answers** – Ensure LM Studio has preloaded models and adequate CPU/GPU.
 * **Email threading mismatches** – Use `services.email_thread.EmailThread`
   alongside `make_action_id` to inspect tokens and workflow identifiers.

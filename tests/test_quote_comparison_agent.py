@@ -11,8 +11,6 @@ from agents.base_agent import AgentContext, AgentStatus
 from agents.quote_comparison_agent import QuoteComparisonAgent
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
@@ -25,7 +23,7 @@ class DummyNick:
             log_action=lambda **_: None,
             validate_workflow_id=lambda *args, **kwargs: True,
         )
-        self.ollama_options = lambda: {}
+        self.lmstudio_options = lambda: {}
         self.pandas_connection = None
 
     def get_db_connection(self):  # pragma: no cover - defensive

@@ -244,8 +244,8 @@ def _chat(model: str, system: str, user: str, **kwargs) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    response = agent.call_ollama(model=model, messages=messages, **kwargs)
-    return agent._extract_ollama_message(response)
+    response = agent.call_lmstudio(model=model, messages=messages, **kwargs)
+    return agent._extract_lmstudio_message(response)
 
 
 def _determine_negotiation_objective(round_no: int, gap_percentage: float) -> str:
@@ -1364,7 +1364,7 @@ class EmailDraftingAgent(BaseAgent):
                 process_routing_service=process_routing,
                 prompt_engine=None,
                 learning_repository=None,
-                ollama_options=lambda: {},
+                lmstudio_options=lambda: {},
                 get_db_connection=lambda: _null_db_connection(),
                 reserve_s3_connection=lambda: _null_s3_connection(),
             )
@@ -1421,8 +1421,8 @@ class EmailDraftingAgent(BaseAgent):
             if not hasattr(routing, "log_action"):
                 routing.log_action = lambda **kwargs: None
 
-        if not hasattr(agent_nick, "ollama_options"):
-            agent_nick.ollama_options = lambda: {}
+        if not hasattr(agent_nick, "lmstudio_options"):
+            agent_nick.lmstudio_options = lambda: {}
         if not hasattr(agent_nick, "get_db_connection"):
             agent_nick.get_db_connection = lambda: _null_db_connection()
         if not hasattr(agent_nick, "reserve_s3_connection"):
@@ -2208,7 +2208,7 @@ class EmailDraftingAgent(BaseAgent):
         )
 
         try:
-            response = self.call_ollama(
+            response = self.call_lmstudio(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": NEGOTIATION_PLAYBOOK_SYSTEM},
@@ -2220,7 +2220,7 @@ class EmailDraftingAgent(BaseAgent):
                     "num_ctx": 8192,
                 },
             )
-            email_text = self._extract_ollama_message(response)
+            email_text = self._extract_lmstudio_message(response)
         except Exception:
             logger.exception("Failed to generate negotiation email via LLM")
             email_text = ""
@@ -2715,7 +2715,7 @@ class EmailDraftingAgent(BaseAgent):
 
 
     @staticmethod
-    def _extract_ollama_message(response: Dict[str, Any]) -> str:
+    def _extract_lmstudio_message(response: Dict[str, Any]) -> str:
         if not isinstance(response, dict):
             return ""
         message = response.get("message")

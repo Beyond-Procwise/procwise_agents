@@ -67,7 +67,7 @@ def service():
         qdrant_client=client,
         embedding_model=embedder,
         settings=settings,
-        ollama_options=lambda: {"temperature": 0.1},
+        lmstudio_options=lambda: {"temperature": 0.1},
     )
 
     svc = DocumentEmbeddingService(

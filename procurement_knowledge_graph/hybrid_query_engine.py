@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-import requests
 from loguru import logger
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
@@ -13,56 +12,60 @@ from retrying import retry
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from .config import AppConfig, Neo4jConfig, OllamaConfig, PostgresConfig, QdrantConfig
+from services.lmstudio_client import LMStudioClient, LMStudioClientError
+from .config import AppConfig, LMStudioConfig, Neo4jConfig, PostgresConfig, QdrantConfig
 
 SCHEMA = "proc"
 
 
-class OllamaJsonClient:
-    def __init__(self, config: OllamaConfig) -> None:
+class LMStudioJsonClient:
+    def __init__(self, config: LMStudioConfig) -> None:
         self._config = config
+        self._client = LMStudioClient(
+            base_url=config.base_url,
+            timeout=config.timeout,
+        )
 
     @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=8000)
     def generate_json(self, system: str, prompt: str) -> Dict[str, Any]:
-        payload = {
-            "model": self._config.generate_model,
-            "system": system,
-            "prompt": prompt,
-            "format": "json",
-            "stream": False,
-        }
-        url = f"{self._config.base_url}/api/generate"
-        response = requests.post(url, json=payload, timeout=self._config.timeout)
-        response.raise_for_status()
-        data = response.json()
-        content = data.get("response", "{}").strip()
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        content = "{}"
         try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning("Received invalid JSON from Ollama, attempting repair")
-            repair_payload = {
-                "model": self._config.generate_model,
-                "system": "You are a JSON repair assistant. Return valid JSON only.",
-                "prompt": f"Fix the JSON string: ```{content}```",
-                "format": "json",
-                "stream": False,
-            }
-            repair_response = requests.post(url, json=repair_payload, timeout=self._config.timeout)
-            repair_response.raise_for_status()
-            fixed = repair_response.json().get("response", "{}").strip()
-            return json.loads(fixed)
+            response = self._client.chat(
+                model=self._config.chat_model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                options={"temperature": 0.0},
+            )
+            content = response.get("message", {}).get("content", "{}")
+            return json.loads(content or "{}")
+        except (LMStudioClientError, json.JSONDecodeError):
+            logger.warning("Received invalid JSON from LM Studio, attempting repair")
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a JSON repair assistant. Return valid JSON only.",
+                },
+                {"role": "user", "content": f"Fix the JSON string: ```{content}```"},
+            ]
+            repaired = self._client.chat(
+                model=self._config.chat_model,
+                messages=repair_messages,
+                response_format={"type": "json_object"},
+            )
+            fixed = repaired.get("message", {}).get("content", "{}")
+            return json.loads(fixed or "{}")
 
     @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=8000)
     def embed(self, text: str) -> List[float]:
-        payload = {
-            "model": self._config.embedding_model,
-            "input": [text],
-        }
-        url = f"{self._config.base_url}/api/embeddings"
-        response = requests.post(url, json=payload, timeout=self._config.timeout)
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
+        vectors = self._client.embed(
+            model=self._config.embedding_model,
+            inputs=[text],
+        )
+        return vectors[0] if vectors else []
 
 
 @dataclass
@@ -95,12 +98,12 @@ class HybridProcurementQueryEngine:
         postgres_config: PostgresConfig,
         neo4j_config: Neo4jConfig,
         qdrant_config: QdrantConfig,
-        ollama_config: OllamaConfig,
+        lmstudio_config: LMStudioConfig,
     ) -> None:
         self._postgres_config = postgres_config
         self._neo4j_config = neo4j_config
         self._qdrant_config = qdrant_config
-        self._ollama_config = ollama_config
+        self._lmstudio_config = lmstudio_config
 
         self._engine: Engine = create_engine(self._postgres_config.dsn, pool_size=10, max_overflow=5)
         self._neo4j_driver = GraphDatabase.driver(
@@ -108,11 +111,11 @@ class HybridProcurementQueryEngine:
             auth=(self._neo4j_config.username, self._neo4j_config.password),
         )
         self._qdrant = QdrantClient(host=self._qdrant_config.host, port=self._qdrant_config.port, api_key=self._qdrant_config.api_key)
-        self._ollama = OllamaJsonClient(self._ollama_config)
+        self._lmstudio = LMStudioJsonClient(self._lmstudio_config)
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "HybridProcurementQueryEngine":
-        return cls(config.postgres, config.neo4j, config.qdrant, config.ollama)
+        return cls(config.postgres, config.neo4j, config.qdrant, config.lmstudio)
 
     def close(self) -> None:
         self._engine.dispose()
@@ -122,10 +125,10 @@ class HybridProcurementQueryEngine:
     # LLM utilities
     # ------------------------------------------------------------------
     def generate_llm_json(self, system: str, prompt: str) -> Dict[str, Any]:
-        return self._ollama.generate_json(system, prompt)
+        return self._lmstudio.generate_json(system, prompt)
 
     def embed_text(self, text: str) -> List[float]:
-        return self._ollama.embed(text)
+        return self._lmstudio.embed(text)
 
     def query_dataframe(self, query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         return self._fetch_dataframe(query, params)
@@ -236,7 +239,7 @@ class HybridProcurementQueryEngine:
     # ------------------------------------------------------------------
     def find_similar_negotiations(self, negotiation_context: str, top_k: int = 5) -> List[Dict[str, Any]]:
         logger.info("Searching for similar negotiations: {context}", context=negotiation_context)
-        embedding = self._ollama.embed(negotiation_context)
+        embedding = self._lmstudio.embed(negotiation_context)
         search_result = self._qdrant.search(
             collection_name="negotiations",
             query_vector=embedding,
@@ -310,7 +313,7 @@ class HybridProcurementQueryEngine:
         Return keys: avg_rounds, price_patterns, response_patterns, recommendation.
         """
         llm_input = json.dumps(history)
-        analysis = self._ollama.generate_json(
+        analysis = self._lmstudio.generate_json(
             system="You analyse supplier negotiation histories and respond with concise JSON reports.",
             prompt=f"Records: {llm_input}\n{prompt}",
         )
@@ -324,7 +327,7 @@ class HybridProcurementQueryEngine:
     # Natural language interface (Method 12)
     # ------------------------------------------------------------------
     def natural_language_query(self, question: str) -> Dict[str, Any]:
-        classifier = self._ollama.generate_json(
+        classifier = self._lmstudio.generate_json(
             system="Classify procurement intelligence queries.",
             prompt=(
                 "Return JSON with key query_type in {supplier_search, negotiation_analysis, spend_analysis, risk_insight}.\n"
@@ -342,7 +345,7 @@ class HybridProcurementQueryEngine:
         else:
             data = self._risk_insight()
 
-        summary = self._ollama.generate_json(
+        summary = self._lmstudio.generate_json(
             system="You summarise procurement analytics in plain English.",
             prompt=f"Question: {question}\nData: {json.dumps(data)}\nReturn JSON with key answer",
         )
@@ -505,7 +508,7 @@ class HybridProcurementQueryEngine:
         }
 
     def _supplier_search(self, question: str) -> List[Dict[str, Any]]:
-        vector = self._ollama.embed(question)
+        vector = self._lmstudio.embed(question)
         results = self._qdrant.search("suppliers", query_vector=vector, limit=5)
         return [dict(hit.payload or {}, score=hit.score) for hit in results]
 

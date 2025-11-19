@@ -22,8 +22,6 @@ from services.model_selector import RAGPipeline
 
 # Ensure GPU-related environment variables align with the rest of the API.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("OLLAMA_USE_GPU", "1")
-os.environ.setdefault("OLLAMA_NUM_PARALLEL", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 
@@ -246,9 +244,9 @@ def extract_document_from_s3(
 
     connection_factory = lambda: agent_nick.get_db_connection()
     chat_options = {}
-    if hasattr(agent_nick, "ollama_options") and callable(agent_nick.ollama_options):
+    if hasattr(agent_nick, "lmstudio_options") and callable(agent_nick.lmstudio_options):
         try:
-            chat_options = agent_nick.ollama_options()
+            chat_options = agent_nick.lmstudio_options()
         except Exception:  # pragma: no cover - fall back to defaults
             logger.debug("Failed to obtain Ollama chat options", exc_info=True)
             chat_options = {}

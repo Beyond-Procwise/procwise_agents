@@ -405,8 +405,8 @@ class MockDatabaseConnection:
 class WorkflowContextManager:
     """Maintains small pieces of shared workflow context for prompts."""
 
-    def __init__(self, ollama_model: str = "qwen3:30b") -> None:
-        self.model = ollama_model
+    def __init__(self, llm_model: str = "qwen3:30b") -> None:
+        self.model = llm_model
         self.workflow_context = {
             "phases": [
                 "ranking",
@@ -855,4 +855,3 @@ __all__ = [
     "validate_implementation",
     "build_status_request_id",
 ]
-

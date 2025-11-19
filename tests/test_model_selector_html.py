@@ -44,30 +44,21 @@ def test_normalise_answer_html_strips_basic_tags():
     assert not re.search(r"<strong>.*</strong>", result)
 
 
-def test_generate_response_uses_stream_when_enabled(monkeypatch):
+def test_generate_response_uses_lmstudio_client(monkeypatch):
     pipeline = _make_pipeline()
-    pipeline.agent_nick = SimpleNamespace(ollama_options=lambda: {})
+    pipeline.agent_nick = SimpleNamespace(lmstudio_options=lambda: {})
 
     payload = "{\"answer\": \"Hello\", \"follow_ups\": [\"Next\"]}"
     calls = []
 
-    def fake_chat(**kwargs):
-        calls.append(kwargs)
-        if kwargs.get("stream"):
-            def _iterator():
-                yield {"message": {"content": payload}}
+    class StubClient:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            return {"message": {"content": payload}}
 
-            return _iterator()
-        return {"message": {"content": payload}}
+    monkeypatch.setattr("services.model_selector.get_lmstudio_client", lambda: StubClient())
 
-    original = settings.stream_llm_responses
-    settings.stream_llm_responses = True
-    try:
-        monkeypatch.setattr("services.model_selector.ollama.chat", fake_chat)
-        result = pipeline._generate_response("prompt", "model")
-    finally:
-        settings.stream_llm_responses = original
+    result = pipeline._generate_response("prompt", "model")
 
     assert result == {"answer": "Hello", "follow_ups": ["Next"]}
     assert len(calls) == 1
-    assert calls[0]["stream"] is True

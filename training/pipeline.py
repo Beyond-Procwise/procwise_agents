@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, 
 import statistics
 
 import psycopg2
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 try:  # pragma: no cover - datasets is optional until training runs
     from datasets import DatasetDict, load_dataset
 except ModuleNotFoundError:  # pragma: no cover - import guard for --help invocations
@@ -74,6 +76,31 @@ class ExportResult:
     output_path: Path
     count: int
     record_ids: List[int]
+
+
+@dataclass
+class QdrantContextConfig:
+    """Configuration for fetching supporting passages from Qdrant."""
+
+    url: str
+    collection: str
+    api_key: Optional[str] = None
+    match_payload_key: str = "doc_id"
+    context_payload_key: str = "content"
+    title_payload_key: Optional[str] = None
+    limit: int = 5
+
+
+@dataclass
+class DomainDatasetConfig:
+    """Configuration for building a domain-specialised dataset."""
+
+    export: ExportConfig
+    qdrant: Optional[QdrantContextConfig] = None
+    join_column: Optional[str] = None
+    context_header: str = "Domain context"
+    max_context_chars: int = 2400
+    include_context_metadata: bool = False
 
 
 @dataclass
@@ -281,6 +308,137 @@ def export_training_data(config: ExportConfig) -> ExportResult:
                             LOGGER.debug("Unable to coerce %s to int for exported id", identifier)
         LOGGER.info("Exported %d records", exported)
     return ExportResult(config.output_path, exported, record_ids)
+
+
+def _get_nested_value(payload: Mapping[str, Any], path: str) -> Any:
+    value: Any = payload
+    for part in path.split("."):
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(part)
+        if value is None:
+            return None
+    return value
+
+
+def _fetch_qdrant_contexts(
+    client: QdrantClient,
+    cfg: QdrantContextConfig,
+    match_value: Any,
+) -> List[Dict[str, Any]]:
+    if match_value in (None, "", []):
+        return []
+    condition = qmodels.FieldCondition(
+        key=cfg.match_payload_key,
+        match=qmodels.MatchValue(value=match_value),
+    )
+    records, _ = client.scroll(
+        collection_name=cfg.collection,
+        scroll_filter=qmodels.Filter(must=[condition]),
+        with_payload=True,
+        with_vectors=False,
+        limit=cfg.limit,
+    )
+    contexts: List[Dict[str, Any]] = []
+    for record in records:
+        payload = record.payload or {}
+        text = _get_nested_value(payload, cfg.context_payload_key)
+        if not text:
+            continue
+        snippet = {
+            "text": str(text).strip(),
+            "payload": payload,
+        }
+        if cfg.title_payload_key:
+            snippet["title"] = payload.get(cfg.title_payload_key)
+        contexts.append(snippet)
+    return contexts
+
+
+def _append_context_to_input(
+    base_input: str,
+    contexts: List[Dict[str, Any]],
+    cfg: DomainDatasetConfig,
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    if not contexts:
+        return base_input, None
+    lines: List[str] = []
+    consumed = 0
+    for chunk in contexts:
+        text = chunk.get("text", "")
+        if not text:
+            continue
+        line = text
+        if chunk.get("title"):
+            line = f"{chunk['title']}: {text}"
+        remaining = cfg.max_context_chars - consumed if cfg.max_context_chars else None
+        if remaining is not None and remaining <= 0:
+            break
+        if remaining is not None and len(line) > remaining:
+            line = line[:remaining]
+        lines.append(line.strip())
+        consumed += len(line)
+        if cfg.max_context_chars and consumed >= cfg.max_context_chars:
+            break
+    if not lines:
+        return base_input, None
+    context_text = f"{cfg.context_header}\n- " + "\n- ".join(lines)
+    combined = context_text if not base_input else f"{base_input}\n\n{context_text}"
+    metadata = contexts if cfg.include_context_metadata else None
+    return combined, metadata
+
+
+def build_domain_dataset(config: DomainDatasetConfig) -> ExportResult:
+    """Export training data augmented with Qdrant domain context."""
+
+    qdrant_client: Optional[QdrantClient] = None
+    if config.qdrant:
+        qdrant_client = QdrantClient(
+            url=config.qdrant.url,
+            api_key=config.qdrant.api_key,
+        )
+
+    export_cfg = config.export
+    LOGGER.info("Building domain dataset to %s", export_cfg.output_path)
+    export_cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    exported = 0
+    with psycopg2.connect(export_cfg.dsn) as conn, conn.cursor(name="procwise_domain_dataset") as cursor:
+        cursor.itersize = export_cfg.chunk_size
+        cursor.execute(export_cfg.query)
+        field_names = [desc.name for desc in cursor.description]
+        required = {"instruction", "output"}
+        if not required.issubset(field_names):
+            raise ValueError(
+                "Query must include %s columns. Found: %s"
+                % (", ".join(sorted(required)), ", ".join(field_names))
+            )
+        join_column = config.join_column
+        if join_column and join_column not in field_names:
+            raise ValueError(
+                f"join_column '{join_column}' not returned by query. Columns: {', '.join(field_names)}"
+            )
+        optional_input = "input" in field_names
+        with export_cfg.output_path.open("w", encoding="utf-8") as handle:
+            for row in cursor:
+                row_data = dict(zip(field_names, row))
+                record_input = row_data.get("input") or "" if optional_input else ""
+                context_metadata: Optional[List[Dict[str, Any]]] = None
+                if qdrant_client and config.qdrant and join_column:
+                    join_value = row_data.get(join_column)
+                    snippets = _fetch_qdrant_contexts(qdrant_client, config.qdrant, join_value)
+                    record_input, context_metadata = _append_context_to_input(record_input, snippets, config)
+                entry: Dict[str, Any] = {
+                    "instruction": row_data.get("instruction") or "",
+                    "output": row_data.get("output") or "",
+                }
+                if record_input:
+                    entry["input"] = record_input
+                if context_metadata is not None:
+                    entry["context_sources"] = context_metadata
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                exported += 1
+    LOGGER.info("Domain dataset contains %d samples", exported)
+    return ExportResult(export_cfg.output_path, exported, [])
 
 
 def _format_messages(
@@ -812,6 +970,59 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional identifier column to track which records were exported",
     )
 
+    domain_parser = subparsers.add_parser(
+        "build-domain-dataset",
+        help="Export Postgres instruction data enriched with Qdrant context",
+    )
+    domain_parser.add_argument("--dsn", required=True, help="Postgres DSN for sourcing instruction data")
+    domain_parser.add_argument("--query", required=True, help="SQL query returning instruction/input/output columns")
+    domain_parser.add_argument("--output", required=True, type=Path, help="Destination JSONL file")
+    domain_parser.add_argument("--chunk-size", type=int, default=1000, help="Streaming chunk size for Postgres cursor")
+    domain_parser.add_argument(
+        "--join-column",
+        default="doc_id",
+        help="Column from the SQL result used to look up context in Qdrant payloads",
+    )
+    domain_parser.add_argument(
+        "--context-header",
+        default="Domain context",
+        help="Header inserted before appended Qdrant passages",
+    )
+    domain_parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=2400,
+        help="Maximum cumulative characters of appended Qdrant context",
+    )
+    domain_parser.add_argument(
+        "--include-context-metadata",
+        action="store_true",
+        help="Include raw context payload metadata alongside each record",
+    )
+    domain_parser.add_argument("--qdrant-url", required=True, help="Qdrant HTTP URL, e.g. http://localhost:6333")
+    domain_parser.add_argument("--qdrant-api-key", help="Optional Qdrant API key")
+    domain_parser.add_argument("--qdrant-collection", required=True, help="Qdrant collection to source passages from")
+    domain_parser.add_argument(
+        "--qdrant-match-field",
+        default="doc_id",
+        help="Payload field used to match the join column value",
+    )
+    domain_parser.add_argument(
+        "--qdrant-context-field",
+        default="content",
+        help="Payload field containing the passage text to inject",
+    )
+    domain_parser.add_argument(
+        "--qdrant-title-field",
+        help="Optional payload field for a human readable title prefixed to each passage",
+    )
+    domain_parser.add_argument(
+        "--qdrant-limit",
+        type=int,
+        default=5,
+        help="Maximum number of passages to retrieve per record",
+    )
+
     train_parser = subparsers.add_parser("train", help="Run QLoRA fine-tuning with TRL")
     _add_common_train_arguments(train_parser)
 
@@ -875,6 +1086,32 @@ def main(argv: Optional[Sequence[str]] = None) -> Path | ExportResult:
             id_column=args.id_column,
         )
         return export_training_data(cfg)
+
+    if args.command == "build-domain-dataset":
+        export_cfg = ExportConfig(
+            dsn=args.dsn,
+            query=args.query,
+            output_path=args.output,
+            chunk_size=args.chunk_size,
+        )
+        qdrant_cfg = QdrantContextConfig(
+            url=args.qdrant_url,
+            api_key=args.qdrant_api_key,
+            collection=args.qdrant_collection,
+            match_payload_key=args.qdrant_match_field,
+            context_payload_key=args.qdrant_context_field,
+            title_payload_key=args.qdrant_title_field,
+            limit=args.qdrant_limit,
+        )
+        cfg = DomainDatasetConfig(
+            export=export_cfg,
+            qdrant=qdrant_cfg,
+            join_column=args.join_column,
+            context_header=args.context_header,
+            max_context_chars=args.max_context_chars,
+            include_context_metadata=args.include_context_metadata,
+        )
+        return build_domain_dataset(cfg)
 
     if args.command == "train":
         cfg = TrainConfig(

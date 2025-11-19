@@ -47,8 +47,6 @@ log "Waiting for Ollama"
 wait_for_service "Ollama" "http://localhost:11434/api/tags" 30
 
 log "Pulling Ollama models"
-docker exec $(docker compose -f "$PROJECT_DIR/docker-compose.yml" ps -q ollama) ollama pull llama3.2 || true
-docker exec $(docker compose -f "$PROJECT_DIR/docker-compose.yml" ps -q ollama) ollama pull all-minilm || true
 
 log "Creating Python virtual environment"
 python3 -m venv "$VENV_DIR"
