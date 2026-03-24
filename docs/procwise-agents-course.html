@@ -1,0 +1,1755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProcWise Agents — How It Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ========== DESIGN SYSTEM ========== */
+:root {
+  --color-bg: #FAF7F2;
+  --color-bg-warm: #F5F0E8;
+  --color-bg-code: #1E1E2E;
+  --color-text: #2C2A28;
+  --color-text-secondary: #6B6560;
+  --color-text-muted: #9E9790;
+  --color-border: #E5DFD6;
+  --color-border-light: #EEEBE5;
+  --color-surface: #FFFFFF;
+  --color-surface-warm: #FDF9F3;
+  --color-accent: #2A7B9B;
+  --color-accent-hover: #1F6782;
+  --color-accent-light: #E4F2F7;
+  --color-accent-muted: #5A9DB5;
+  --color-success: #2D8B55;
+  --color-success-light: #E8F5EE;
+  --color-error: #C93B3B;
+  --color-error-light: #FDE8E8;
+  --color-info: #2A7B9B;
+  --color-info-light: #E4F2F7;
+  --color-actor-1: #D94F30;
+  --color-actor-2: #2A7B9B;
+  --color-actor-3: #7B6DAA;
+  --color-actor-4: #D4A843;
+  --color-actor-5: #2D8B55;
+  --font-display: 'Bricolage Grotesque', Georgia, serif;
+  --font-body: 'DM Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+  --text-4xl: 2.25rem;
+  --text-5xl: 3rem;
+  --text-6xl: 3.75rem;
+  --leading-tight: 1.15;
+  --leading-snug: 1.3;
+  --leading-normal: 1.6;
+  --leading-loose: 1.8;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+  --content-width: 800px;
+  --content-width-wide: 1000px;
+  --nav-height: 50px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px rgba(44,42,40,0.05);
+  --shadow-md: 0 4px 12px rgba(44,42,40,0.08);
+  --shadow-lg: 0 8px 24px rgba(44,42,40,0.1);
+  --shadow-xl: 0 16px 48px rgba(44,42,40,0.12);
+  --ease-out: cubic-bezier(0.16,1,0.3,1);
+  --ease-in-out: cubic-bezier(0.65,0,0.35,1);
+  --duration-fast: 150ms;
+  --duration-normal: 300ms;
+  --duration-slow: 500ms;
+  --stagger-delay: 120ms;
+}
+
+/* ========== RESET & BASE ========== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-snap-type: y proximity; scroll-behavior: smooth; }
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background: var(--color-bg);
+  background-image: radial-gradient(ellipse at 20% 50%, rgba(42,123,155,0.03) 0%, transparent 50%);
+  -webkit-font-smoothing: antialiased;
+}
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: var(--radius-full); }
+pre, code { white-space: pre-wrap; word-break: break-word; overflow-x: hidden; }
+.translation-code::-webkit-scrollbar, pre::-webkit-scrollbar { display: none; }
+a { color: var(--color-accent); text-decoration: none; }
+a:hover { color: var(--color-accent-hover); }
+
+/* ========== NAVIGATION ========== */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+  background: rgba(250,247,242,0.92); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--color-border-light);
+  height: var(--nav-height);
+}
+.progress-bar {
+  position: absolute; top: 0; left: 0; height: 3px;
+  background: var(--color-accent); width: 0%; transition: width 100ms linear;
+}
+.nav-inner {
+  max-width: var(--content-width-wide); margin: 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  height: 100%; padding: 0 var(--space-6);
+}
+.nav-title {
+  font-family: var(--font-display); font-weight: 700;
+  font-size: var(--text-sm); color: var(--color-text);
+}
+.nav-dots { display: flex; gap: var(--space-2); }
+.nav-dot {
+  width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--color-text-muted);
+  background: transparent; cursor: pointer; transition: all var(--duration-fast);
+  padding: 0; position: relative;
+}
+.nav-dot:hover { border-color: var(--color-accent-muted); }
+.nav-dot.current { border-color: var(--color-accent); background: var(--color-accent); box-shadow: 0 0 8px rgba(42,123,155,0.3); }
+.nav-dot.visited { border-color: var(--color-accent); background: var(--color-accent); }
+.nav-dot-tooltip {
+  position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  background: var(--color-bg-code); color: #CDD6F4; padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm); font-size: var(--text-xs); white-space: nowrap;
+  opacity: 0; pointer-events: none; transition: opacity var(--duration-fast);
+}
+.nav-dot:hover .nav-dot-tooltip { opacity: 1; }
+
+/* ========== MODULE LAYOUT ========== */
+.module {
+  min-height: 100dvh; min-height: 100vh;
+  scroll-snap-align: start;
+  padding: var(--space-16) var(--space-6);
+  padding-top: calc(var(--nav-height) + var(--space-12));
+}
+.module-content { max-width: var(--content-width); margin: 0 auto; }
+.module-header { text-align: center; margin-bottom: var(--space-12); }
+.module-number {
+  font-family: var(--font-display); font-size: var(--text-6xl); font-weight: 800;
+  color: var(--color-accent); opacity: 0.15; display: block; line-height: var(--leading-tight);
+}
+.module-title {
+  font-family: var(--font-display); font-size: var(--text-4xl); font-weight: 700;
+  line-height: var(--leading-tight); margin-top: var(--space-2);
+}
+.module-subtitle {
+  font-size: var(--text-lg); color: var(--color-text-secondary);
+  margin-top: var(--space-3); max-width: 600px; margin-left: auto; margin-right: auto;
+}
+.module-body { display: flex; flex-direction: column; gap: var(--space-16); }
+.screen { display: flex; flex-direction: column; gap: var(--space-6); }
+.screen-heading {
+  font-family: var(--font-display); font-size: var(--text-2xl); font-weight: 600;
+  line-height: var(--leading-snug);
+}
+.audience-badge {
+  display: inline-block; padding: var(--space-1) var(--space-3);
+  font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase;
+  letter-spacing: 0.05em; border-radius: var(--radius-full);
+  background: var(--color-accent-light); color: var(--color-accent);
+}
+
+/* ========== ANIMATIONS ========== */
+.animate-in {
+  opacity: 0; transform: translateY(20px);
+  transition: opacity var(--duration-slow) var(--ease-out), transform var(--duration-slow) var(--ease-out);
+}
+.animate-in.visible { opacity: 1; transform: translateY(0); }
+.stagger-children > .animate-in {
+  transition-delay: calc(var(--stagger-index, 0) * var(--stagger-delay));
+}
+@keyframes fadeSlideUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes typingBounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
+
+/* ========== TRANSLATION BLOCKS ========== */
+.translation-block {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+  border-radius: var(--radius-md); overflow: hidden; box-shadow: var(--shadow-md);
+  margin: var(--space-4) 0;
+}
+.translation-code {
+  background: var(--color-bg-code); color: #CDD6F4;
+  padding: var(--space-6); font-family: var(--font-mono); font-size: var(--text-sm);
+  line-height: 1.7; position: relative; overflow-x: hidden;
+}
+.translation-code pre, .translation-code code { white-space: pre-wrap; word-break: break-word; overflow-x: hidden; }
+.translation-english {
+  background: var(--color-surface-warm); padding: var(--space-6);
+  font-size: var(--text-sm); line-height: 1.7;
+  border-left: 3px solid var(--color-accent);
+}
+.translation-label {
+  position: absolute; top: var(--space-2); right: var(--space-3);
+  font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.5;
+}
+.translation-english .translation-label { color: var(--color-text-muted); position: relative; top: auto; right: auto; display: block; margin-bottom: var(--space-2); }
+.tl { margin-bottom: var(--space-2); padding-left: var(--space-3); border-left: 2px solid var(--color-border-light); }
+
+/* ========== SYNTAX HIGHLIGHTING ========== */
+.code-keyword { color: #CBA6F7; }
+.code-string { color: #A6E3A1; }
+.code-function { color: #89B4FA; }
+.code-comment { color: #6C7086; }
+.code-number { color: #FAB387; }
+.code-property { color: #F9E2AF; }
+.code-operator { color: #94E2D5; }
+.code-tag { color: #F38BA8; }
+.code-attr { color: #F9E2AF; }
+.code-value { color: #A6E3A1; }
+
+/* ========== PATTERN CARDS ========== */
+.pattern-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+}
+.pattern-card {
+  background: var(--color-surface); border-radius: var(--radius-md);
+  padding: var(--space-6); box-shadow: var(--shadow-sm);
+  transition: transform var(--duration-normal) var(--ease-out), box-shadow var(--duration-normal);
+}
+.pattern-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-md); }
+.pattern-icon {
+  width: 48px; height: 48px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.5rem; margin-bottom: var(--space-3); color: white;
+}
+.pattern-title { font-family: var(--font-display); font-weight: 600; font-size: var(--text-base); margin-bottom: var(--space-2); }
+.pattern-desc { font-size: var(--text-sm); color: var(--color-text-secondary); line-height: var(--leading-normal); }
+
+/* ========== ICON ROWS ========== */
+.icon-rows { display: flex; flex-direction: column; gap: var(--space-4); }
+.icon-row {
+  display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4);
+  background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);
+}
+.icon-row p { margin: 0; color: var(--color-text-secondary); font-size: var(--text-sm); }
+.icon-circle {
+  width: 48px; height: 48px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.25rem; flex-shrink: 0; color: white;
+}
+
+/* ========== STEP CARDS ========== */
+.step-cards { display: flex; flex-direction: column; gap: var(--space-3); }
+.step-card {
+  display: flex; align-items: flex-start; gap: var(--space-4);
+  padding: var(--space-4) var(--space-5); background: var(--color-surface);
+  border-radius: var(--radius-md); border-left: 3px solid var(--color-accent); box-shadow: var(--shadow-sm);
+}
+.step-num {
+  width: 32px; height: 32px; border-radius: 50%; background: var(--color-accent);
+  color: white; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-display); flex-shrink: 0;
+}
+.step-body strong { display: block; }
+.step-body p { margin: var(--space-1) 0 0; color: var(--color-text-secondary); font-size: var(--text-sm); }
+
+/* ========== CALLOUT BOXES ========== */
+.callout {
+  display: flex; gap: var(--space-4); padding: var(--space-5);
+  border-radius: var(--radius-md); margin: var(--space-4) 0;
+}
+.callout-accent { background: var(--color-accent-light); border-left: 4px solid var(--color-accent); }
+.callout-info { background: var(--color-info-light); border-left: 4px solid var(--color-info); }
+.callout-warning { background: var(--color-error-light); border-left: 4px solid var(--color-error); }
+.callout-icon { font-size: 1.5rem; flex-shrink: 0; }
+.callout-content { flex: 1; }
+.callout-title { font-family: var(--font-display); font-weight: 600; display: block; margin-bottom: var(--space-1); }
+
+/* ========== FLOW DIAGRAMS ========== */
+.flow-steps {
+  display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
+  justify-content: center; margin: var(--space-6) 0;
+}
+.flow-step {
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-2);
+  padding: var(--space-4); background: var(--color-surface); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm); text-align: center; min-width: 100px; max-width: 140px;
+}
+.flow-step-num {
+  width: 28px; height: 28px; border-radius: 50%; background: var(--color-accent);
+  color: white; font-weight: 700; font-size: var(--text-sm);
+  display: flex; align-items: center; justify-content: center;
+}
+.flow-step p { font-size: var(--text-xs); color: var(--color-text-secondary); margin: 0; }
+.flow-arrow { font-size: var(--text-2xl); color: var(--color-accent-muted); font-weight: 300; }
+
+/* ========== CHAT ANIMATION ========== */
+.chat-window {
+  background: var(--color-surface); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg); overflow: hidden; max-width: 600px; margin: var(--space-6) auto;
+}
+.chat-header {
+  background: var(--color-bg-code); color: #CDD6F4; padding: var(--space-3) var(--space-4);
+  font-family: var(--font-display); font-weight: 600; font-size: var(--text-sm); text-align: center;
+}
+.chat-messages { padding: var(--space-4); min-height: 200px; max-height: 420px; overflow-y: auto; }
+.chat-message { display: flex; gap: var(--space-3); margin-bottom: var(--space-3); }
+.chat-avatar {
+  width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: var(--text-xs); font-weight: 700; color: white; flex-shrink: 0;
+}
+.chat-bubble {
+  background: var(--color-bg); padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md); max-width: 80%;
+}
+.chat-sender { font-weight: 600; font-size: var(--text-xs); display: block; margin-bottom: var(--space-1); }
+.chat-bubble p { font-size: var(--text-sm); margin: 0; }
+.chat-typing { display: flex; align-items: center; gap: var(--space-3); padding: 0 var(--space-4) var(--space-3); }
+.chat-typing-dots { display: flex; gap: 4px; }
+.typing-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--color-text-muted);
+  animation: typingBounce 1.4s infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+.chat-controls {
+  display: flex; gap: var(--space-2); padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border-light); align-items: center;
+}
+.chat-controls button {
+  padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border); background: var(--color-surface);
+  font-family: var(--font-body); font-size: var(--text-sm); cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.chat-controls button:hover { border-color: var(--color-accent); color: var(--color-accent); }
+.chat-progress { font-size: var(--text-xs); color: var(--color-text-muted); margin-left: auto; }
+
+/* ========== DATA FLOW ANIMATION ========== */
+.flow-animation {
+  background: var(--color-surface); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg); padding: var(--space-6); margin: var(--space-6) 0;
+}
+.flow-actors {
+  display: flex; justify-content: space-around; flex-wrap: wrap; gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+.flow-actor {
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-2);
+  padding: var(--space-4); border-radius: var(--radius-md); border: 2px solid var(--color-border);
+  transition: all var(--duration-normal) var(--ease-out); min-width: 80px;
+}
+.flow-actor.active {
+  box-shadow: 0 0 0 3px var(--color-accent), 0 0 20px rgba(42,123,155,0.2);
+  transform: scale(1.05);
+}
+.flow-actor-icon {
+  width: 40px; height: 40px; border-radius: 50%; display: flex;
+  align-items: center; justify-content: center; font-size: 1.25rem; color: white;
+}
+.flow-actor span { font-size: var(--text-xs); font-weight: 600; text-align: center; }
+.flow-step-label {
+  text-align: center; padding: var(--space-4); font-size: var(--text-sm);
+  color: var(--color-text-secondary); min-height: 48px;
+  border: 1px dashed var(--color-border); border-radius: var(--radius-sm);
+  margin-bottom: var(--space-4);
+}
+.flow-controls {
+  display: flex; gap: var(--space-2); justify-content: center; align-items: center;
+}
+.flow-controls button {
+  padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border); background: var(--color-surface);
+  font-family: var(--font-body); font-size: var(--text-sm); cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.flow-controls button:hover { border-color: var(--color-accent); color: var(--color-accent); }
+
+/* ========== ARCHITECTURE DIAGRAM ========== */
+.arch-diagram { margin: var(--space-6) 0; }
+.arch-zone {
+  border: 2px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-4); margin-bottom: var(--space-4);
+}
+.arch-zone-label {
+  font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--color-text-muted); margin-bottom: var(--space-3);
+}
+.arch-components { display: flex; flex-wrap: wrap; gap: var(--space-3); }
+.arch-component {
+  display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
+  background: var(--color-surface); border-radius: var(--radius-sm); border: 1px solid var(--color-border-light);
+  cursor: pointer; transition: all var(--duration-fast); font-size: var(--text-sm);
+}
+.arch-component:hover { border-color: var(--color-accent); box-shadow: var(--shadow-sm); }
+.arch-component.active { border-color: var(--color-accent); background: var(--color-accent-light); }
+.arch-component-icon { font-size: 1.1rem; }
+.arch-description {
+  padding: var(--space-4); background: var(--color-accent-light); border-radius: var(--radius-sm);
+  font-size: var(--text-sm); color: var(--color-text); margin-top: var(--space-3);
+  border-left: 3px solid var(--color-accent); min-height: 48px;
+}
+
+/* ========== QUIZ ========== */
+.quiz-container { margin: var(--space-6) 0; }
+.quiz-question-block { margin-bottom: var(--space-6); }
+.quiz-question {
+  font-family: var(--font-display); font-size: var(--text-lg); font-weight: 600;
+  margin-bottom: var(--space-4);
+}
+.quiz-options { display: flex; flex-direction: column; gap: var(--space-2); }
+.quiz-option {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4); border: 2px solid var(--color-border);
+  border-radius: var(--radius-sm); background: var(--color-surface);
+  cursor: pointer; width: 100%; text-align: left; font-family: var(--font-body);
+  font-size: var(--text-sm);
+  transition: border-color var(--duration-fast), background var(--duration-fast);
+}
+.quiz-option:hover { border-color: var(--color-accent-muted); }
+.quiz-option.selected { border-color: var(--color-accent); background: var(--color-accent-light); }
+.quiz-option.correct { border-color: var(--color-success); background: var(--color-success-light); }
+.quiz-option.incorrect { border-color: var(--color-error); background: var(--color-error-light); }
+.quiz-option-radio {
+  width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--color-border);
+  transition: all var(--duration-fast); flex-shrink: 0;
+}
+.quiz-option.selected .quiz-option-radio { border-color: var(--color-accent); background: var(--color-accent); box-shadow: inset 0 0 0 3px white; }
+.quiz-option.correct .quiz-option-radio { border-color: var(--color-success); background: var(--color-success); box-shadow: inset 0 0 0 3px white; }
+.quiz-feedback {
+  max-height: 0; overflow: hidden; opacity: 0;
+  transition: max-height var(--duration-normal), opacity var(--duration-normal), padding var(--duration-normal);
+  font-size: var(--text-sm); border-radius: var(--radius-sm);
+}
+.quiz-feedback.show { max-height: 200px; opacity: 1; padding: var(--space-3); margin-top: var(--space-2); }
+.quiz-feedback.success { background: var(--color-success-light); color: var(--color-success); }
+.quiz-feedback.error { background: var(--color-error-light); color: var(--color-error); }
+.quiz-btn {
+  padding: var(--space-2) var(--space-5); border-radius: var(--radius-sm);
+  border: none; background: var(--color-accent); color: white;
+  font-family: var(--font-body); font-size: var(--text-sm); font-weight: 600;
+  cursor: pointer; transition: background var(--duration-fast); margin-top: var(--space-4);
+}
+.quiz-btn:hover { background: var(--color-accent-hover); }
+.quiz-btn-secondary {
+  padding: var(--space-2) var(--space-5); border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border); background: var(--color-surface);
+  font-family: var(--font-body); font-size: var(--text-sm); cursor: pointer;
+  margin-top: var(--space-4); margin-left: var(--space-2);
+  transition: all var(--duration-fast);
+}
+.quiz-btn-secondary:hover { border-color: var(--color-accent); color: var(--color-accent); }
+
+/* ========== FILE TREE ========== */
+.file-tree { font-family: var(--font-mono); font-size: var(--text-sm); margin: var(--space-4) 0; }
+.ft-folder, .ft-file { padding: var(--space-2) var(--space-3); border-left: 2px solid var(--color-border-light); margin-left: var(--space-4); }
+.ft-folder > .ft-name { color: var(--color-accent); font-weight: 600; cursor: default; }
+.ft-file > .ft-name { color: var(--color-text); }
+.ft-desc { color: var(--color-text-secondary); font-family: var(--font-body); margin-left: var(--space-2); font-size: var(--text-xs); }
+.ft-children { margin-left: var(--space-4); }
+
+/* ========== GLOSSARY TOOLTIPS ========== */
+.term { border-bottom: 1.5px dashed var(--color-accent-muted); cursor: pointer; position: relative; }
+.term:hover, .term.active { border-bottom-color: var(--color-accent); color: var(--color-accent); }
+.term-tooltip {
+  position: fixed; background: var(--color-bg-code); color: #CDD6F4;
+  padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm);
+  font-size: var(--text-sm); font-family: var(--font-body); line-height: var(--leading-normal);
+  width: max(200px, min(320px, 80vw)); box-shadow: var(--shadow-lg);
+  pointer-events: none; opacity: 0; transition: opacity var(--duration-fast); z-index: 10000;
+}
+.term-tooltip::after {
+  content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+  border: 6px solid transparent; border-top-color: var(--color-bg-code);
+}
+.term-tooltip.visible { opacity: 1; }
+.term-tooltip.flip::after { top: auto; bottom: 100%; border-top-color: transparent; border-bottom-color: var(--color-bg-code); }
+
+/* ========== LAYER TOGGLE ========== */
+.layer-demo { margin: var(--space-6) 0; }
+.layer-tabs { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); }
+.layer-tab {
+  padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border); background: var(--color-surface);
+  font-family: var(--font-body); font-size: var(--text-sm); cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.layer-tab.active { background: var(--color-accent); color: white; border-color: var(--color-accent); }
+.layer-viewport {
+  border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-4); min-height: 200px; background: var(--color-surface);
+}
+
+/* ========== BADGE LIST ========== */
+.badge-list { display: flex; flex-direction: column; gap: var(--space-2); }
+.badge-item {
+  display: flex; align-items: center; gap: var(--space-4);
+  padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm); transition: border-color var(--duration-fast);
+}
+.badge-item:hover { border-color: var(--color-accent-muted); }
+.badge-code {
+  font-family: var(--font-mono); font-size: var(--text-sm);
+  background: var(--color-bg-code); color: #CBA6F7;
+  padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); white-space: nowrap;
+}
+
+/* ========== SPOT THE BUG ========== */
+.bug-challenge { margin: var(--space-6) 0; }
+.bug-code { background: var(--color-bg-code); border-radius: var(--radius-md); overflow: hidden; }
+.bug-line {
+  display: flex; align-items: flex-start; gap: var(--space-3);
+  padding: var(--space-2) var(--space-4); cursor: pointer;
+  transition: background var(--duration-fast); border-left: 3px solid transparent;
+}
+.bug-line:hover { background: rgba(255,255,255,0.05); }
+.bug-line.correct { background: rgba(45,139,85,0.2); border-left-color: var(--color-success); }
+.bug-line.incorrect { background: rgba(201,59,59,0.15); border-left-color: var(--color-error); }
+.bug-line .line-num { color: var(--color-text-muted); font-family: var(--font-mono); font-size: var(--text-xs); min-width: 24px; padding-top: 2px; }
+.bug-line code { color: #CDD6F4; font-family: var(--font-mono); font-size: var(--text-sm); }
+.bug-feedback { margin-top: var(--space-3); font-size: var(--text-sm); border-radius: var(--radius-sm); padding: 0; max-height: 0; overflow: hidden; opacity: 0; transition: all var(--duration-normal); }
+.bug-feedback.show { max-height: 200px; opacity: 1; padding: var(--space-4); }
+.bug-feedback.success { background: var(--color-success-light); color: var(--color-success); }
+.bug-feedback.error { background: var(--color-error-light); color: var(--color-error); }
+
+/* ========== DND MATCHING ========== */
+.dnd-container { margin: var(--space-6) 0; }
+.dnd-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-4); }
+.dnd-chip {
+  padding: var(--space-2) var(--space-4); background: var(--color-accent);
+  color: white; border-radius: var(--radius-full); font-size: var(--text-sm);
+  font-weight: 600; cursor: grab; user-select: none;
+  transition: all var(--duration-fast);
+}
+.dnd-chip.dragging { opacity: 0.5; }
+.dnd-chip.placed { opacity: 0.4; cursor: default; }
+.dnd-zones { display: flex; flex-direction: column; gap: var(--space-3); }
+.dnd-zone {
+  display: flex; align-items: center; gap: var(--space-4);
+  padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm); background: var(--color-surface);
+}
+.dnd-zone-label { flex: 1; font-size: var(--text-sm); }
+.dnd-zone-target {
+  min-width: 120px; min-height: 36px; border: 2px dashed var(--color-border);
+  border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center;
+  font-size: var(--text-sm); color: var(--color-text-muted); padding: var(--space-2);
+  transition: all var(--duration-fast);
+}
+.dnd-zone-target.drag-over { border-color: var(--color-accent); background: var(--color-accent-light); }
+.dnd-zone-target.correct { border-color: var(--color-success); border-style: solid; background: var(--color-success-light); color: var(--color-success); font-weight: 600; }
+.dnd-zone-target.incorrect { border-color: var(--color-error); border-style: solid; background: var(--color-error-light); color: var(--color-error); }
+
+/* ========== RESPONSIVE ========== */
+@media (max-width: 768px) {
+  :root { --text-4xl: 1.875rem; --text-5xl: 2.25rem; --text-6xl: 3rem; }
+  .translation-block { grid-template-columns: 1fr; }
+  .translation-english { border-left: none; border-top: 3px solid var(--color-accent); }
+  .pattern-cards { grid-template-columns: 1fr 1fr; }
+  .flow-actors { gap: var(--space-2); }
+}
+@media (max-width: 480px) {
+  :root { --text-4xl: 1.5rem; --text-5xl: 1.875rem; --text-6xl: 2.25rem; }
+  .module { padding: var(--space-8) var(--space-4); }
+  .pattern-cards { grid-template-columns: 1fr; }
+  .flow-steps { flex-direction: column; }
+  .flow-arrow { transform: rotate(90deg); }
+  .chat-window { margin: var(--space-4) 0; }
+}
+</style>
+</head>
+<body>
+
+<!-- ========== NAVIGATION ========== -->
+<nav class="nav">
+  <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0"></div>
+  <div class="nav-inner">
+    <span class="nav-title">ProcWise Agents — How It Works</span>
+    <div class="nav-dots">
+      <button class="nav-dot current" data-target="module-1" aria-label="Module 1"><span class="nav-dot-tooltip">What Is ProcWise?</span></button>
+      <button class="nav-dot" data-target="module-2" aria-label="Module 2"><span class="nav-dot-tooltip">Meet the Agents</span></button>
+      <button class="nav-dot" data-target="module-3" aria-label="Module 3"><span class="nav-dot-tooltip">Quote Processing</span></button>
+      <button class="nav-dot" data-target="module-4" aria-label="Module 4"><span class="nav-dot-tooltip">The Brain</span></button>
+      <button class="nav-dot" data-target="module-5" aria-label="Module 5"><span class="nav-dot-tooltip">Knowledge Graph</span></button>
+      <button class="nav-dot" data-target="module-6" aria-label="Module 6"><span class="nav-dot-tooltip">LangGraph Workflows</span></button>
+      <button class="nav-dot" data-target="module-7" aria-label="Module 7"><span class="nav-dot-tooltip">Debugging</span></button>
+      <button class="nav-dot" data-target="module-8" aria-label="Module 8"><span class="nav-dot-tooltip">Extending</span></button>
+    </div>
+  </div>
+</nav>
+
+<!-- ==================== MODULE 1: WHAT IS PROCWISE? ==================== -->
+<section class="module" id="module-1" style="background: var(--color-bg)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">01</span>
+      <h1 class="module-title">What Is ProcWise?</h1>
+      <p class="module-subtitle">An AI platform that turns procurement chaos into an automated, intelligent workflow</p>
+      <span class="audience-badge">Everyone</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: The Problem -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The Procurement Problem</h2>
+        <p>Every company buys things &mdash; raw materials, software licenses, office supplies. The process of finding suppliers, comparing prices, and negotiating deals is called <span class="term" data-definition="Procurement is the process of finding, evaluating, and purchasing goods or services from external suppliers. Think of it as the company's professional shopping department.">procurement</span>.</p>
+        <p>Most procurement teams drown in spreadsheets, emails, and manual comparisons. ProcWise fixes that with 12 AI agents that work together.</p>
+
+        <div class="icon-rows stagger-children">
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-error)">&#128203;</div>
+            <div><strong>Manual Quote Comparison</strong><p>Hours spent comparing supplier prices in spreadsheets</p></div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-4)">&#128231;</div>
+            <div><strong>Email Overload</strong><p>Supplier negotiations scattered across hundreds of email threads</p></div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-3)">&#128269;</div>
+            <div><strong>Missed Savings</strong><p>No way to spot patterns across past purchases to negotiate better deals</p></div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-text-muted)">&#9888;&#65039;</div>
+            <div><strong>Price Discrepancies</strong><p>Invoices that don't match quotes go undetected until it's too late</p></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: The Solution -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">ProcWise: AI-Powered Procurement</h2>
+        <p>ProcWise replaces manual work with a team of specialized <span class="term" data-definition="An AI agent is a software program powered by a language model (like ChatGPT) that can take actions autonomously &mdash; reading documents, making decisions, and even sending emails. Think of it as a digital employee with a specific job.">AI agents</span>, each responsible for one part of the procurement process.</p>
+
+        <div class="arch-diagram animate-in">
+          <div class="arch-zone" style="border-color: var(--color-actor-2)">
+            <h4 class="arch-zone-label">&#127758; Data Layer</h4>
+            <div class="arch-components">
+              <div class="arch-component" data-desc="PostgreSQL stores all operational data &mdash; purchase orders, supplier records, quotes, invoices. It's the system of record." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128451;&#65039;</span> PostgreSQL</div>
+              <div class="arch-component" data-desc="Neo4j is a graph database that maps relationships between suppliers, items, quotes, and purchase orders. It answers questions like 'which suppliers have we negotiated with for this item before?'" onclick="showArchDesc(this)"><span class="arch-component-icon">&#128312;</span> Neo4j Graph</div>
+              <div class="arch-component" data-desc="Qdrant stores vector embeddings &mdash; mathematical representations of text that let the system find similar documents by meaning, not just keywords." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128300;</span> Qdrant Vectors</div>
+              <div class="arch-component" data-desc="Redis is an in-memory cache that stores temporary working data &mdash; like an agent's scratchpad during a task." onclick="showArchDesc(this)"><span class="arch-component-icon">&#9889;</span> Redis Cache</div>
+            </div>
+          </div>
+
+          <div class="arch-zone" style="border-color: var(--color-actor-3)">
+            <h4 class="arch-zone-label">&#129504; Intelligence Layer</h4>
+            <div class="arch-components">
+              <div class="arch-component" data-desc="The Cognitive Layer is the brain that all agents share. It handles memory (remembering what happened in this workflow), retrieval (finding relevant past data), and LLM routing (choosing which AI model to use for each task)." onclick="showArchDesc(this)"><span class="arch-component-icon">&#129504;</span> Cognitive Layer</div>
+              <div class="arch-component" data-desc="Local AI models (like Phi-4, Mistral) run on your own hardware. They handle routine tasks like data extraction and classification without sending data to the cloud." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128187;</span> Local LLMs (Ollama)</div>
+              <div class="arch-component" data-desc="Claude (by Anthropic) handles complex reasoning tasks like negotiation strategy and verification. It's only used when the local models aren't powerful enough." onclick="showArchDesc(this)"><span class="arch-component-icon">&#9729;&#65039;</span> Cloud LLM (Claude)</div>
+            </div>
+          </div>
+
+          <div class="arch-zone" style="border-color: var(--color-actor-1)">
+            <h4 class="arch-zone-label">&#129302; Agent Layer</h4>
+            <div class="arch-components">
+              <div class="arch-component" data-desc="12 specialized AI agents, each with a specific job: extracting data from documents, comparing quotes, ranking suppliers, drafting negotiation emails, and more." onclick="showArchDesc(this)"><span class="arch-component-icon">&#129302;</span> 12 AI Agents</div>
+              <div class="arch-component" data-desc="LangGraph workflows orchestrate how agents work together. They define the sequence of steps, decision points, and error handling for each procurement task." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128260;</span> LangGraph Workflows</div>
+            </div>
+          </div>
+
+          <div class="arch-zone" style="border-color: var(--color-actor-5)">
+            <h4 class="arch-zone-label">&#127760; API Layer</h4>
+            <div class="arch-components">
+              <div class="arch-component" data-desc="FastAPI provides the REST endpoints that the frontend and external systems use to interact with ProcWise. It's the front door." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128640;</span> FastAPI</div>
+              <div class="arch-component" data-desc="Email integration (SES/SMTP for sending, IMAP for receiving) lets agents communicate with real suppliers via email." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128231;</span> Email (SES/IMAP)</div>
+              <div class="arch-component" data-desc="S3 stores uploaded procurement documents &mdash; PDFs, spreadsheets, and other files that agents need to process." onclick="showArchDesc(this)"><span class="arch-component-icon">&#128193;</span> S3 Storage</div>
+            </div>
+          </div>
+          <div class="arch-description" id="arch-desc-1">Click any component to learn what it does</div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why Multiple Agents Instead of One Big AI?</strong>
+            <p>The same reason a hospital has specialists instead of one super-doctor. A cardiologist and a neurologist each focus deeply on their area. ProcWise works the same way &mdash; each agent is an expert at one thing: extracting data, comparing prices, or drafting emails. This <span class="term" data-definition="Separation of concerns is a design principle where each component handles one specific responsibility. It makes systems easier to understand, test, and modify because you can change one part without breaking others.">separation of concerns</span> makes the system reliable, testable, and easy to improve one piece at a time.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 2: MEET THE AGENTS ==================== -->
+<section class="module" id="module-2" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">02</span>
+      <h1 class="module-title">Meet the Agents</h1>
+      <p class="module-subtitle">12 specialized AI workers, each an expert at one part of the procurement process</p>
+      <span class="audience-badge">Everyone</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Agent Cards -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The Cast of Characters</h2>
+        <p>Think of ProcWise like a hospital emergency room. When a patient (purchase request) arrives, a <span class="term" data-definition="An orchestrator is the conductor of the system &mdash; it decides which agents should handle a request, in what order, and passes data between them. Like a 911 dispatcher routing calls to the right department.">triage system</span> routes them to the right specialists.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#128196;</div>
+            <h4 class="pattern-title">Data Extraction</h4>
+            <p class="pattern-desc">Reads PDFs, spreadsheets, and Word docs. Pulls out structured data like item names, quantities, and prices.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128200;</div>
+            <h4 class="pattern-title">Quote Comparison</h4>
+            <p class="pattern-desc">Aggregates quotes from multiple suppliers and normalizes them so you can compare apples to apples.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#9989;</div>
+            <h4 class="pattern-title">Quote Evaluation</h4>
+            <p class="pattern-desc">Evaluates quotes against company policies &mdash; are prices within budget? Does the supplier meet requirements?</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#127942;</div>
+            <h4 class="pattern-title">Supplier Ranking</h4>
+            <p class="pattern-desc">Scores suppliers using multiple criteria: price, delivery speed, quality history, and past performance.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">&#128172;</div>
+            <h4 class="pattern-title">Negotiation</h4>
+            <p class="pattern-desc">Orchestrates multi-round negotiations with suppliers. Tracks counter-offers and advises on strategy.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#9993;&#65039;</div>
+            <h4 class="pattern-title">Email Drafting</h4>
+            <p class="pattern-desc">Generates context-aware negotiation emails tailored to each supplier's history and communication style.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128232;</div>
+            <h4 class="pattern-title">Email Dispatch</h4>
+            <p class="pattern-desc">Sends approved email drafts via SES or SMTP and tracks delivery status.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#128229;</div>
+            <h4 class="pattern-title">Email Watcher</h4>
+            <p class="pattern-desc">Monitors the inbox for supplier replies and routes them to the right workflow.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#128269;</div>
+            <h4 class="pattern-title">Discrepancy Detection</h4>
+            <p class="pattern-desc">Catches mismatches &mdash; when an invoice price doesn't match the quote, or quantities don't add up.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">&#128176;</div>
+            <h4 class="pattern-title">Opportunity Miner</h4>
+            <p class="pattern-desc">Scans historical data to find savings opportunities &mdash; bulk discounts, alternative suppliers, contract renegotiation windows.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#129309;</div>
+            <h4 class="pattern-title">Supplier Interaction</h4>
+            <p class="pattern-desc">Normalizes communications from different suppliers into a standard format the system can process.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128488;&#65039;</div>
+            <h4 class="pattern-title">RAG Agent</h4>
+            <p class="pattern-desc">Answers natural-language questions about procurement data using retrieval-augmented generation.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Group Chat -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">How Agents Collaborate</h2>
+        <p>Here's what happens behind the scenes when a new supplier quote arrives. Watch the agents work together:</p>
+
+        <div class="chat-window">
+          <div class="chat-header">&#129302; ProcWise Agent Group Chat</div>
+          <div class="chat-messages" id="chat-m2">
+            <div class="chat-message" data-msg="0" data-sender="orchestrator" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">O</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-2)">Orchestrator</span><p>New quote PDF just came in from Acme Industrial. Routing to Data Extraction.</p></div>
+            </div>
+            <div class="chat-message" data-msg="1" data-sender="extraction" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-1)">DE</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-1)">Data Extraction</span><p>Got it. Parsed the PDF &mdash; found 15 line items. Prices, quantities, and delivery terms extracted. Passing to Quote Comparison.</p></div>
+            </div>
+            <div class="chat-message" data-msg="2" data-sender="comparison" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">QC</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-2)">Quote Comparison</span><p>Compared against 3 other suppliers. Acme is 12% cheaper on 8 items but 5% higher on fasteners. Sending to Evaluation.</p></div>
+            </div>
+            <div class="chat-message" data-msg="3" data-sender="evaluation" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-3)">QE</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-3)">Quote Evaluation</span><p>Policy check passed. Total is within budget. But fastener pricing exceeds our target by 5%. Flagging for negotiation.</p></div>
+            </div>
+            <div class="chat-message" data-msg="4" data-sender="negotiation" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-4)">N</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-4)">Negotiation</span><p>Checked Acme's history &mdash; they usually concede 3-4% after Round 1. Drafting a counter-offer email now.</p></div>
+            </div>
+            <div class="chat-message" data-msg="5" data-sender="email" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-1)">ED</div>
+              <div class="chat-bubble"><span class="chat-sender" style="color: var(--color-actor-1)">Email Drafting</span><p>Draft ready: "Dear Acme team, we'd like to proceed but need to discuss fastener pricing..." Awaiting approval to send.</p></div>
+            </div>
+          </div>
+          <div class="chat-typing" id="chat-typing-m2" style="display:none">
+            <div class="chat-avatar" id="typing-avatar-m2" style="background: var(--color-text-muted)">?</div>
+            <div class="chat-typing-dots"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
+          </div>
+          <div class="chat-controls">
+            <button onclick="playChatNext('m2')">Next Message</button>
+            <button onclick="playChatAll('m2')">Play All</button>
+            <button onclick="resetChat('m2')">Replay</button>
+            <span class="chat-progress" id="chat-progress-m2">0 / 6 messages</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The Power of Agent Specialization</strong>
+            <p>Each agent has a <span class="term" data-definition="A contract in software is a formal agreement about what a component accepts as input and what it produces as output. Like a job description that clearly defines responsibilities.">contract</span> &mdash; defined inputs and outputs. The Data Extraction agent always produces structured data with item names, quantities, and prices. The Quote Comparison agent always expects that format. This predictability is what makes the whole system reliable &mdash; each agent can be tested and improved independently.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 3: HOW A QUOTE GETS PROCESSED ==================== -->
+<section class="module" id="module-3" style="background: var(--color-bg)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">How a Quote Gets Processed</h1>
+      <p class="module-subtitle">Trace a real purchase request from arrival to approval, step by step</p>
+      <span class="audience-badge">Everyone</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Data Flow -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The Journey of a Quote</h2>
+        <p>Imagine a supplier emails you a PDF quote for 15 items. Here's what ProcWise does with it automatically:</p>
+
+        <div class="flow-animation" id="flow-m3">
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-m3-upload"><div class="flow-actor-icon" style="background: var(--color-actor-1)">&#128196;</div><span>Upload</span></div>
+            <div class="flow-actor" id="flow-m3-extract"><div class="flow-actor-icon" style="background: var(--color-actor-2)">&#128269;</div><span>Extract</span></div>
+            <div class="flow-actor" id="flow-m3-compare"><div class="flow-actor-icon" style="background: var(--color-actor-3)">&#128200;</div><span>Compare</span></div>
+            <div class="flow-actor" id="flow-m3-evaluate"><div class="flow-actor-icon" style="background: var(--color-actor-4)">&#9989;</div><span>Evaluate</span></div>
+            <div class="flow-actor" id="flow-m3-negotiate"><div class="flow-actor-icon" style="background: var(--color-actor-5)">&#128172;</div><span>Negotiate</span></div>
+          </div>
+          <div class="flow-step-label" id="flow-label-m3">Click "Next Step" to trace the quote through the system</div>
+          <div class="flow-controls">
+            <button onclick="flowNext('m3')">Next Step</button>
+            <button onclick="flowReset('m3')">Restart</button>
+            <span class="chat-progress" id="flow-progress-m3">Step 0 / 6</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Code Translation - Three-Way Match -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The Three-Way Match</h2>
+        <p>One of ProcWise's most powerful features: automatically comparing the <span class="term" data-definition="A purchase order (PO) is the official document a company sends to a supplier saying 'we want to buy these items at these prices.' It's the company's commitment to purchase.">purchase order</span>, the original <span class="term" data-definition="A quote (also called a quotation or bid) is a supplier's offer to sell items at specific prices. It's their proposal before a deal is finalized.">quote</span>, and the final <span class="term" data-definition="An invoice is the bill a supplier sends after delivering goods. It says 'you owe us this much.' Matching it against the PO catches overcharges.">invoice</span> to catch discrepancies.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">def</span> <span class="code-function">three_way_match_by_po</span>(<span class="code-property">self</span>, <span class="code-property">po_id</span>, <span class="code-property">tolerance_pct</span><span class="code-operator">=</span><span class="code-number">2.0</span>):</span>
+<span class="code-line">    <span class="code-property">query</span> <span class="code-operator">=</span> <span class="code-string">"""</span></span>
+<span class="code-line">    <span class="code-string">MATCH (p:PurchaseOrder {po_id: $po_id})</span></span>
+<span class="code-line">    <span class="code-string">  -[:CONTAINS_PO_LINE]->(pl:POLineItem)</span></span>
+<span class="code-line">    <span class="code-string">  -[:ORDERS_ITEM]->(i:Item)</span></span>
+<span class="code-line">    <span class="code-string">OPTIONAL MATCH (ql:QuoteLineItem)-[:QUOTES_ITEM]->(i)</span></span>
+<span class="code-line">    <span class="code-string">OPTIONAL MATCH (il:InvoiceLineItem)-[:INVOICES_ITEM]->(i)</span></span>
+<span class="code-line">    <span class="code-string">RETURN i.item_description AS item,</span></span>
+<span class="code-line">    <span class="code-string">  pl.unit_price AS po_price,</span></span>
+<span class="code-line">    <span class="code-string">  ql.unit_price AS quote_price,</span></span>
+<span class="code-line">    <span class="code-string">  il.unit_price AS invoice_price"""</span></span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Define a function that compares three documents for one purchase order. Allow a 2% price difference before flagging.</p>
+              <p class="tl">This is a graph database query (not SQL). Start by finding the purchase order...</p>
+              <p class="tl">Follow the relationship to find each line item in the PO...</p>
+              <p class="tl">Then find the actual item being ordered.</p>
+              <p class="tl">Now look for the original quote for that same item (if one exists)...</p>
+              <p class="tl">And the invoice for that same item (if one exists)...</p>
+              <p class="tl">Return the item name and all three prices so we can compare them side by side.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Quiz -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Check Your Understanding</h2>
+        <div class="quiz-container" id="quiz-m3">
+          <div class="quiz-question-block" data-correct="option-b">
+            <h3 class="quiz-question">A supplier sends a revised quote with prices 3% lower than their first quote. Which agents get involved?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Only the Email Watcher, since it's just an email</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Email Watcher &rarr; Data Extraction &rarr; Quote Comparison &rarr; Quote Evaluation</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Only Quote Comparison, since we already have the data</span></button>
+            </div>
+            <div class="quiz-feedback" data-correct-text="Exactly! The revised quote triggers the full pipeline. The Email Watcher detects the incoming email, Data Extraction parses the new PDF, Quote Comparison updates the comparison with new prices, and Quote Evaluation re-checks against policies." data-incorrect-text="Not quite. A revised quote is a new document that needs the full processing pipeline &mdash; it needs to be detected, extracted, compared, and evaluated just like the original."></div>
+          </div>
+
+          <div class="quiz-question-block" data-correct="option-c">
+            <h3 class="quiz-question">The Discrepancy Detection agent finds that an invoice price is 8% higher than the PO price (tolerance is 2%). What should happen next?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Automatically reject the invoice and notify the supplier</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Ignore it &mdash; 8% is close enough</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>Flag the discrepancy for review and potentially trigger the Negotiation agent</span></button>
+            </div>
+            <div class="quiz-feedback" data-correct-text="Right! An 8% variance exceeds the 2% tolerance, so it gets flagged. The system doesn't auto-reject (that could damage supplier relationships) but escalates for human review or automated negotiation." data-incorrect-text="Think about it &mdash; automatically rejecting could damage a supplier relationship, and ignoring an 8% overcharge loses money. The smart path is to flag it and let the negotiation process handle it."></div>
+          </div>
+
+          <button class="quiz-btn" onclick="checkQuiz('quiz-m3')">Check Answers</button>
+          <button class="quiz-btn-secondary" onclick="resetQuiz('quiz-m3')">Try Again</button>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 4: THE BRAIN ==================== -->
+<section class="module" id="module-4" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">The Brain &mdash; Cognitive Layer</h1>
+      <p class="module-subtitle">How agents think, remember, and choose the right AI model for each task</p>
+      <span class="audience-badge">Onboarding + Developers</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Overview -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Five Components, One Brain</h2>
+        <p>Every agent in ProcWise shares the same "brain" &mdash; the <span class="term" data-definition="The Cognitive Layer is a shared intelligence infrastructure that all agents use. It provides memory (remembering context), retrieval (finding relevant information), LLM routing (choosing AI models), verification (checking results), and learning (improving over time).">Cognitive Layer</span>. Think of it like air traffic control at an airport &mdash; routing requests, maintaining state, and preventing collisions.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#129504;</div>
+            <h4 class="pattern-title">Working Memory</h4>
+            <p class="pattern-desc">Redis-backed scratchpad with three scopes: workflow (1 hour), session (24 hours), and long-term (permanent).</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#128270;</div>
+            <h4 class="pattern-title">Retrieval Engine</h4>
+            <p class="pattern-desc">Fuses three search methods (graph, vector, keyword) and re-ranks results for maximum relevance.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#128268;</div>
+            <h4 class="pattern-title">LLM Router</h4>
+            <p class="pattern-desc">Routes tasks to local or cloud AI models based on complexity. Simple tasks stay local; hard ones go to Claude.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">&#9989;</div>
+            <h4 class="pattern-title">Verification Engine</h4>
+            <p class="pattern-desc">Validates outputs against schemas and confidence thresholds before they leave the system.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#128200;</div>
+            <h4 class="pattern-title">Learning Loop</h4>
+            <p class="pattern-desc">Captures workflow outcomes to continuously improve agent performance over time.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Working Memory Code Translation -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Working Memory: The Agent's Scratchpad</h2>
+        <p>Each agent can store and retrieve information during a workflow. Data expires automatically based on its scope &mdash; like sticky notes that dissolve after a set time.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">class</span> <span class="code-function">MemoryScope</span>(Enum):</span>
+<span class="code-line">    WORKFLOW <span class="code-operator">=</span> <span class="code-string">"workflow"</span>     <span class="code-comment"># 1 hour TTL</span></span>
+<span class="code-line">    SESSION  <span class="code-operator">=</span> <span class="code-string">"session"</span>      <span class="code-comment"># 24 hour TTL</span></span>
+<span class="code-line">    LONG_TERM <span class="code-operator">=</span> <span class="code-string">"long_term"</span>   <span class="code-comment"># permanent</span></span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-keyword">async def</span> <span class="code-function">store</span>(<span class="code-property">self</span>, <span class="code-property">workflow_id</span>, <span class="code-property">entry</span>):</span>
+<span class="code-line">    redis_key <span class="code-operator">=</span> <span class="code-property">self</span>._make_key(</span>
+<span class="code-line">        entry.scope, workflow_id, entry.key)</span>
+<span class="code-line">    ttl <span class="code-operator">=</span> <span class="code-property">self</span>._ttl_for_scope(entry.scope)</span>
+<span class="code-line">    <span class="code-keyword">await</span> <span class="code-property">self</span>._redis.set(</span>
+<span class="code-line">        redis_key, json.dumps(entry.to_dict()),</span>
+<span class="code-line">        <span class="code-operator">**</span>({<span class="code-string">"ex"</span>: ttl} <span class="code-keyword">if</span> ttl <span class="code-keyword">else</span> {}))</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Define three levels of memory, each lasting a different amount of time:</p>
+              <p class="tl"><strong>Workflow:</strong> lasts 1 hour &mdash; for data relevant only to the current task</p>
+              <p class="tl"><strong>Session:</strong> lasts 24 hours &mdash; for data that might be needed across related tasks</p>
+              <p class="tl"><strong>Long-term:</strong> permanent &mdash; for learned patterns and historical insights</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">To save a memory: build a unique key from the scope + workflow ID + data name...</p>
+              <p class="tl">Look up how long this scope's data should last...</p>
+              <p class="tl">Store it in Redis (a fast in-memory database) with an automatic expiration timer.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: LLM Router Code Translation -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">LLM Router: Choosing the Right AI</h2>
+        <p>Not every task needs a powerful (and expensive) cloud AI. The <span class="term" data-definition="An LLM (Large Language Model) is the AI brain that processes text &mdash; like GPT, Claude, or Mistral. Different models have different strengths: some are fast and cheap, others are slower but smarter.">LLM</span> Router picks the best model for each job.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">def</span> <span class="code-function">route</span>(<span class="code-property">self</span>, <span class="code-property">task_type</span>):</span>
+<span class="code-line">    <span class="code-keyword">if</span> task_type.value <span class="code-keyword">in</span> <span class="code-property">self</span>._cloud_tasks \</span>
+<span class="code-line">       <span class="code-keyword">and</span> <span class="code-property">self</span>._enable_cloud \</span>
+<span class="code-line">       <span class="code-keyword">and</span> <span class="code-property">self</span>._cloud_api_key:</span>
+<span class="code-line">        <span class="code-keyword">return</span> <span class="code-property">self</span>._cloud_provider, <span class="code-property">self</span>._cloud_model</span>
+<span class="code-line">    local_model <span class="code-operator">=</span> <span class="code-property">self</span>._local_map.get(</span>
+<span class="code-line">        task_type.value, <span class="code-property">self</span>._local_fallback)</span>
+<span class="code-line">    <span class="code-keyword">return</span> <span class="code-string">"ollama"</span>, local_model</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Given a task type (like "extraction" or "negotiation_strategy"), decide which AI model to use:</p>
+              <p class="tl">If this task type needs cloud-level intelligence...</p>
+              <p class="tl">AND the cloud option is turned on...</p>
+              <p class="tl">AND we have an API key for it &mdash; then use the cloud model (Claude).</p>
+              <p class="tl">Otherwise, find the right local model for this task type...</p>
+              <p class="tl">(Fall back to a default local model if no specific one is configured)</p>
+              <p class="tl">Use the local model via Ollama &mdash; faster, free, and keeps data private.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="badge-list" style="margin-top: var(--space-6)">
+          <div class="badge-item"><code class="badge-code">extraction</code><span>&#128187; Phi-4 (local) &mdash; fast pattern matching for pulling data from documents</span></div>
+          <div class="badge-item"><code class="badge-code">classification</code><span>&#128187; Phi-4 (local) &mdash; categorizing documents and items</span></div>
+          <div class="badge-item"><code class="badge-code">summarization</code><span>&#128187; Mistral (local) &mdash; condensing long text into key points</span></div>
+          <div class="badge-item"><code class="badge-code">complex_reasoning</code><span>&#9729;&#65039; Claude (cloud) &mdash; multi-step logic and analysis</span></div>
+          <div class="badge-item"><code class="badge-code">negotiation_strategy</code><span>&#9729;&#65039; Claude (cloud) &mdash; strategic thinking and recommendation</span></div>
+          <div class="badge-item"><code class="badge-code">verification</code><span>&#9729;&#65039; Claude (cloud) &mdash; checking other agents' work for accuracy</span></div>
+        </div>
+      </section>
+
+      <!-- Screen 4: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The Escalation Pattern</strong>
+            <p>Notice the fallback logic: try local first, escalate to cloud if it fails. This is a common pattern called <span class="term" data-definition="Graceful degradation means a system continues working (perhaps with reduced quality) when a component fails, rather than crashing completely. Like a car that keeps driving on three wheels instead of stopping dead.">graceful degradation</span>. If the local AI model can't handle a task, the system automatically tries the more powerful cloud model instead of failing. It's like calling a specialist when the general practitioner can't figure out the diagnosis.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 5: KNOWLEDGE GRAPH ==================== -->
+<section class="module" id="module-5" style="background: var(--color-bg)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">05</span>
+      <h1 class="module-title">The Knowledge Graph</h1>
+      <p class="module-subtitle">How ProcWise remembers everything &mdash; suppliers, relationships, and patterns</p>
+      <span class="audience-badge">Onboarding + Developers</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Three Finding Systems -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three Ways to Find Information</h2>
+        <p>Imagine a library with three different finding systems. ProcWise combines all three and picks the best results from each:</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#128312;</div>
+            <h4 class="pattern-title">Knowledge Graph (Neo4j)</h4>
+            <p class="pattern-desc">Like a card catalog that shows relationships. "This supplier has 5 quotes linked to 3 POs and delivered to 2 locations." Finds connections.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128300;</div>
+            <h4 class="pattern-title">Vector Search (Qdrant)</h4>
+            <p class="pattern-desc">Like a "books similar to this" recommendation. Finds documents with similar meaning even if they use different words.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#128220;</div>
+            <h4 class="pattern-title">Keyword Search (BM25)</h4>
+            <p class="pattern-desc">Like a full-text search. Finds exact words and phrases. Best when you know exactly what you're looking for.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Retrieval Fusion Code -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Weighted Fusion: Combining All Three</h2>
+        <p>The <span class="term" data-definition="Retrieval fusion is the technique of combining search results from multiple different systems, weighting them, and re-ranking to produce better results than any single system alone.">Retrieval Engine</span> doesn't just pick one search method &mdash; it runs all three, weights the results, and then re-ranks them using a specialized AI model.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">async def</span> <span class="code-function">retrieve</span>(<span class="code-property">self</span>, <span class="code-property">query</span>, <span class="code-property">collection</span>):</span>
+<span class="code-line">    kg <span class="code-operator">=</span> <span class="code-keyword">await</span> <span class="code-property">self</span>._retrieve_kg(query, ctx)</span>
+<span class="code-line">    vec <span class="code-operator">=</span> <span class="code-keyword">await</span> <span class="code-property">self</span>._retrieve_vector(query, col)</span>
+<span class="code-line">    bm25 <span class="code-operator">=</span> <span class="code-keyword">await</span> <span class="code-property">self</span>._retrieve_bm25(query, col)</span>
+<span class="code-line">    <span class="code-comment"># Weight: KG 30%, Vector 40%, BM25 30%</span></span>
+<span class="code-line">    <span class="code-keyword">for</span> r <span class="code-keyword">in</span> kg:  r.score <span class="code-operator">*=</span> <span class="code-number">0.3</span></span>
+<span class="code-line">    <span class="code-keyword">for</span> r <span class="code-keyword">in</span> vec: r.score <span class="code-operator">*=</span> <span class="code-number">0.4</span></span>
+<span class="code-line">    <span class="code-keyword">for</span> r <span class="code-keyword">in</span> bm25: r.score <span class="code-operator">*=</span> <span class="code-number">0.3</span></span>
+<span class="code-line">    weighted <span class="code-operator">=</span> kg <span class="code-operator">+</span> vec <span class="code-operator">+</span> bm25</span>
+<span class="code-line">    <span class="code-keyword">if</span> <span class="code-property">self</span>._reranker:</span>
+<span class="code-line">        scores <span class="code-operator">=</span> <span class="code-property">self</span>._reranker.predict(</span>
+<span class="code-line">            [[query, r.content] <span class="code-keyword">for</span> r <span class="code-keyword">in</span> weighted])</span>
+<span class="code-line">    <span class="code-keyword">return</span> sorted(weighted)[:top_k]</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Given a search query, search using all three methods at once:</p>
+              <p class="tl">1. Ask the knowledge graph (finds relationships)</p>
+              <p class="tl">2. Ask the vector database (finds similar meaning)</p>
+              <p class="tl">3. Ask the keyword index (finds exact words)</p>
+              <p class="tl">Weight each source: vectors count slightly more (40%) because meaning-based search is usually most relevant for procurement queries.</p>
+              <p class="tl">Combine all results into one list...</p>
+              <p class="tl">Then use a specialized re-ranking AI model to score each result against the original query for final ordering.</p>
+              <p class="tl">Return only the top results (default: 10).</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-info">
+          <div class="callout-icon">&#128218;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why Not Just Use One Search Method?</strong>
+            <p>Each method has blind spots. Keyword search misses synonyms ("fastener" vs "bolt"). Vector search can return loosely related results. Graph queries only find known relationships. By combining all three and then re-ranking with AI, ProcWise gets dramatically better results than any single method alone &mdash; like asking a librarian, a search engine, and a subject expert, then letting a judge pick the best answers.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 6: LANGGRAPH WORKFLOWS ==================== -->
+<section class="module" id="module-6" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">06</span>
+      <h1 class="module-title">LangGraph Workflows</h1>
+      <p class="module-subtitle">The new architecture: composable, testable, and observable agent workflows</p>
+      <span class="audience-badge">Developers</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Old vs New -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">From Monolith to Assembly Line</h2>
+        <p>ProcWise recently migrated from monolithic agent classes to <span class="term" data-definition="LangGraph is a framework for building AI agent workflows as directed graphs. Each step (node) does one thing, and edges define the flow between steps &mdash; including conditional branching. Think of it as a flowchart that actually runs.">LangGraph</span> workflows. The metaphor: imagine replacing one person who does everything (buys materials, checks quality, files paperwork) with an assembly line where each station does one thing perfectly.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step"><div class="flow-step-num">1</div><p>Define State</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num">2</div><p>Write Nodes</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num">3</div><p>Wire Edges</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num">4</div><p>Compile Graph</p></div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step"><div class="flow-step-num">5</div><p>Run</p></div>
+        </div>
+      </section>
+
+      <!-- Screen 2: State Pattern -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Step 1: Define the State</h2>
+        <p>Every workflow starts with a <span class="term" data-definition="A TypedDict is a Python dictionary with a defined structure &mdash; you declare exactly which keys it has and what type each value is. It's like a form with labeled fields that must be filled in correctly.">TypedDict</span> that describes all the data flowing through it.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">class</span> <span class="code-function">DiscrepancyState</span>(TypedDict):</span>
+<span class="code-line">    <span class="code-property">workflow_id</span>: str</span>
+<span class="code-line">    <span class="code-property">extracted_docs</span>: List[Dict]</span>
+<span class="code-line">    <span class="code-property">processing_issues</span>: List[Dict]</span>
+<span class="code-line">    <span class="code-property">mismatches</span>: List[Dict]</span>
+<span class="code-line">    <span class="code-property">summary</span>: Dict</span>
+<span class="code-line">    <span class="code-property">errors</span>: List[str]</span>
+<span class="code-line">    <span class="code-property">status</span>: str</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Define the "form" for discrepancy detection. Every step reads and writes to this same form:</p>
+              <p class="tl"><strong>workflow_id</strong> &mdash; unique ID to track this run</p>
+              <p class="tl"><strong>extracted_docs</strong> &mdash; the documents we're checking</p>
+              <p class="tl"><strong>processing_issues</strong> &mdash; problems found during extraction</p>
+              <p class="tl"><strong>mismatches</strong> &mdash; price/quantity discrepancies found</p>
+              <p class="tl"><strong>summary</strong> &mdash; final report of findings</p>
+              <p class="tl"><strong>errors</strong> &mdash; anything that went wrong</p>
+              <p class="tl"><strong>status</strong> &mdash; where we are in the process</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Graph Wiring -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Steps 2-4: Nodes, Edges, Compile</h2>
+        <p>Each step is a pure function (a "node"). Edges define the order. <span class="term" data-definition="Conditional edges are branches in a workflow where the next step depends on the current state. Like a choose-your-own-adventure book: 'if validation passed, go to step 3; if it failed, skip to the end.'">Conditional edges</span> handle branching.</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line">graph <span class="code-operator">=</span> <span class="code-function">StateGraph</span>(DiscrepancyState)</span>
+<span class="code-line"></span>
+<span class="code-line">graph.<span class="code-function">add_node</span>(<span class="code-string">"validate_input"</span>, validate_input)</span>
+<span class="code-line">graph.<span class="code-function">add_node</span>(<span class="code-string">"process_issues"</span>, process_issues)</span>
+<span class="code-line">graph.<span class="code-function">add_node</span>(<span class="code-string">"validate_documents"</span>, validate_docs)</span>
+<span class="code-line">graph.<span class="code-function">add_node</span>(<span class="code-string">"persist_mismatches"</span>, persist)</span>
+<span class="code-line">graph.<span class="code-function">add_node</span>(<span class="code-string">"format_output"</span>, format_output)</span>
+<span class="code-line"></span>
+<span class="code-line">graph.<span class="code-function">set_entry_point</span>(<span class="code-string">"validate_input"</span>)</span>
+<span class="code-line">graph.<span class="code-function">add_conditional_edges</span>(</span>
+<span class="code-line">    <span class="code-string">"validate_input"</span>, should_continue,</span>
+<span class="code-line">    {<span class="code-string">"process_issues"</span>: <span class="code-string">"process_issues"</span>,</span>
+<span class="code-line">     <span class="code-string">"format_output"</span>: <span class="code-string">"format_output"</span>})</span>
+<span class="code-line">graph.<span class="code-function">add_edge</span>(<span class="code-string">"process_issues"</span>, <span class="code-string">"validate_documents"</span>)</span>
+<span class="code-line">graph.<span class="code-function">add_edge</span>(<span class="code-string">"validate_documents"</span>, <span class="code-string">"persist_mismatches"</span>)</span>
+<span class="code-line">graph.<span class="code-function">add_edge</span>(<span class="code-string">"persist_mismatches"</span>, <span class="code-string">"format_output"</span>)</span>
+<span class="code-line">graph.<span class="code-function">add_edge</span>(<span class="code-string">"format_output"</span>, END)</span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-keyword">return</span> graph.<span class="code-function">compile</span>()</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Create a new workflow graph using our DiscrepancyState form.</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">Register each processing step as a "node" with a name and function:</p>
+              <p class="tl">1. Validate the input data is good</p>
+              <p class="tl">2. Process any known issues from extraction</p>
+              <p class="tl">3. Compare documents against the database</p>
+              <p class="tl">4. Save any mismatches we found</p>
+              <p class="tl">5. Format the final output report</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">Start at "validate_input". Then branch: if validation passes, go to "process_issues". If it fails, skip straight to "format_output" (to report the error).</p>
+              <p class="tl">After that, it's a straight line: process &rarr; validate &rarr; persist &rarr; format &rarr; done.</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">Compile the graph into a runnable workflow.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 4: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why Graphs Beat Classes</strong>
+            <p>The old agents were 1,748-line classes that mixed validation, business logic, LLM calls, and database operations together. A bug in one area could break everything. LangGraph workflows split each concern into a small, testable node function. You can test "validate_input" alone, swap "persist_mismatches" for a mock, or add a new step without touching existing code. This is the <span class="term" data-definition="The Open-Closed Principle says software should be open for extension (you can add new features) but closed for modification (you don't have to change existing code to add them). Like adding a new station to an assembly line without rebuilding the whole factory.">Open-Closed Principle</span> in action.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 7: DEBUGGING ==================== -->
+<section class="module" id="module-7" style="background: var(--color-bg)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">07</span>
+      <h1 class="module-title">When Things Break</h1>
+      <p class="module-subtitle">233 tests, feature flags, and a debugging playbook for procurement workflows</p>
+      <span class="audience-badge">Developers</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Test Suite -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The Safety Net: 233 Tests</h2>
+        <p>Every workflow has a comprehensive test suite. Here's how the tests are distributed across the migration phases:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">43</div><div class="step-body"><strong>Cognitive Layer Foundation</strong><p>Working Memory, Retrieval Engine, LLM Router, Verification, Learning Loop</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">18</div><div class="step-body"><strong>Discrepancy Detection</strong><p>The first workflow migrated &mdash; validation, document comparison, mismatch persistence</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">13</div><div class="step-body"><strong>Data Extraction + RAG</strong><p>Document parsing, field extraction, Q&A retrieval</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">55</div><div class="step-body"><strong>Ranking + Comparison + Evaluation</strong><p>Supplier scoring, quote normalization, policy checking</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">68</div><div class="step-body"><strong>Email + Supplier Communication</strong><p>Drafting, dispatch, watching, and supplier interaction</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">36</div><div class="step-body"><strong>Negotiation + Opportunity Mining</strong><p>Multi-round negotiations, savings discovery</p></div></div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Feature Flags -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Feature Flags: The Kill Switch</h2>
+        <p>The entire new architecture can be toggled on or off with a single <span class="term" data-definition="A feature flag is a setting that lets you turn a feature on or off without deploying new code. Like a light switch for functionality &mdash; if something goes wrong, flip it off instantly.">feature flag</span>.</p>
+
+        <div class="badge-list">
+          <div class="badge-item"><code class="badge-code">ENABLE_COGNITIVE_LAYER=true</code><span>Activates the new LangGraph workflows, cognitive layer, and unified retrieval. Set to <code>false</code> to fall back to legacy agents.</span></div>
+          <div class="badge-item"><code class="badge-code">ENABLE_CLOUD_LLM=true</code><span>Allows the LLM Router to escalate to Claude for complex tasks. Set to <code>false</code> to keep everything running on local models only.</span></div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Spot the Bug -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Spot the Bug</h2>
+        <p>A workflow node is supposed to validate that extracted documents exist before processing them. Can you find the bug?</p>
+
+        <div class="bug-challenge" id="bug-m7">
+          <div class="bug-code">
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">1</span><code><span class="code-keyword">def</span> <span class="code-function">validate_input</span>(state: DiscrepancyState):</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">2</span><code>    <span class="code-string">"""Validate that extracted_docs is non-empty."""</span></code></div>
+            <div class="bug-line bug-target" onclick="checkBugLine(this, true)"><span class="line-num">3</span><code>    <span class="code-keyword">if</span> state[<span class="code-string">"extracted_docs"</span>]:</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">4</span><code>        <span class="code-keyword">return</span> {</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">5</span><code>            <span class="code-string">"status"</span>: <span class="code-string">"failed"</span>,</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">6</span><code>            <span class="code-string">"errors"</span>: [<span class="code-string">"No documents provided"</span>]</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">7</span><code>        }</code></div>
+            <div class="bug-line" onclick="checkBugLine(this, false)"><span class="line-num">8</span><code>    <span class="code-keyword">return</span> {<span class="code-string">"status"</span>: <span class="code-string">"pending"</span>}</code></div>
+          </div>
+          <div class="bug-feedback" id="bug-feedback-m7"></div>
+        </div>
+      </section>
+
+      <!-- Screen 4: Scenario Quiz -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Debugging Scenarios</h2>
+        <div class="quiz-container" id="quiz-m7">
+          <div class="quiz-question-block" data-correct="option-b">
+            <h3 class="quiz-question">A supplier's response email is being received (Email Watcher logs show it) but the Negotiation agent never processes it. Where do you look first?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The Negotiation agent's run() method</span></button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The Email Watcher's routing logic that decides where to send parsed emails</span></button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)"><div class="quiz-option-radio"></div><span>The database connection settings</span></button>
+            </div>
+            <div class="quiz-feedback" data-correct-text="Right! If the Email Watcher sees the email but Negotiation doesn't get it, the problem is in the handoff. Check the routing/workflow edge between Email Watcher and Negotiation &mdash; is the email being classified correctly?" data-incorrect-text="Think about the data flow: Email Watcher receives it (that works) but Negotiation never sees it. The break must be between them &mdash; in the routing logic that connects one to the other."></div>
+          </div>
+          <button class="quiz-btn" onclick="checkQuiz('quiz-m7')">Check Answer</button>
+          <button class="quiz-btn-secondary" onclick="resetQuiz('quiz-m7')">Try Again</button>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MODULE 8: EXTENDING ==================== -->
+<section class="module" id="module-8" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">08</span>
+      <h1 class="module-title">Extending the Platform</h1>
+      <p class="module-subtitle">How to add new agents, workflows, and capabilities to ProcWise</p>
+      <span class="audience-badge">Developers</span>
+    </header>
+
+    <div class="module-body">
+      <!-- Screen 1: Recipe -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Adding a New Workflow: The Recipe</h2>
+        <p>Every new agent follows the same pattern. Think of it like opening a franchise &mdash; the playbook is already written, you just fill in the specifics.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in"><div class="step-num">1</div><div class="step-body"><strong>Define the State</strong><p>Create a <code>state.py</code> with a TypedDict describing all data your workflow needs</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">2</div><div class="step-body"><strong>Write the Nodes</strong><p>Each processing step is a pure function in <code>nodes.py</code> that takes state and returns updates</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">3</div><div class="step-body"><strong>Wire the Graph</strong><p>In <code>graph.py</code>, connect nodes with edges and conditional branches</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">4</div><div class="step-body"><strong>Build the Adapter</strong><p>Create <code>adapter.py</code> to bridge the new workflow with the legacy API interface</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">5</div><div class="step-body"><strong>Register It</strong><p>Add the workflow to <code>agent_definitions.json</code> and the feature flag system</p></div></div>
+          <div class="step-card animate-in"><div class="step-num">6</div><div class="step-body"><strong>Test Everything</strong><p>Write tests for each node individually, then integration tests for the full graph</p></div></div>
+        </div>
+      </section>
+
+      <!-- Screen 2: File Structure -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Workflow File Structure</h2>
+        <p>Every workflow in <code>workflows/</code> follows this exact structure:</p>
+
+        <div class="file-tree animate-in">
+          <div class="ft-folder open">
+            <span class="ft-name">workflows/your_new_workflow/</span>
+            <span class="ft-desc">Your new workflow directory</span>
+            <div class="ft-children">
+              <div class="ft-file"><span class="ft-name">__init__.py</span><span class="ft-desc">Exports the compiled graph and adapter</span></div>
+              <div class="ft-file"><span class="ft-name">state.py</span><span class="ft-desc">TypedDict defining all workflow data</span></div>
+              <div class="ft-file"><span class="ft-name">nodes.py</span><span class="ft-desc">Pure functions &mdash; one per processing step</span></div>
+              <div class="ft-file"><span class="ft-name">graph.py</span><span class="ft-desc">Wires nodes together with edges</span></div>
+              <div class="ft-file"><span class="ft-name">adapter.py</span><span class="ft-desc">Bridges new workflow with legacy API</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Cognitive Tools Code -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Using Cognitive Tools in Nodes</h2>
+        <p>Your workflow nodes can use the shared <span class="term" data-definition="Cognitive tools are pre-built functions that give any workflow access to shared capabilities: storing/retrieving memories, searching the knowledge base, calling AI models, and verifying outputs. They're the building blocks every agent uses.">cognitive tools</span> for memory, retrieval, and AI calls:</p>
+
+        <div class="translation-block">
+          <div class="translation-code">
+            <span class="translation-label">CODE</span>
+            <pre><code><span class="code-line"><span class="code-keyword">async def</span> <span class="code-function">memory_store</span>(</span>
+<span class="code-line">    <span class="code-property">workflow_id</span>, <span class="code-property">key</span>, <span class="code-property">value</span>,</span>
+<span class="code-line">    <span class="code-property">confidence</span>, <span class="code-property">source_agent</span>,</span>
+<span class="code-line">    <span class="code-property">scope</span><span class="code-operator">=</span><span class="code-string">"workflow"</span>):</span>
+<span class="code-line">    entry <span class="code-operator">=</span> <span class="code-function">MemoryEntry</span>(</span>
+<span class="code-line">        key<span class="code-operator">=</span>key, value<span class="code-operator">=</span>value,</span>
+<span class="code-line">        confidence<span class="code-operator">=</span>confidence,</span>
+<span class="code-line">        source_agent<span class="code-operator">=</span>source_agent,</span>
+<span class="code-line">        scope<span class="code-operator">=</span><span class="code-function">MemoryScope</span>(scope))</span>
+<span class="code-line">    <span class="code-keyword">await</span> working_memory.<span class="code-function">store</span>(</span>
+<span class="code-line">        workflow_id<span class="code-operator">=</span>workflow_id, entry<span class="code-operator">=</span>entry)</span>
+<span class="code-line">    <span class="code-keyword">return</span> {<span class="code-string">"status"</span>: <span class="code-string">"stored"</span>, <span class="code-string">"key"</span>: key}</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">This tool lets any workflow node save a piece of information to shared memory.</p>
+              <p class="tl">It needs: which workflow, a name for the data, the data itself, how confident we are in it, and which agent is saving it.</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">Create a memory entry with all that metadata...</p>
+              <p class="tl">&nbsp;</p>
+              <p class="tl">Store it in Redis (the fast memory database) where other agents can find it...</p>
+              <p class="tl">Confirm it was saved successfully.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 4: Key Config -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Key Configuration Settings</h2>
+        <p>These are the settings that control the cognitive layer's behavior:</p>
+
+        <div class="badge-list">
+          <div class="badge-item"><code class="badge-code">ENABLE_COGNITIVE_LAYER</code><span>Master switch for new architecture (default: false)</span></div>
+          <div class="badge-item"><code class="badge-code">CLOUD_LLM_MODEL</code><span>Which cloud model to use (default: claude-sonnet-4-20250514)</span></div>
+          <div class="badge-item"><code class="badge-code">LLM_ROUTER_CONFIDENCE_THRESHOLD</code><span>Minimum confidence to accept a result (default: 0.7)</span></div>
+          <div class="badge-item"><code class="badge-code">RETRIEVAL_TOP_K</code><span>How many results to return from search (default: 10)</span></div>
+          <div class="badge-item"><code class="badge-code">RETRIEVAL_BM25_WEIGHT</code><span>Keyword search weight in fusion (default: 0.3)</span></div>
+          <div class="badge-item"><code class="badge-code">RETRIEVAL_VECTOR_WEIGHT</code><span>Semantic search weight in fusion (default: 0.4)</span></div>
+          <div class="badge-item"><code class="badge-code">RETRIEVAL_KG_WEIGHT</code><span>Graph search weight in fusion (default: 0.3)</span></div>
+          <div class="badge-item"><code class="badge-code">WORKING_MEMORY_WORKFLOW_TTL</code><span>How long workflow memories last in seconds (default: 3600)</span></div>
+        </div>
+      </section>
+
+      <!-- Screen 5: Callout -->
+      <section class="screen animate-in">
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The Adapter Pattern: Backward Compatibility</strong>
+            <p>Each workflow has an <span class="term" data-definition="An adapter is a piece of code that translates between two interfaces. Like a travel power adapter that lets your US plug work in a UK socket &mdash; both sides keep their original shape, the adapter handles the translation.">adapter</span> that makes it look like the old agent class to the rest of the system. This means the API endpoints, the orchestrator, and the frontend don't need to change at all. The new workflows slot in seamlessly behind the same interface. When you're confident the new workflow is solid, you can remove the adapter and update the callers &mdash; but there's no rush.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<!-- ========== JAVASCRIPT ========== -->
+<script>
+(function() {
+  'use strict';
+
+  // ===== SCROLL ANIMATIONS =====
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { rootMargin: '0px 0px -10% 0px', threshold: 0.1 });
+  document.querySelectorAll('.animate-in').forEach(el => observer.observe(el));
+
+  // Stagger children
+  document.querySelectorAll('.stagger-children').forEach(parent => {
+    Array.from(parent.children).forEach((child, i) => {
+      child.style.setProperty('--stagger-index', i);
+    });
+  });
+
+  // ===== PROGRESS BAR =====
+  const progressBar = document.getElementById('progress-bar');
+  function updateProgress() {
+    const scrollTop = window.scrollY;
+    const scrollHeight = document.documentElement.scrollHeight - window.innerHeight;
+    const progress = scrollHeight > 0 ? (scrollTop / scrollHeight) * 100 : 0;
+    progressBar.style.width = progress + '%';
+  }
+  window.addEventListener('scroll', () => requestAnimationFrame(updateProgress), { passive: true });
+
+  // ===== NAV DOTS =====
+  const dots = document.querySelectorAll('.nav-dot');
+  const modules = document.querySelectorAll('.module');
+  const visited = new Set();
+
+  dots.forEach(dot => {
+    dot.addEventListener('click', () => {
+      const target = document.getElementById(dot.dataset.target);
+      if (target) target.scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+
+  const moduleObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const id = entry.target.id;
+        const idx = parseInt(id.replace('module-', '')) - 1;
+        visited.add(idx);
+        dots.forEach((d, i) => {
+          d.classList.remove('current');
+          if (visited.has(i)) d.classList.add('visited');
+        });
+        if (dots[idx]) { dots[idx].classList.add('current'); dots[idx].classList.add('visited'); }
+      }
+    });
+  }, { threshold: 0.3 });
+  modules.forEach(m => moduleObserver.observe(m));
+
+  // ===== KEYBOARD NAV =====
+  const moduleIds = Array.from(modules).map(m => m.id);
+  let currentModuleIdx = 0;
+  document.addEventListener('keydown', (e) => {
+    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      currentModuleIdx = Math.min(currentModuleIdx + 1, moduleIds.length - 1);
+      document.getElementById(moduleIds[currentModuleIdx]).scrollIntoView({ behavior: 'smooth' });
+      e.preventDefault();
+    }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      currentModuleIdx = Math.max(currentModuleIdx - 1, 0);
+      document.getElementById(moduleIds[currentModuleIdx]).scrollIntoView({ behavior: 'smooth' });
+      e.preventDefault();
+    }
+  });
+
+  // ===== ARCHITECTURE DIAGRAM =====
+  window.showArchDesc = function(el) {
+    const zone = el.closest('.module');
+    const descEl = zone.querySelector('.arch-description');
+    zone.querySelectorAll('.arch-component').forEach(c => c.classList.remove('active'));
+    el.classList.add('active');
+    if (descEl) descEl.textContent = el.dataset.desc;
+  };
+
+  // ===== CHAT ANIMATION =====
+  const chatState = {};
+  const chatActors = {
+    'orchestrator': { initials: 'O', color: 'var(--color-actor-2)' },
+    'extraction': { initials: 'DE', color: 'var(--color-actor-1)' },
+    'comparison': { initials: 'QC', color: 'var(--color-actor-2)' },
+    'evaluation': { initials: 'QE', color: 'var(--color-actor-3)' },
+    'negotiation': { initials: 'N', color: 'var(--color-actor-4)' },
+    'email': { initials: 'ED', color: 'var(--color-actor-1)' },
+  };
+
+  function getChatState(id) {
+    if (!chatState[id]) chatState[id] = { index: 0 };
+    return chatState[id];
+  }
+
+  window.playChatNext = function(id) {
+    const state = getChatState(id);
+    const messages = document.querySelectorAll('#chat-' + id + ' .chat-message');
+    if (state.index >= messages.length) return;
+    const msg = messages[state.index];
+    const sender = msg.dataset.sender;
+    const typing = document.getElementById('chat-typing-' + id);
+    const avatar = document.getElementById('typing-avatar-' + id);
+    const actor = chatActors[sender] || { initials: '?', color: 'var(--color-text-muted)' };
+    avatar.textContent = actor.initials;
+    avatar.style.background = actor.color;
+    typing.style.display = 'flex';
+    setTimeout(() => {
+      typing.style.display = 'none';
+      msg.style.display = 'flex';
+      msg.style.animation = 'fadeSlideUp 0.3s var(--ease-out)';
+      state.index++;
+      const progress = document.getElementById('chat-progress-' + id);
+      if (progress) progress.textContent = state.index + ' / ' + messages.length + ' messages';
+    }, 800);
+  };
+
+  window.playChatAll = function(id) {
+    const state = getChatState(id);
+    const messages = document.querySelectorAll('#chat-' + id + ' .chat-message');
+    const interval = setInterval(() => {
+      if (state.index >= messages.length) { clearInterval(interval); return; }
+      playChatNext(id);
+    }, 1200);
+  };
+
+  window.resetChat = function(id) {
+    chatState[id] = { index: 0 };
+    document.querySelectorAll('#chat-' + id + ' .chat-message').forEach(m => { m.style.display = 'none'; m.style.animation = ''; });
+    document.getElementById('chat-typing-' + id).style.display = 'none';
+    const progress = document.getElementById('chat-progress-' + id);
+    const total = document.querySelectorAll('#chat-' + id + ' .chat-message').length;
+    if (progress) progress.textContent = '0 / ' + total + ' messages';
+  };
+
+  // ===== DATA FLOW ANIMATION =====
+  const flowState = {};
+  const flowConfigs = {
+    'm3': {
+      steps: [
+        { highlight: 'flow-m3-upload', label: 'A supplier emails a PDF quote. The system detects the new document and queues it for processing.' },
+        { highlight: 'flow-m3-extract', label: 'The Data Extraction agent parses the PDF, pulling out 15 line items with prices, quantities, and delivery terms.' },
+        { highlight: 'flow-m3-compare', label: 'Quote Comparison normalizes the data and compares against 3 other suppliers. Acme is 12% cheaper on 8 items.' },
+        { highlight: 'flow-m3-evaluate', label: 'Quote Evaluation checks company policies. Total is within budget, but fastener pricing exceeds the target by 5%.' },
+        { highlight: 'flow-m3-negotiate', label: 'The Negotiation agent reviews Acme\'s history: they usually concede 3-4% in Round 1. Drafts a counter-offer.' },
+        { highlight: 'flow-m3-negotiate', label: 'Email Drafting generates a personalized negotiation email. Ready for human approval before sending.' }
+      ]
+    }
+  };
+
+  window.flowNext = function(id) {
+    if (!flowState[id]) flowState[id] = { step: 0 };
+    const state = flowState[id];
+    const config = flowConfigs[id];
+    if (!config || state.step >= config.steps.length) return;
+    const step = config.steps[state.step];
+    document.querySelectorAll('#flow-' + id + ' .flow-actor').forEach(a => a.classList.remove('active'));
+    document.getElementById(step.highlight).classList.add('active');
+    document.getElementById('flow-label-' + id).textContent = step.label;
+    state.step++;
+    const progress = document.getElementById('flow-progress-' + id);
+    if (progress) progress.textContent = 'Step ' + state.step + ' / ' + config.steps.length;
+  };
+
+  window.flowReset = function(id) {
+    flowState[id] = { step: 0 };
+    document.querySelectorAll('#flow-' + id + ' .flow-actor').forEach(a => a.classList.remove('active'));
+    document.getElementById('flow-label-' + id).textContent = 'Click "Next Step" to trace the quote through the system';
+    const config = flowConfigs[id];
+    const progress = document.getElementById('flow-progress-' + id);
+    if (progress && config) progress.textContent = 'Step 0 / ' + config.steps.length;
+  };
+
+  // ===== QUIZZES =====
+  window.selectOption = function(btn) {
+    const block = btn.closest('.quiz-question-block');
+    block.querySelectorAll('.quiz-option').forEach(o => o.classList.remove('selected'));
+    btn.classList.add('selected');
+  };
+
+  window.checkQuiz = function(containerId) {
+    const container = document.getElementById(containerId);
+    container.querySelectorAll('.quiz-question-block').forEach(q => {
+      const selected = q.querySelector('.quiz-option.selected');
+      const feedback = q.querySelector('.quiz-feedback');
+      const correctValue = q.dataset.correct;
+      if (!selected) { feedback.innerHTML = 'Pick an answer first!'; feedback.className = 'quiz-feedback show error'; return; }
+      if (selected.dataset.value === correctValue) {
+        selected.classList.add('correct');
+        feedback.innerHTML = '<strong>Exactly!</strong> ' + feedback.dataset.correctText;
+        feedback.className = 'quiz-feedback show success';
+      } else {
+        selected.classList.add('incorrect');
+        const correctBtn = q.querySelector('[data-value="' + correctValue + '"]');
+        if (correctBtn) correctBtn.classList.add('correct');
+        feedback.innerHTML = '<strong>Not quite.</strong> ' + feedback.dataset.incorrectText;
+        feedback.className = 'quiz-feedback show error';
+      }
+      q.querySelectorAll('.quiz-option').forEach(o => o.disabled = true);
+    });
+  };
+
+  window.resetQuiz = function(containerId) {
+    const container = document.getElementById(containerId);
+    container.querySelectorAll('.quiz-option').forEach(o => {
+      o.classList.remove('selected', 'correct', 'incorrect');
+      o.disabled = false;
+    });
+    container.querySelectorAll('.quiz-feedback').forEach(f => { f.className = 'quiz-feedback'; f.innerHTML = ''; });
+  };
+
+  // ===== SPOT THE BUG =====
+  window.checkBugLine = function(el, isCorrect) {
+    const challenge = el.closest('.bug-challenge');
+    const feedback = challenge.querySelector('.bug-feedback');
+    if (isCorrect) {
+      el.classList.add('correct');
+      feedback.innerHTML = '<strong>Found it!</strong> Line 3 says <code>if state["extracted_docs"]:</code> which is True when documents <em>exist</em>. But the body returns "failed" &mdash; meaning it fails when documents ARE present. The fix: add <code>not</code> &mdash; <code>if not state["extracted_docs"]:</code>';
+      feedback.className = 'bug-feedback show success';
+    } else {
+      el.classList.add('incorrect');
+      feedback.innerHTML = 'Not this line &mdash; look carefully at the condition and what happens when it\'s true...';
+      feedback.className = 'bug-feedback show error';
+      setTimeout(() => { el.classList.remove('incorrect'); feedback.className = 'bug-feedback'; }, 2000);
+    }
+  };
+
+  // ===== GLOSSARY TOOLTIPS =====
+  let activeTooltip = null;
+  function positionTooltip(term, tip) {
+    const rect = term.getBoundingClientRect();
+    const tipWidth = 300;
+    let left = rect.left + rect.width / 2 - tipWidth / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tipWidth - 8));
+    document.body.appendChild(tip);
+    const tipHeight = tip.offsetHeight;
+    if (rect.top - tipHeight - 8 < 0) {
+      tip.style.top = (rect.bottom + 8) + 'px';
+      tip.classList.add('flip');
+    } else {
+      tip.style.top = (rect.top - tipHeight - 8) + 'px';
+      tip.classList.remove('flip');
+    }
+    tip.style.left = left + 'px';
+  }
+
+  document.querySelectorAll('.term').forEach(term => {
+    const tip = document.createElement('span');
+    tip.className = 'term-tooltip';
+    tip.textContent = term.dataset.definition;
+
+    term.addEventListener('mouseenter', () => {
+      if (activeTooltip && activeTooltip !== tip) { activeTooltip.classList.remove('visible'); activeTooltip.remove(); }
+      positionTooltip(term, tip);
+      requestAnimationFrame(() => tip.classList.add('visible'));
+      activeTooltip = tip;
+    });
+    term.addEventListener('mouseleave', () => {
+      tip.classList.remove('visible');
+      setTimeout(() => { if (!tip.classList.contains('visible')) tip.remove(); }, 150);
+      activeTooltip = null;
+    });
+    term.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (activeTooltip && activeTooltip !== tip) { activeTooltip.classList.remove('visible'); activeTooltip.remove(); }
+      if (tip.classList.contains('visible')) { tip.classList.remove('visible'); tip.remove(); activeTooltip = null; }
+      else { positionTooltip(term, tip); requestAnimationFrame(() => tip.classList.add('visible')); activeTooltip = tip; }
+    });
+  });
+  document.addEventListener('click', () => { if (activeTooltip) { activeTooltip.classList.remove('visible'); activeTooltip.remove(); activeTooltip = null; } });
+
+})();
+</script>
+</body>
+</html>
